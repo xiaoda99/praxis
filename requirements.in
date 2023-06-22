@@ -12,7 +12,7 @@ jax-bitempered-loss
 lingvo
 # numpy
 # optax
-# optax-shampoo
+optax-shampoo
 # tensorflow~=2.9.2
 # tensorflow-text~=2.9.0
 # tensorflow-datasets==4.8.3
