@@ -1658,6 +1658,7 @@ class DotProductAttention(base_layer.BaseLayer):
     if self.use_rotary_position_emb:
       query_proj = self.rotary_position_emb(query_proj, query_segment_pos)
       key_proj = self.rotary_position_emb(key_proj, key_segment_pos)
+      query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)  # XD
       self._fprop_update_decode_state('key_post_rotary_pos_emb', key_proj)
 
     # Apply relative bias.

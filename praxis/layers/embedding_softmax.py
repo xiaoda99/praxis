@@ -17,6 +17,7 @@
 
 import math
 from typing import Optional, Union
+from absl import logging  # XD
 
 import jax
 from jax import numpy as jnp
@@ -933,6 +934,38 @@ class PositionalEmbedding2D(base_layer.BaseLayer):
     pos_emb = jnp.expand_dims(pos_emb, axis=0)
     return pos_emb
 
+def precompute_freqs_cis(dim: int, end: int, theta: float=10000.0, dtype: jnp.dtype=jnp.float32) -> jnp.ndarray: # XD: from EasyLM
+    freqs = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+    t = np.arange(end)  # type: ignore
+    freqs = np.outer(t, freqs).astype(dtype)  # type: ignore
+    sin, cos = np.sin(freqs), np.cos(freqs)
+    freqs_cis = np.complex64(cos + 1j * sin)
+    return jnp.asarray(freqs_cis)
+
+def apply_rotary_emb(  # XD: from EasyLM
+    xq: jnp.ndarray,
+    # xk: jnp.ndarray,
+    freqs_cis: jnp.ndarray,
+    dtype: jnp.dtype=jnp.float32,
+):
+
+    reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
+    # reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+
+    xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
+    # xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
+
+    # add head dim
+    # freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
+    freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:1], 1, *freqs_cis.shape[1:]))  # XD
+
+    xq_out = xq_ * freqs_cis
+    xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
+
+    # xk_out = xk_ * freqs_cis
+    # xk_out = jnp.stack((jnp.real(xk_out), jnp.imag(xk_out)), axis=-1).reshape(*xk_out.shape[:-1], -1)
+
+    return xq_out.astype(dtype)#, xk_out.astype(dtype)
 
 class RotaryPositionalEmbedding(PositionalEmbedding):
   """Applies rotary position embedding for a given 1-d sequence.
@@ -951,6 +984,7 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
       raise ValueError(
           'Embedding dim for rotary position embedding must be a multiple of 2.'
       )
+    self.freqs_cis = precompute_freqs_cis(self.embedding_dims, 2048)  # XD
     super().setup()
 
   def __call__(
@@ -982,6 +1016,7 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
           'The embedding dims of the rotary position embedding'
           'must match the hidden dimension of the inputs.'
       )
+    # return apply_rotary_emb(inputs, freqs_cis=self.freqs_cis, dtype=jnp.float32)  # XD
     half_embedding_dim = self.embedding_dims // 2
     fraction = 2 * jnp.arange(0, half_embedding_dim) / self.embedding_dims
     timescale = (
