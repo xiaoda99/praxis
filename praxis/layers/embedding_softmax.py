@@ -1016,7 +1016,7 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
           'The embedding dims of the rotary position embedding'
           'must match the hidden dimension of the inputs.'
       )
-    # return apply_rotary_emb(inputs, freqs_cis=self.freqs_cis, dtype=jnp.float32)  # XD
+    # return apply_rotary_emb(inputs, freqs_cis=self.freqs_cis, dtype=jnp.float32)#fprop_dtype  # XD
     half_embedding_dim = self.embedding_dims // 2
     fraction = 2 * jnp.arange(0, half_embedding_dim) / self.embedding_dims
     timescale = (
