@@ -579,6 +579,35 @@ class RelativeBias(base_layer.BaseLayer):
     )
     return relative_bias
 
+class CrossHeadProjection(base_layer.BaseLayer):
+  num_heads: int = 0
+  num_groups: int = 0
+
+  def setup(self) -> None:
+    wp = self.weight_split_dims_mapping
+    # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
+    wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
+    self.num_heads_per_group = self.num_heads // self.num_groups
+
+    # pc = WeightHParams(
+    #     shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group],
+    #     # shape=[self.num_heads_per_group, self.num_heads_per_group],
+    #     mesh_shape=self.mesh_shape,
+    #     tensor_split_dims_mapping=wt,
+    #     fan_in_axes=None,
+    #     fan_out_axes=None,
+    # )
+    # self.create_variable('w', pc)
+
+  def __call__(self, inputs: JTensor) -> JTensor:
+    shape = inputs.shape
+    inputs = self._cast_to_fprop_dtype(inputs)
+    assert shape[1] == self.num_heads
+    inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
+    # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
+    # inputs = jnp.einsum('BGMTS,GMN->BGNTS', inputs, self.theta.w)
+    inputs = inputs + jnp.ones_like(inputs) #inputs[:, :, 0:1, :, :]
+    return jnp.reshape(inputs, shape)  # BGMTS->BNTS
 
 class AttentionProjection(base_layer.BaseLayer):
   """Layer that computes multi heads projection.
@@ -1107,6 +1136,7 @@ class DotProductAttention(base_layer.BaseLayer):
   input_dim: Union[int, Dict[str, int]] = 0
   hidden_dim: int = 0
   num_heads: int = 1
+  num_groups: int = 4  # XD
   dim_per_head: Optional[int] = None
   dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
   atten_dropout_prob: float = 0.0
@@ -1116,6 +1146,7 @@ class DotProductAttention(base_layer.BaseLayer):
   internal_gshard_gaussian_init: bool = False
   combine_qkv: bool = False
   combined_qkv_proj_tpl: LayerTpl = template_field(CombinedQKVProjectionLayer)
+  cross_head_proj_tpl: LayerTpl = template_field(CrossHeadProjection)  # XD
   use_bias: bool = True
   output_proj_use_nhd_shape: bool = False
   internal_enable_query_scale: bool = True
@@ -1223,6 +1254,16 @@ class DotProductAttention(base_layer.BaseLayer):
       proj_p.weight_split_dims_mapping.wt = wp.proj
       return proj_p
 
+    def project_logits_or_probs(gaussian_std=None):  # XD
+      proj_p = self.cross_head_proj_tpl.clone().set(
+          num_heads=self.num_heads,
+          num_groups=self.num_groups,
+      )
+      if gaussian_std:
+        proj_p.params_init = WeightInit.Gaussian(gaussian_std)
+      proj_p.weight_split_dims_mapping.wt = wp.proj
+      return proj_p
+
     if isinstance(self.input_dim, Mapping):
       key_input_dim = self.input_dim['key']
       value_input_dim = self.input_dim['value']
@@ -1255,6 +1296,8 @@ class DotProductAttention(base_layer.BaseLayer):
       self.create_child('key', project_input(key_input_dim, key_std))
       self.create_child('query', project_input(query_input_dim, query_std))
       self.create_child('value', project_input(value_input_dim, value_std))
+    self.create_child('pre_proj', project_logits_or_probs())
+    # self.create_child('post_proj', project_logits_or_probs())
 
     if self.use_rotary_position_emb:
       self._create_rotary_position_emb(
@@ -1413,6 +1456,10 @@ class DotProductAttention(base_layer.BaseLayer):
     logits = self.qk_einsum('BTNH,BSNH->BNTS', query, key)
     return logits
 
+  def _cross_head_proj(self, bnts, proj_name):  # XD: bnts is attn logits or weights
+    if getattr(self, proj_name, None) is None: return bnts
+    return getattr(self, proj_name)(bnts) #* getattr(self, proj_name + '_gate', 1.)
+
   def _dot_atten(
       self,
       query: JTensor,
@@ -1466,6 +1513,8 @@ class DotProductAttention(base_layer.BaseLayer):
     if self.scale_logits_by_head_dims:
       logits = jnp.multiply(logits, 1.0 / np.sqrt(h))
 
+    logits = self._cross_head_proj(logits, 'pre_proj')  # XD
+
     self.add_summary(
         'max_logit_precap',
         jnp.max(py_utils.apply_mask_to_logits(logits, atten_mask)),
@@ -1484,11 +1533,12 @@ class DotProductAttention(base_layer.BaseLayer):
     if self.attention_mask_summary:
       self.add_summary('attention_mask', atten_mask)
     if self.attention_extra_logit is None:
-      probs = jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
+      probs = padded_logits # jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
     else:
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
           key.dtype
       )
+    probs = self._cross_head_proj(probs, 'post_proj')  # XD
     # Apply attention dropout.
     probs = self.atten_dropout(probs)
     # Compute the attention context.

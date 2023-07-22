@@ -5,7 +5,7 @@ absl-py
 clu
 einops
 etils
-fiddle @ git+https://github.com/google/fiddle
+fiddle @ git+https://github.com/google/fiddle.git@01780f0
 lax
 # jax @ git+https://github.com/google/jax
 jax-bitempered-loss
