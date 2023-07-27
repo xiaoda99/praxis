@@ -589,15 +589,14 @@ class CrossHeadProjection(base_layer.BaseLayer):
     wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
     self.num_heads_per_group = self.num_heads // self.num_groups
 
-    # pc = WeightHParams(
-    #     shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group],
-    #     # shape=[self.num_heads_per_group, self.num_heads_per_group],
-    #     mesh_shape=self.mesh_shape,
-    #     tensor_split_dims_mapping=wt,
-    #     fan_in_axes=None,
-    #     fan_out_axes=None,
-    # )
-    # self.create_variable('w', pc)
+    pc = WeightHParams(
+        shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group],
+        mesh_shape=self.mesh_shape,
+        tensor_split_dims_mapping=wt,
+        fan_in_axes=None,
+        fan_out_axes=None,
+    )
+    self.create_variable('w', pc)
 
   def __call__(self, inputs: JTensor) -> JTensor:
     shape = inputs.shape
@@ -605,8 +604,8 @@ class CrossHeadProjection(base_layer.BaseLayer):
     assert shape[1] == self.num_heads
     inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
     # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
-    # inputs = jnp.einsum('BGMTS,GMN->BGNTS', inputs, self.theta.w)
-    inputs = inputs + jnp.ones_like(inputs) #inputs[:, :, 0:1, :, :]
+    inputs = inputs + jnp.einsum('BGMTS,GMN->BGNTS', inputs, self.theta.w)
+    # inputs = inputs + jnp.repeat(inputs[:, :, 0:1, :, :], self.num_heads_per_group, axis=2)  # jnp.roll(inputs, 1, axis=2) #
     return jnp.reshape(inputs, shape)  # BGMTS->BNTS
 
 class AttentionProjection(base_layer.BaseLayer):
@@ -1136,7 +1135,7 @@ class DotProductAttention(base_layer.BaseLayer):
   input_dim: Union[int, Dict[str, int]] = 0
   hidden_dim: int = 0
   num_heads: int = 1
-  num_groups: int = 4  # XD
+  num_groups: int = 0  # XD
   dim_per_head: Optional[int] = None
   dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
   atten_dropout_prob: float = 0.0
@@ -1297,7 +1296,7 @@ class DotProductAttention(base_layer.BaseLayer):
       self.create_child('query', project_input(query_input_dim, query_std))
       self.create_child('value', project_input(value_input_dim, value_std))
     self.create_child('pre_proj', project_logits_or_probs())
-    # self.create_child('post_proj', project_logits_or_probs())
+    self.create_child('post_proj', project_logits_or_probs())
 
     if self.use_rotary_position_emb:
       self._create_rotary_position_emb(
@@ -1533,7 +1532,7 @@ class DotProductAttention(base_layer.BaseLayer):
     if self.attention_mask_summary:
       self.add_summary('attention_mask', atten_mask)
     if self.attention_extra_logit is None:
-      probs = padded_logits # jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
+      probs = jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
     else:
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
           key.dtype
