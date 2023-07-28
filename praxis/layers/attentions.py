@@ -1295,8 +1295,9 @@ class DotProductAttention(base_layer.BaseLayer):
       self.create_child('key', project_input(key_input_dim, key_std))
       self.create_child('query', project_input(query_input_dim, query_std))
       self.create_child('value', project_input(value_input_dim, value_std))
-    self.create_child('pre_proj', project_logits_or_probs())
-    self.create_child('post_proj', project_logits_or_probs())
+    if self.num_groups > 0:  # XD
+      self.create_child('pre_proj', project_logits_or_probs())
+      self.create_child('post_proj', project_logits_or_probs())
 
     if self.use_rotary_position_emb:
       self._create_rotary_position_emb(
