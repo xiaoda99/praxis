@@ -608,6 +608,45 @@ class CrossHeadProjection(base_layer.BaseLayer):
     # inputs = inputs + jnp.repeat(inputs[:, :, 0:1, :, :], self.num_heads_per_group, axis=2)  # jnp.roll(inputs, 1, axis=2) #
     return jnp.reshape(inputs, shape)  # BGMTS->BNTS
 
+from praxis.layers import activations as activations_lib
+class CrossHeadFFN(base_layer.BaseLayer):
+  num_heads: int = 0
+  num_groups: int = 0
+  squeeze_ratio: int = 0
+  squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
+
+  def setup(self) -> None:
+    wp = self.weight_split_dims_mapping
+    # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
+    wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
+    self.num_heads_per_group = self.num_heads // self.num_groups
+    self.hidden_dims = self.num_heads_per_group // self.squeeze_ratio
+
+    pc1 = WeightHParams(
+        shape=[self.num_groups, self.num_heads_per_group, self.hidden_dims],
+        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,
+        fan_in_axes=None, fan_out_axes=None,
+    )
+    self.create_variable('w1', pc1)
+    self.activation_tpl = pax_fiddle.Config(self.squeeze_activation_cls)
+    self.create_child('activation', self.activation_tpl.clone())
+
+    pc2 = WeightHParams(
+        shape=[self.num_groups, self.hidden_dims, self.num_heads_per_group],
+        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,
+        fan_in_axes=None, fan_out_axes=None,
+    )
+    self.create_variable('w2', pc2)
+
+  def __call__(self, inputs: JTensor) -> JTensor:
+    shape = inputs.shape
+    inputs = self._cast_to_fprop_dtype(inputs)
+    assert shape[1] == self.num_heads
+    inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
+    activations = self.activation(jnp.einsum('BGMTS,GMN->BGNTS', inputs, self.theta.w1))
+    inputs = inputs + jnp.einsum('BGNTS,GNM->BGMTS', activations, self.theta.w2)
+    return jnp.reshape(inputs, shape)  # BGMTS->BNTS
+
 class AttentionProjection(base_layer.BaseLayer):
   """Layer that computes multi heads projection.
 
@@ -1146,6 +1185,9 @@ class DotProductAttention(base_layer.BaseLayer):
   combine_qkv: bool = False
   combined_qkv_proj_tpl: LayerTpl = template_field(CombinedQKVProjectionLayer)
   cross_head_proj_tpl: LayerTpl = template_field(CrossHeadProjection)  # XD
+  cross_head_ffn_tpl: LayerTpl = template_field(CrossHeadFFN)  # XD
+  squeeze_ratio: int = None  # XD
+  squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity  # XD
   use_bias: bool = True
   output_proj_use_nhd_shape: bool = False
   internal_enable_query_scale: bool = True
@@ -1254,10 +1296,11 @@ class DotProductAttention(base_layer.BaseLayer):
       return proj_p
 
     def project_logits_or_probs(gaussian_std=None):  # XD
-      proj_p = self.cross_head_proj_tpl.clone().set(
-          num_heads=self.num_heads,
-          num_groups=self.num_groups,
-      )
+      cross_head_tpl, kwargs = (self.cross_head_ffn_tpl,
+        dict(squeeze_ratio=self.squeeze_ratio, squeeze_activation_cls=self.squeeze_activation_cls)) \
+        if self.squeeze_ratio is not None else (self.cross_head_proj_tpl, dict())
+      proj_p = cross_head_tpl.clone().set(
+          num_heads=self.num_heads, num_groups=self.num_groups, **kwargs)
       if gaussian_std:
         proj_p.params_init = WeightInit.Gaussian(gaussian_std)
       proj_p.weight_split_dims_mapping.wt = wp.proj
