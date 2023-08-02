@@ -1176,6 +1176,8 @@ class DotProductAttention(base_layer.BaseLayer):
   num_heads: int = 1
   num_groups: int = 0  # XD
   dim_per_head: Optional[int] = None
+  dim_per_head_v: Optional[int] = None  # XD
+  value_gate_activation_cls: activations_lib.BaseActivation = None  # XD
   dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
   atten_dropout_prob: float = 0.0
   proj_tpl: LayerTpl = template_field(AttentionProjection)
@@ -1268,12 +1270,13 @@ class DotProductAttention(base_layer.BaseLayer):
       assert (
           dim_per_head * self.num_heads == self.hidden_dim
       ), f'{dim_per_head} * {self.num_heads} != {self.hidden_dim}'
+    dim_per_head_v = self.dim_per_head_v or dim_per_head  # XD
 
     if self.mesh_shape is not None:
       assert self.weight_split_dims_mapping is not None
       assert self.activation_split_dims_mapping is not None
 
-    def project_input(input_dim, gaussian_std=None):
+    def project_input(input_dim, dim_per_head, gaussian_std=None):  # XD: add dim_per_head
       proj_p = self.proj_tpl.clone().set(
           input_dim=input_dim,
           num_heads=self.num_heads,
@@ -1335,9 +1338,12 @@ class DotProductAttention(base_layer.BaseLayer):
           'combined_qkv', combined_qkv_project_input(query_input_dim)
       )
     else:
-      self.create_child('key', project_input(key_input_dim, key_std))
-      self.create_child('query', project_input(query_input_dim, query_std))
-      self.create_child('value', project_input(value_input_dim, value_std))
+      self.create_child('key', project_input(key_input_dim, dim_per_head, key_std))  # XD: add dim_per_head
+      self.create_child('query', project_input(query_input_dim, dim_per_head, query_std))  # XD: add dim_per_head
+      self.create_child('value', project_input(value_input_dim, dim_per_head_v, value_std))  # XD: add dim_per_head
+      if self.value_gate_activation_cls:  # XD
+        self.create_child('value_gate', project_input(value_input_dim, dim_per_head_v, value_std))
+        self.create_child('value_gate_activation',  pax_fiddle.Config(self.value_gate_activation_cls).clone())
     if self.num_groups > 0:  # XD
       self.create_child('pre_proj', project_logits_or_probs())
       self.create_child('post_proj', project_logits_or_probs())
@@ -1380,7 +1386,7 @@ class DotProductAttention(base_layer.BaseLayer):
     post_proj_p = self.proj_tpl.clone().set(
         input_dim=query_input_dim,
         num_heads=self.num_heads,
-        dim_per_head=dim_per_head,
+        dim_per_head=dim_per_head_v,  # XD: dim_per_head -> dim_per_head_v
         is_output_projection=True,
         use_bias=self.use_bias,
         use_nhd_shape=self.output_proj_use_nhd_shape,
@@ -1533,7 +1539,7 @@ class DotProductAttention(base_layer.BaseLayer):
     value = self._shard_blnh(value)
 
     b, s, n, h = key.shape
-    base_layer.assert_has_shape(value, [b, s, n, h])
+    base_layer.assert_has_shape(value, [b, s, n, -1])  # XD: h -> -1
     base_layer.assert_has_shape(query, [b, -1, n, h])
     t = query.shape[1]
     # If only padding bias is supplied, then atten_mask can be [B, 1, 1, S]
@@ -1764,6 +1770,10 @@ class DotProductAttention(base_layer.BaseLayer):
     encoded, atten_probs = self._dot_atten(
         query_proj, key_proj, value_proj, atten_mask, relative_bias
     )
+    if self.value_gate_activation_cls:  # XD
+      value_gate_proj = self.value_gate(value_vec)
+      value_gate_proj = self._shard_blnh(value_gate_proj)
+      encoded = encoded * self.value_gate_activation(value_gate_proj)
 
     # Apply NGrammer to the output of the attention layer.
     # Paper: https://openreview.net/forum?id=GxjCYmQAody.
