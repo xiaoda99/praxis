@@ -34,6 +34,7 @@ from praxis import pytypes
 from praxis.layers import base_ops
 from praxis.layers import embedding_softmax
 from praxis.layers import stochastics
+from praxis.layers import normalizations  # XD
 
 NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
@@ -1197,6 +1198,9 @@ class DotProductAttention(base_layer.BaseLayer):
   scale_query_by_dim_per_head: bool = False
   scale_logits_by_head_dims: bool = False
   atten_logit_cap: float = 0.0
+  float32_logits: bool = False  # XD
+  qk_norm: bool = False  # XD
+  qk_norm_tpl: LayerTpl = template_field(normalizations.LayerNorm)  # XD
   # TODO(pax-dev): merge use_rotary_position_emb and rotary_position_emb_tpl
   # by initializing rotary_position_emb_tpl = None.
   use_rotary_position_emb: bool = False
@@ -1347,7 +1351,12 @@ class DotProductAttention(base_layer.BaseLayer):
     if self.num_groups > 0:  # XD
       self.create_child('pre_proj', project_logits_or_probs())
       self.create_child('post_proj', project_logits_or_probs())
-
+    if self.qk_norm:  # XD
+      for name in ['q_norm', 'k_norm']:
+        params = self.qk_norm_tpl.clone()
+        params.name = name
+        params.dim = dim_per_head
+        self.create_child(name, params)
     if self.use_rotary_position_emb:
       self._create_rotary_position_emb(
           self.rotary_position_emb_tpl, dim_per_head
@@ -1551,7 +1560,7 @@ class DotProductAttention(base_layer.BaseLayer):
     asserts.in_set(atten_mask.shape[2], [t, 1])
     asserts.in_set(atten_mask.shape[0], [b, 1])
 
-    query = self._scale_query(query)
+    if not self.qk_norm: query = self._scale_query(query)  # XD: add if
     logits = self._atten_logits(query, key)
     if relative_bias is not None:
       # The relative_bias has shape [1, n, t, s] or [b, n, t, s].
@@ -1752,6 +1761,8 @@ class DotProductAttention(base_layer.BaseLayer):
       value_proj = self.dconv_v(value_proj, axis=1, segment_pos=key_segment_pos)
       self._fprop_update_decode_state('value_post_dconv', value_proj)
 
+    if self.qk_norm:  # XD
+      query_proj, key_proj = self.q_norm(query_proj), self.k_norm(key_proj)
     # Apply rotary position embeddings.
     # Paper: https://arxiv.org/abs/2104.09864.
     if self.use_rotary_position_emb:
@@ -1759,6 +1770,8 @@ class DotProductAttention(base_layer.BaseLayer):
       key_proj = self.rotary_position_emb(key_proj, key_segment_pos)
       # query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)  # XD
       self._fprop_update_decode_state('key_post_rotary_pos_emb', key_proj)
+    if self.float32_logits:  # xd
+      query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)
 
     # Apply relative bias.
     # Paper: https://aclanthology.org/N18-2074.pdf.
