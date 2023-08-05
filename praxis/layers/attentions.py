@@ -653,12 +653,16 @@ class SharedQKVProjectionLayer(base_layer.BaseLayer):
   num_groups: int = 0
   num_heads: int = 0
   shared_dim: int = 0
+  dim_per_shared_head: int = 1
   scale_shared_key: bool = False
+  scale_init: WeightInit = None
+  scale_bias: float = 0.
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
     self.num_heads_per_group = self.num_heads // self.num_groups
     self.shared_dim_per_group = self.shared_dim // self.num_groups
+    self.num_shared_heads_per_group = self.shared_dim_per_group // self.dim_per_shared_head
 
     pc_shape = [self.input_dim, self.num_groups, 3 * self.shared_dim_per_group]
     wt = ['data', 'mdl', None]
@@ -676,10 +680,10 @@ class SharedQKVProjectionLayer(base_layer.BaseLayer):
         self.create_variable('scale', pc)
     else:
       for name in ['q_scale', 'v_scale']:
-        pc_shape = [self.num_groups, self.num_heads_per_group, self.shared_dim_per_group]
+        pc_shape = [self.num_groups, self.num_heads_per_group, self.num_shared_heads_per_group]
         wt = ['mdl', None, None]
-        pc = WeightHParams(shape=pc_shape, mesh_shape=self.mesh_shape,
-          tensor_split_dims_mapping=wt, fan_in_axes=None, fan_out_axes=None)
+        pc = WeightHParams(shape=pc_shape, mesh_shape=self.mesh_shape, init=self.scale_init,
+          tensor_split_dims_mapping=wt, fan_in_axes=None, fan_out_axes=None,)
         self.create_variable(name, pc)
 
   def __call__(self, inputs: JTensor) -> JTensor:
@@ -692,18 +696,21 @@ class SharedQKVProjectionLayer(base_layer.BaseLayer):
       shape = qkv.shape[:2] + (qkv.shape[2] * qkv.shape[3],) + qkv.shape[4:]  # BTGMC->BTNC
       qkv = jnp.reshape(qkv, shape)
       return jnp.split(qkv, 3, axis=-1)
-    qkv = jnp.einsum('BTD,DGC->BTGC', inputs, theta.w)  # G: group, C: 3 * shared_dim
+    qkv = jnp.einsum('BTD,DGC->BTGC', inputs, theta.w)  # G: group, C: 3 * shared_dim_per_group
     query, key, value = jnp.split(qkv, 3, axis=-1)
     # query, key, value = qkv  # jnp.split(qkv, 3, axis=0)
-    query = jnp.einsum('BTGC,GMC->BTGMC', query, theta.q_scale)  # m: num_heads_per_group
-    key = jnp.repeat(jnp.expand_dims(key, axis=3), self.num_heads_per_group, axis=3)  # BTGC->BTG1C->BTGMC
-    value = jnp.einsum('BTGC,GMC->BTGMC', value, theta.v_scale)
-
-    # query = jnp.repeat(jnp.expand_dims(query, axis=2), self.num_heads_per_group, axis=2)  # BTC->BT1C->BTMC
-    # key = jnp.repeat(jnp.expand_dims(key, axis=2), self.num_heads_per_group, axis=2)  # BTC->BT1C->BTMC
-    # value = jnp.repeat(jnp.expand_dims(value, axis=2), self.num_heads_per_group, axis=2)  # BTC->BT1C->BTMC
-    # return query, key, value
-
+    query = jnp.reshape(query, query.shape[:3] + (self.num_shared_heads_per_group, self.dim_per_shared_head))  # BTGd->BTGnh
+    query = jnp.einsum('BTGnh,GMn->BTGMnh', query, jax.nn.silu(theta.q_scale + self.scale_bias))
+    query = jnp.reshape(query, query.shape[:2] + (self.num_heads, self.shared_dim_per_group))  # BTGMnh->BT(GM)(nh)->BTNd
+    key = jnp.repeat(jnp.expand_dims(key, axis=3), self.num_heads_per_group, axis=3)  # BTGd->BTG1d->BTGMd
+    key = jnp.reshape(key, key.shape[:2] + (self.num_heads, self.shared_dim_per_group))  # BTGMd->BTNd
+    value = jnp.reshape(value, value.shape[:3] + (self.num_shared_heads_per_group, self.dim_per_shared_head))  # BTGd->BTGnh
+    value = jnp.einsum('BTGnh,GMn->BTGMnh', value, jax.nn.silu(theta.v_scale + self.scale_bias))
+    value = jnp.reshape(value, value.shape[:2] + (self.num_heads, self.shared_dim_per_group))  # BTGMnh->BT(GM)(nh)->BTNd
+    return query, key, value
+    # query = jnp.einsum('BTGC,GMC->BTGMC', query, theta.q_scale)  # m: num_heads_per_group
+    # key = jnp.repeat(jnp.expand_dims(key, axis=3), self.num_heads_per_group, axis=3)  # BTGC->BTG1C->BTGMC
+    # value = jnp.einsum('BTGC,GMC->BTGMC', value, theta.v_scale)
     shape = query.shape[:2] + (query.shape[2] * query.shape[3],) + query.shape[4:]  # BTGMC->BTNC
     return jnp.reshape(query, shape), jnp.reshape(key, shape), jnp.reshape(value, shape)
     # return tuple([jnp.reshape(x, shape) for x in [query, key, value]])
@@ -867,7 +874,7 @@ class AttentionProjection(base_layer.BaseLayer):
       w = jnp.reshape(jnp.concatenate([w, ws], axis=-1), final_shape)  # DGMH,DGMC->DGM(H+C)->DN(H+C)
 
     if self.is_output_projection:
-      assert shape[-2:] == (self.num_heads, self.dim_per_head + self.shared_dim)  # XD
+      assert shape[-2:] == (self.num_heads, self.dim_per_head + self.shared_dim_per_group)  # XD
       batch_eqn = eqn_sym[: (rank - 2)]
       if self.use_nhd_shape:
         eqn = f'{batch_eqn}NH,NHD->{batch_eqn}D'
@@ -1268,7 +1275,10 @@ class DotProductAttention(base_layer.BaseLayer):
   combined_qkv_proj_tpl: LayerTpl = template_field(CombinedQKVProjectionLayer)
   shared_qk_dim: int = 0 # XD
   shared_ov_dim: int = 0 # XD
-  scale_shared_key: bool = False  # XD
+  dim_per_shared_head: int = 1 # XD
+  scale_shared_key: bool = False # XD
+  scale_init: WeightInit = None # XD
+  scale_bias: float = 0. # XD
   shared_qkv_proj_tpl: LayerTpl = template_field(SharedQKVProjectionLayer)  # XD
   rotate_shared_qk: bool = True  # XD
   cross_head_proj_tpl: LayerTpl = template_field(CrossHeadProjection)  # XD
@@ -1383,7 +1393,10 @@ class DotProductAttention(base_layer.BaseLayer):
           num_groups=self.num_groups,
           num_heads=self.num_heads,
           shared_dim=self.shared_dim,
+          dim_per_shared_head=self.dim_per_shared_head,
           scale_shared_key=self.scale_shared_key,
+          scale_init=self.scale_init,
+          scale_bias=self.scale_bias,
       )
       if gaussian_std:
         proj_p.params_init = WeightInit.Gaussian(gaussian_std)
