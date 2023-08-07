@@ -583,6 +583,7 @@ class RelativeBias(base_layer.BaseLayer):
 class CrossHeadProjection(base_layer.BaseLayer):
   num_heads: int = 0
   num_groups: int = 0
+  init: WeightInit = None
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
@@ -593,6 +594,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
     pc = WeightHParams(
         shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group],
         mesh_shape=self.mesh_shape,
+        init=self.init,
         tensor_split_dims_mapping=wt,
         fan_in_axes=None,
         fan_out_axes=None,
@@ -715,6 +717,69 @@ class SharedQKVProjectionLayer(base_layer.BaseLayer):
     return jnp.reshape(query, shape), jnp.reshape(key, shape), jnp.reshape(value, shape)
     # return tuple([jnp.reshape(x, shape) for x in [query, key, value]])
 
+class ScaleQKVProjectionLayer(base_layer.BaseLayer):
+  num_groups: int = 0
+  num_heads: int = 0
+  num_shared_heads: int = 0
+  # shared_dim: int = 0
+  # dim_per_shared_head: int = 1
+  do_scale: bool = True
+  scale_init: WeightInit = None
+  scale_bias: float = 0.
+  rotary_position_emb: embedding_softmax.RotaryPositionalEmbedding = None
+
+  def setup(self) -> None:
+    self.num_heads_per_group = self.num_heads // self.num_groups
+    if not self.do_scale: return  # key_scale
+    wp = self.weight_split_dims_mapping
+    # self.shared_dim_per_group = self.shared_dim // self.num_groups
+    # self.num_shared_heads_per_group = self.shared_dim_per_group // self.dim_per_shared_head
+    self.num_shared_heads_per_group = self.num_shared_heads // self.num_groups
+
+    pc_shape = [self.num_groups, self.num_heads_per_group, self.num_shared_heads_per_group]
+    wt = ['mdl', None, None]
+    pc = WeightHParams(shape=pc_shape, mesh_shape=self.mesh_shape, init=self.scale_init,
+      tensor_split_dims_mapping=wt, fan_in_axes=None, fan_out_axes=None,)
+    self.create_variable('w', pc)
+
+  def __call__(self, inputs: JTensor) -> JTensor:
+    theta = self.theta
+    inputs = self._cast_to_fprop_dtype(inputs)
+    if self.rotary_position_emb is not None:
+      inputs = self.rotary_position_emb(inputs)
+      inputs = self._cast_to_fprop_dtype(inputs)
+    ret = jnp.reshape(inputs, inputs.shape[:2] + (self.num_groups, self.num_heads_per_group) + inputs.shape[3:])  # BTNH->BTGMH
+    ret = jnp.einsum('BTGMH,GML->BTGMLH', ret, theta.w + self.scale_bias) if self.do_scale  else \
+      jnp.repeat(jnp.expand_dims(ret, axis=3), self.num_heads_per_group, axis=3)  # key_scale: BTGLH->BTGMLH
+    ret = jnp.reshape(ret, ret.shape[:2] + (self.num_heads, -1))  # BTGMLH->BT(GM)(LH)->BTNC
+    return ret
+
+class SharedPostProjection(base_layer.BaseLayer):
+  input_dim: int = 0
+  num_heads: int = 0
+  num_groups: int = 0
+  num_shared_heads: int = 0
+  # shared_dim: int = 0
+  dim_per_shared_head: int = 1
+
+  def setup(self) -> None:
+    self.num_heads_per_group = self.num_heads // self.num_groups
+    self.num_shared_heads_per_group = self.num_shared_heads // self.num_groups
+
+    pc_shape = [self.input_dim, self.num_groups, self.num_shared_heads_per_group, self.dim_per_shared_head]
+    wt = ['data', 'mdl', None, None]
+    pc = WeightHParams(shape=pc_shape, mesh_shape=self.mesh_shape,
+      tensor_split_dims_mapping=wt, fan_in_axes=None, fan_out_axes=None,)
+    self.create_variable('w', pc)
+
+  def __call__(self, inputs: JTensor) -> JTensor:
+    theta = self.theta
+    inputs = self._cast_to_fprop_dtype(inputs)
+    inputs = jnp.reshape(inputs, inputs.shape[:2] + (self.num_groups, self.num_heads_per_group, 
+      self.num_shared_heads_per_group, self.dim_per_shared_head))  # BTNC->BT(GM)(LH)->BTGMLH
+    ret = jnp.einsum('BTGMLH,DGLH->BTD', inputs, theta.w)  # num_heads_per_group dim M is contracted (summed out)
+    return ret
+
 class AttentionProjection(base_layer.BaseLayer):
   """Layer that computes multi heads projection.
 
@@ -738,7 +803,9 @@ class AttentionProjection(base_layer.BaseLayer):
   input_dim: int = 0
   num_heads: int = 0
   num_groups: int = 0  # XD
-  shared_dim: int = 0  # XD
+  # shared_dim: int = 0  # XD
+  num_shared_heads: int = None  # XD
+  dim_per_shared_head: int = 1  # XD
   dim_per_head: int = 0
   is_output_projection: bool = False
   use_bias: bool = True
@@ -803,14 +870,9 @@ class AttentionProjection(base_layer.BaseLayer):
         ),
     )
     self.create_variable('w', pc)
-    if self.is_output_projection and self.shared_dim > 0: # XD
+    if self.is_output_projection and self.num_shared_heads is not None: # XD
       self.num_heads_per_group = self.num_heads // self.num_groups
-      self.shared_dim_per_group = self.shared_dim // self.num_groups
-      pc_shape = [self.input_dim, self.num_groups, self.shared_dim_per_group]
-      wt = ['data', 'mdl', None]
-      pc = WeightHParams(shape=pc_shape, mesh_shape=self.mesh_shape,
-          tensor_split_dims_mapping=wt, fan_in_axes=None, fan_out_axes=None)
-      self.create_variable('ws', pc)
+      self.num_shared_heads_per_group = self.num_shared_heads // self.num_groups
 
     if self.use_bias:
       if self.is_output_projection:
@@ -866,15 +928,9 @@ class AttentionProjection(base_layer.BaseLayer):
       w = jnp.reshape(theta.w, pc_shape)
     else:
       w = theta.w
-    if self.is_output_projection and self.shared_dim > 0:  # XD
-      assert not self.use_nhd_shape
-      w = jnp.reshape(w, [self.input_dim, self.num_groups, self.num_heads_per_group, self.dim_per_head])  # DNH->DGMH
-      ws = jnp.repeat(jnp.expand_dims(theta.ws, axis=2), self.num_heads_per_group, axis=2)  # DGC->DG1C->DGMC
-      final_shape = [self.input_dim, self.num_heads, self.dim_per_head + self.shared_dim_per_group]
-      w = jnp.reshape(jnp.concatenate([w, ws], axis=-1), final_shape)  # DGMH,DGMC->DGM(H+C)->DN(H+C)
 
     if self.is_output_projection:
-      assert shape[-2:] == (self.num_heads, self.dim_per_head + self.shared_dim_per_group)  # XD
+      assert shape[-2:] == (self.num_heads, self.dim_per_head)
       batch_eqn = eqn_sym[: (rank - 2)]
       if self.use_nhd_shape:
         eqn = f'{batch_eqn}NH,NHD->{batch_eqn}D'
@@ -889,6 +945,16 @@ class AttentionProjection(base_layer.BaseLayer):
     ret = self.einsum(eqn, inputs, w)
     if self.use_bias:
       ret += theta.b
+    return ret
+
+  def project_shared_output(self, inputs: JTensor) -> JTensor:  # XD
+    theta = self.theta
+    inputs = self._cast_to_fprop_dtype(inputs)
+    w = jnp.reshape(theta.w, [self.input_dim, self.num_groups,
+      self.num_heads_per_group, self.dim_per_head])  # DNH->DGLH
+    inputs = jnp.reshape(inputs, inputs.shape[:2] + (self.num_groups, self.num_heads_per_group, 
+      self.num_shared_heads_per_group, self.dim_per_shared_head))  # BTNC->BT(GM)(LH)->BTGMLH
+    ret = jnp.einsum('BTGMLH,DGLH->BTD', inputs, w)  # num_heads_per_group dim M is contracted (summed out)
     return ret
 
   def extend_step(self, inputs: JTensor, *, time_step: JTensor) -> JTensor:
@@ -1275,12 +1341,14 @@ class DotProductAttention(base_layer.BaseLayer):
   combined_qkv_proj_tpl: LayerTpl = template_field(CombinedQKVProjectionLayer)
   shared_qk_dim: int = 0 # XD
   shared_ov_dim: int = 0 # XD
+  num_shared_heads: int = None  # XD
   dim_per_shared_head: int = 1 # XD
   scale_shared_key: bool = False # XD
   scale_init: WeightInit = None # XD
   scale_bias: float = 0. # XD
-  shared_qkv_proj_tpl: LayerTpl = template_field(SharedQKVProjectionLayer)  # XD
-  rotate_shared_qk: bool = True  # XD
+  scale_qkv_proj_tpl: LayerTpl = template_field(ScaleQKVProjectionLayer)  # XD
+  shared_post_proj_tpl: LayerTpl = template_field(SharedPostProjection)  # XD
+  # rotate_shared_qk: bool = True  # XD
   cross_head_proj_tpl: LayerTpl = template_field(CrossHeadProjection)  # XD
   cross_head_ffn_tpl: LayerTpl = template_field(CrossHeadFFN)  # XD
   squeeze_ratio: int = None  # XD
@@ -1289,7 +1357,7 @@ class DotProductAttention(base_layer.BaseLayer):
   output_proj_use_nhd_shape: bool = False
   internal_enable_query_scale: bool = True
   internal_enable_per_dim_scale: bool = True
-  scale_query_by_dim_per_head: bool = False
+  scale_query_by_dim_per_head: bool = True  # XD: False
   scale_logits_by_head_dims: bool = False
   atten_logit_cap: float = 0.0
   float32_logits: bool = False  # XD
@@ -1350,12 +1418,13 @@ class DotProductAttention(base_layer.BaseLayer):
   # This function is meant to be overridden by subclasses, e.g. the streaming
   # subclass.
   def _create_rotary_position_emb(
-      self, layer_tpl: LayerTpl, dim_per_head: int
+      self, layer_tpl: LayerTpl, dim_per_head: int,
+      name='rotary_position_emb',  # XD add
   ) -> None:
     pos_emb_p = layer_tpl.clone()
     pos_emb_p.embedding_dims = dim_per_head
     pos_emb_p.cast_as_fprop_dtype = self.cast_rotary_position_emb
-    self.create_child('rotary_position_emb', pos_emb_p)
+    self.create_child(name, pos_emb_p)  # XD: 'rotary_position_emb' -> name
 
   def setup(self) -> None:
     self.shared_dim = max(self.shared_qk_dim, self.shared_ov_dim)
@@ -1387,26 +1456,10 @@ class DotProductAttention(base_layer.BaseLayer):
       proj_p.weight_split_dims_mapping.wt = wp.proj
       return proj_p
 
-    def shared_qkv_project_input(input_dim, gaussian_std=None):  # XD
-      proj_p = self.shared_qkv_proj_tpl.clone().set(
-          input_dim=input_dim,
-          num_groups=self.num_groups,
-          num_heads=self.num_heads,
-          shared_dim=self.shared_dim,
-          dim_per_shared_head=self.dim_per_shared_head,
-          scale_shared_key=self.scale_shared_key,
-          scale_init=self.scale_init,
-          scale_bias=self.scale_bias,
-      )
-      if gaussian_std:
-        proj_p.params_init = WeightInit.Gaussian(gaussian_std)
-      proj_p.weight_split_dims_mapping.wt = wp.proj
-      return proj_p
-
-    def combined_qkv_project_input(input_dim):
+    def combined_qkv_project_input(input_dim, num_heads, dim_per_head):  # XD: add num_heads and dim_per_head
       proj_p = self.combined_qkv_proj_tpl.clone().set(
           input_dim=input_dim,
-          num_heads=self.num_heads,
+          num_heads=num_heads,  # XD: remove self.
           dim_per_head=dim_per_head,
           use_bias=self.use_bias,
       )
@@ -1418,7 +1471,8 @@ class DotProductAttention(base_layer.BaseLayer):
         dict(squeeze_ratio=self.squeeze_ratio, squeeze_activation_cls=self.squeeze_activation_cls)) \
         if self.squeeze_ratio is not None else (self.cross_head_proj_tpl, dict())
       proj_p = cross_head_tpl.clone().set(
-          num_heads=self.num_heads, num_groups=self.num_groups, **kwargs)
+        num_heads=self.num_heads, num_groups=self.num_groups,
+        init=self.scale_init, **kwargs)
       if gaussian_std:
         proj_p.params_init = WeightInit.Gaussian(gaussian_std)
       proj_p.weight_split_dims_mapping.wt = wp.proj
@@ -1459,10 +1513,6 @@ class DotProductAttention(base_layer.BaseLayer):
       if self.value_gate_activation_cls:  # XD
         self.create_child('value_gate', project_input(value_input_dim, dim_per_head_v, value_std))
         self.create_child('value_gate_activation',  pax_fiddle.Config(self.value_gate_activation_cls).clone())
-    if self.shared_dim > 0:  # XD
-      self.create_child('shared_qkv', shared_qkv_project_input(query_input_dim))
-    if self.project_logits: self.create_child('pre_proj', project_logits_or_probs()) # XD
-    if self.project_probs: self.create_child('post_proj', project_logits_or_probs()) # XD
     if self.qk_norm:  # XD
       for name in ['q_norm', 'k_norm']:
         params = self.qk_norm_tpl.clone()
@@ -1471,8 +1521,51 @@ class DotProductAttention(base_layer.BaseLayer):
         self.create_child(name, params)
     if self.use_rotary_position_emb:
       self._create_rotary_position_emb(
-          self.rotary_position_emb_tpl, dim_per_head + (self.shared_qk_dim if self.rotate_shared_qk else 0) # XD
+          self.rotary_position_emb_tpl, dim_per_head
       )
+
+    def scale_qkv_projections(num_shared_heads, do_scale, rotary_position_emb=None, gaussian_std=None):  # XD
+      scale_p = self.scale_qkv_proj_tpl.clone().set(
+          num_groups=self.num_groups,
+          num_heads=self.num_heads,
+          num_shared_heads=num_shared_heads,
+          do_scale=do_scale,
+          scale_init=self.scale_init,
+          scale_bias=self.scale_bias,
+          rotary_position_emb=rotary_position_emb,
+      )
+      if gaussian_std:
+        scale_p.params_init = WeightInit.Gaussian(gaussian_std)
+      scale_p.weight_split_dims_mapping.wt = wp.proj
+      return scale_p
+
+    if self.shared_dim > 0:  # XD
+      if self.num_shared_heads is None:
+        num_shared_heads = self.shared_dim // self.dim_per_shared_head
+      else:
+        assert self.num_shared_heads == self.shared_dim // self.dim_per_shared_head, \
+          f'{self.num_shared_heads} != {self.shared_dim} // {self.dim_per_shared_head}'
+        num_shared_heads = self.num_shared_heads
+      rotary_position_emb = self.rotary_position_emb
+      if self.shared_dim != self.hidden_dim:
+        # self.create_child('shared_qkv', shared_qkv_project_input(query_input_dim))
+        self.create_child('shared_qkv', combined_qkv_project_input(
+          query_input_dim, num_shared_heads, self.dim_per_shared_head))
+        if self.use_rotary_position_emb:
+          self._create_rotary_position_emb(
+              self.rotary_position_emb_tpl, self.dim_per_shared_head,
+              name='shared_rotary_position_emb')
+          rotary_position_emb = self.shared_rotary_position_emb
+      if self.shared_qk_dim > 0:
+        self.create_child('query_scale', scale_qkv_projections(num_shared_heads, True,
+          rotary_position_emb=rotary_position_emb))
+        self.create_child('key_scale', scale_qkv_projections(num_shared_heads, False,
+          rotary_position_emb=rotary_position_emb))
+      if self.shared_ov_dim > 0:
+        self.create_child('value_scale', scale_qkv_projections(num_shared_heads, True))
+
+    if self.project_logits: self.create_child('pre_proj', project_logits_or_probs()) # XD
+    if self.project_probs: self.create_child('post_proj', project_logits_or_probs()) # XD
 
     if self.relative_bias_tpl is not None:
       relative_bias_p = self.relative_bias_tpl.clone()
@@ -1502,18 +1595,29 @@ class DotProductAttention(base_layer.BaseLayer):
         'atten_dropout',
         self.dropout_tpl.clone().set(keep_prob=1.0 - self.atten_dropout_prob),
     )
+    if self.shared_ov_dim > 0 and self.shared_ov_dim != self.hidden_dim:  # XD
+      shared_post_proj_p = self.shared_post_proj_tpl.clone().set(
+        input_dim=query_input_dim,
+        num_heads=self.num_heads,
+        num_groups=self.num_groups,
+        num_shared_heads=num_shared_heads,
+        dim_per_shared_head=self.dim_per_shared_head,
+      )
+      self.create_child('shared_post', shared_post_proj_p)
     # Setting is_output_projection=True to set the projection direction
     # from hidden dim to input dim. Output projection follows query_input_dim.
     post_proj_p = self.proj_tpl.clone().set(
         input_dim=query_input_dim,
         num_heads=self.num_heads,
-        num_groups=self.num_groups,  # XD
-        shared_dim=self.shared_ov_dim,  # XD
         dim_per_head=dim_per_head_v,  # XD: dim_per_head -> dim_per_head_v
         is_output_projection=True,
         use_bias=self.use_bias,
         use_nhd_shape=self.output_proj_use_nhd_shape,
     )
+    if self.shared_ov_dim == self.hidden_dim:  # XD
+      post_proj_p.num_groups = self.num_groups
+      post_proj_p.num_shared_heads = num_shared_heads
+      post_proj_p.dim_per_shared_head = self.dim_per_shared_head
     if post_std is not None:
       post_proj_p.params_init = WeightInit.Gaussian(post_std)
     if (
@@ -1583,7 +1687,8 @@ class DotProductAttention(base_layer.BaseLayer):
       if self.scale_query_by_dim_per_head and self.dim_per_head is not None:
         dim_per_head = self.dim_per_head
       else:
-        dim_per_head = self.hidden_dim // self.num_heads + self.shared_qk_dim  # XD
+        assert False  # XD
+        dim_per_head = self.hidden_dim // self.num_heads
 
       query *= dim_per_head**-0.5
     return query
@@ -1860,8 +1965,14 @@ class DotProductAttention(base_layer.BaseLayer):
       key_proj = self.key(key_vec)
       value_proj = self.value(value_vec)
     if self.shared_dim > 0:  # XD: BTD->BTNC
-      shared_query_proj, shared_key_proj, shared_value_proj = self.shared_qkv(query_vec)
-      if self.shared_ov_dim > 0: value_proj = jnp.concatenate([value_proj, shared_value_proj], axis=-1)
+      shared_query_proj, shared_key_proj, shared_value_proj = self.shared_qkv(query_vec) \
+        if hasattr(self, 'shared_qkv') else (query_proj, key_proj, value_proj)
+      if self.shared_qk_dim > 0:
+        shared_query_proj = self.query_scale(shared_query_proj)
+        shared_key_proj = self.key_scale(shared_key_proj)
+      if self.shared_ov_dim > 0:
+        shared_value_proj = self.value_scale(shared_value_proj)
+        value_proj = jnp.concatenate([value_proj, shared_value_proj], axis=-1)
 
     self._fprop_update_decode_state('key_state', key_proj)
     self._fprop_update_decode_state('value_state', value_proj)
@@ -1878,9 +1989,6 @@ class DotProductAttention(base_layer.BaseLayer):
       value_proj = self.dconv_v(value_proj, axis=1, segment_pos=key_segment_pos)
       self._fprop_update_decode_state('value_post_dconv', value_proj)
 
-    if self.shared_qk_dim > 0 and self.rotate_shared_qk:  # XD: BTNH+BTNC->BTN(H+C)
-      query_proj = jnp.concatenate([query_proj, shared_query_proj], axis=-1)
-      key_proj = jnp.concatenate([key_proj, shared_key_proj], axis=-1)
     if self.qk_norm:  # XD
       query_proj, key_proj = self.q_norm(query_proj), self.k_norm(key_proj)
     # Apply rotary position embeddings.
@@ -1890,7 +1998,7 @@ class DotProductAttention(base_layer.BaseLayer):
       key_proj = self.rotary_position_emb(key_proj, key_segment_pos)
       # query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)  # XD
       self._fprop_update_decode_state('key_post_rotary_pos_emb', key_proj)
-    if self.shared_qk_dim > 0 and not self.rotate_shared_qk:  # XD: BTNH+BTNC->BTN(H+C)
+    if self.shared_qk_dim > 0:  # XD: BTNH+BTNC->BTN(H+C)
       query_proj = jnp.concatenate([query_proj, shared_query_proj], axis=-1)
       key_proj = jnp.concatenate([key_proj, shared_key_proj], axis=-1)
 
@@ -1928,7 +2036,14 @@ class DotProductAttention(base_layer.BaseLayer):
       )
 
     # Post projection
+    if self.shared_ov_dim > 0:  # XD
+      dim_per_head = self.dim_per_head or self.dim_per_head_v or self.hidden_dim // self.num_heads
+      encoded, shared_encoded = jnp.split(encoded, [dim_per_head,], axis=-1)  # BT(D+C)
+      shared_encoded = self.shared_post(shared_encoded) \
+        if self.shared_ov_dim != self.hidden_dim else \
+        self.post.project_shared_output(shared_encoded)
     encoded = self.post(encoded)
+    if self.shared_ov_dim > 0: encoded = encoded + shared_encoded  # XD
     encoded = self._shard_bld(encoded)
     encoded = checkpoint_name(encoded, 'out_proj')
 
