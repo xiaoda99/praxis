@@ -585,6 +585,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
   num_groups: int = 0
   residual: bool = True
   init: WeightInit = None
+  transpose: bool = False
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
@@ -605,11 +606,18 @@ class CrossHeadProjection(base_layer.BaseLayer):
   def __call__(self, inputs: JTensor) -> JTensor:
     shape = inputs.shape
     inputs = self._cast_to_fprop_dtype(inputs)
-    assert shape[1] == self.num_heads
-    inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
-    # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
-    ret = jnp.einsum('BGMTS,GMN->BGNTS', inputs, self.theta.w)
+    # assert shape[1] == self.num_heads
+    if self.transpose:
+      # inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
+      inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))  # BTSN->BTSGM
+      exp = 'BTSGM,GMN->BTSGN'
+    else:
+      inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
+      # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
+      exp = 'BGMTS,GMN->BGNTS'
+    ret = jnp.einsum(exp, inputs, self.theta.w)
     if self.residual: ret = ret + inputs
+    # if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
     # inputs = inputs + jnp.repeat(inputs[:, :, 0:1, :, :], self.num_heads_per_group, axis=2)  # jnp.roll(inputs, 1, axis=2) #
     return jnp.reshape(ret, shape)  # BGMTS->BNTS
 
@@ -622,6 +630,7 @@ class CrossHeadFFN(base_layer.BaseLayer):
   residual: bool = True
   init: WeightInit = None
   use_bias = True
+  transpose: bool = False
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
@@ -658,13 +667,20 @@ class CrossHeadFFN(base_layer.BaseLayer):
   def __call__(self, inputs: JTensor) -> JTensor:
     shape = inputs.shape
     inputs = self._cast_to_fprop_dtype(inputs)
-    assert shape[1] == self.num_heads
-    inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
-    ret = jnp.einsum('BGMTS,GMN->BGNTS', inputs, self.theta.w1)
-    if self.use_bias: ret = ret + jnp.expand_dims(self.theta.b, axis=(1, 2))
+    # assert shape[1] == self.num_heads
+    if self.transpose:
+      # inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
+      inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))  # BTSN->BTSGM
+      exp = 'BTSGM,GMN->BTSGN'
+    else:
+      inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
+      exp = 'BGMTS,GMN->BGNTS'
+    ret = jnp.einsum(exp, inputs, self.theta.w1)
+    if self.use_bias: ret = ret + (self.theta.b if self.transpose else jnp.expand_dims(self.theta.b, axis=(1, 2)))
     ret = self.activation(ret)
-    ret = jnp.einsum('BGNTS,GNM->BGMTS', ret, self.theta.w2)
+    ret = jnp.einsum(exp, ret, self.theta.w2)
     if self.residual: ret = ret + inputs
+    # if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
     return jnp.reshape(ret, shape)  # BGMTS->BNTS
 
 class SharedQKVProjectionLayer(base_layer.BaseLayer):
@@ -1355,6 +1371,7 @@ class DotProductAttention(base_layer.BaseLayer):
   probs_squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
   cross_head_proj_tpl: LayerTpl = template_field(CrossHeadProjection)
   cross_head_ffn_tpl: LayerTpl = template_field(CrossHeadFFN)
+  transpose_logits: bool = False
 
   dim_per_head: Optional[int] = None
   # XD: gated attention related
@@ -1764,7 +1781,8 @@ class DotProductAttention(base_layer.BaseLayer):
 
   def _atten_logits(self, query: JTensor, key: JTensor) -> JTensor:
     """Compute logits from query and key."""
-    logits = self.qk_einsum('BTNH,BSNH->BNTS', query, key)
+    logits = self.qk_einsum('BTNH,BSNH->BNTS', query, key) \
+      if not self.transpose_logits else self.qk_einsum('BTNH,BSNH->BTSN', query, key) # XD
     return logits
 
   def _cross_head_proj(self, bnts, proj_name):  # XD: bnts is attn logits or weights
@@ -1826,6 +1844,8 @@ class DotProductAttention(base_layer.BaseLayer):
 
     logits = self._cross_head_proj(logits, 'pre_proj')  # XD
 
+    if self.transpose_logits:
+      atten_mask = jnp.transpose(atten_mask, (0, 2, 3, 1))  # XD: BNTS->BTSN
     self.add_summary(
         'max_logit_precap',
         jnp.max(py_utils.apply_mask_to_logits(logits, atten_mask)),
@@ -1844,7 +1864,7 @@ class DotProductAttention(base_layer.BaseLayer):
     if self.attention_mask_summary:
       self.add_summary('attention_mask', atten_mask)
     if self.attention_extra_logit is None:
-      probs = jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
+      probs = jax.nn.softmax(padded_logits, axis=-1 - int(self.transpose_logits)).astype(key.dtype) # XD: -1 -> -2
     else:
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
           key.dtype
@@ -1853,7 +1873,9 @@ class DotProductAttention(base_layer.BaseLayer):
     # Apply attention dropout.
     probs = self.atten_dropout(probs)
     # Compute the attention context.
-    encoded = self.pv_einsum('BNTS,BSNH->BTNH', probs, value)
+    if self.transpose_logits: probs = jnp.transpose(probs, (0, 3, 1, 2)) # XD: BTSN -> BNTS
+    encoded = self.pv_einsum('BNTS,BSNH->BTNH', probs, value) #\
+      # if not self.transpose_logits else self.pv_einsum('BTSN,BSNH->BTNH', probs, value)  # XD
 
     if self.zero_fully_masked:
       # Return zeros for tokens which don't attend anything.
