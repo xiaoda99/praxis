@@ -1169,7 +1169,8 @@ class Transformer(base_layer.BaseLayer):
     else:
       atten_tpl.name = name
     atten_tpl.input_dim = self.input_dims
-    atten_tpl.hidden_dim = self.input_dims
+    atten_tpl.hidden_dim = self.num_heads * self.dim_per_head \
+      if self.dim_per_head is not None else self.input_dims  # XD
     atten_tpl.num_heads = self.num_heads
     atten_tpl.dim_per_head = self.dim_per_head
     atten_tpl.atten_dropout_prob = self.atten_dropout_prob

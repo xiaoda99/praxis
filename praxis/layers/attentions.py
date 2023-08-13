@@ -25,6 +25,7 @@ from flax import linen as nn
 import jax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+from einops import rearrange, repeat  # XD
 import numpy as np
 from praxis import asserts
 from praxis import base_layer
@@ -580,26 +581,32 @@ class RelativeBias(base_layer.BaseLayer):
     )
     return relative_bias
 
+from jax import lax # XD
 class CrossHeadProjection(base_layer.BaseLayer):
   num_heads: int = 0
   num_groups: int = 0
   residual: bool = True
   init: WeightInit = None
   transpose: bool = False
+  left_mul: bool = False
+  use_conv: bool = False
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
-    # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
-    wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
     self.num_heads_per_group = self.num_heads // self.num_groups
+    if self.use_conv:
+      assert self.num_groups == 1, f'{self.num_groups} != 1'
+      shape = [self.num_heads_per_group, self.num_heads_per_group, 1, 1]  # OIWH
+      wt = [None, None, None, None]
+    else:
+      shape = [self.num_groups, self.num_heads_per_group, self.num_heads_per_group]
+      # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
+      wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
 
     pc = WeightHParams(
-        shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group],
-        mesh_shape=self.mesh_shape,
-        init=self.init,
-        tensor_split_dims_mapping=wt,
-        fan_in_axes=None,
-        fan_out_axes=None,
+        shape=shape, mesh_shape=self.mesh_shape,
+        tensor_split_dims_mapping=wt, init=self.init, 
+        fan_in_axes=None, fan_out_axes=None,
     )
     self.create_variable('w', pc)
 
@@ -607,15 +614,18 @@ class CrossHeadProjection(base_layer.BaseLayer):
     shape = inputs.shape
     inputs = self._cast_to_fprop_dtype(inputs)
     # assert shape[1] == self.num_heads
-    if self.transpose:
-      # inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
-      inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))  # BTSN->BTSGM
-      exp = 'BTSGM,GMN->BTSGN'
+    if self.use_conv:  # an order of magnitude slower than einsum!
+      ret = lax.conv(inputs, self.theta.w, (1, 1), 'SAME') # BNTS,MN11->BMTS
     else:
-      inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
-      # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
-      exp = 'BGMTS,GMN->BGNTS'
-    ret = jnp.einsum(exp, inputs, self.theta.w)
+      if self.transpose:
+        # inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
+        inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))  # BTSN->BTSGM
+        exp = 'BTSGM,GMN->BTSGN'
+      else:
+        inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
+        # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
+        exp = 'BGMTS,GMN->BGNTS' if not self.left_mul else 'GNM,BGMTS->BGNTS'
+      ret = jnp.einsum(exp, inputs, self.theta.w) if not self.left_mul else jnp.einsum(exp, self.theta.w, inputs)
     if self.residual: ret = ret + inputs
     # if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
     # inputs = inputs + jnp.repeat(inputs[:, :, 0:1, :, :], self.num_heads_per_group, axis=2)  # jnp.roll(inputs, 1, axis=2) #
@@ -631,6 +641,7 @@ class CrossHeadFFN(base_layer.BaseLayer):
   init: WeightInit = None
   use_bias = True
   transpose: bool = False
+  left_mul: bool = False
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
@@ -659,7 +670,7 @@ class CrossHeadFFN(base_layer.BaseLayer):
 
     pc2 = WeightHParams(
         shape=[self.num_groups, self.hidden_dim, self.num_heads_per_group],
-        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,
+        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=self.init,
         fan_in_axes=None, fan_out_axes=None,
     )
     self.create_variable('w2', pc2)
@@ -674,81 +685,14 @@ class CrossHeadFFN(base_layer.BaseLayer):
       exp = 'BTSGM,GMN->BTSGN'
     else:
       inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
-      exp = 'BGMTS,GMN->BGNTS'
-    ret = jnp.einsum(exp, inputs, self.theta.w1)
+      exp = 'BGMTS,GMN->BGNTS' if not self.left_mul else 'GNM,BGMTS->BGNTS'
+    ret = jnp.einsum(exp, inputs, self.theta.w1) if not self.left_mul else jnp.einsum(exp, self.theta.w1, inputs)
     if self.use_bias: ret = ret + (self.theta.b if self.transpose else jnp.expand_dims(self.theta.b, axis=(1, 2)))
     ret = self.activation(ret)
-    ret = jnp.einsum(exp, ret, self.theta.w2)
+    ret = jnp.einsum(exp, ret, self.theta.w2) if not self.left_mul else jnp.einsum(exp, self.theta.w2, ret)
     if self.residual: ret = ret + inputs
     # if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
     return jnp.reshape(ret, shape)  # BGMTS->BNTS
-
-class SharedQKVProjectionLayer(base_layer.BaseLayer):
-  input_dim: int = 0
-  num_groups: int = 0
-  num_heads: int = 0
-  shared_dim: int = 0
-  dim_per_shared_head: int = 1
-  scale_shared_key: bool = False
-  scale_init: WeightInit = None
-  scale_bias: float = 0.
-
-  def setup(self) -> None:
-    wp = self.weight_split_dims_mapping
-    self.num_heads_per_group = self.num_heads // self.num_groups
-    self.shared_dim_per_group = self.shared_dim // self.num_groups
-    self.num_shared_heads_per_group = self.shared_dim_per_group // self.dim_per_shared_head
-
-    pc_shape = [self.input_dim, self.num_groups, 3 * self.shared_dim_per_group]
-    wt = ['data', 'mdl', None]
-    # pc_shape = [self.input_dim, 3 * self.shared_dim_per_group]
-    # wt = ['data', 'mdl']
-    pc = WeightHParams(shape=pc_shape, mesh_shape=self.mesh_shape,
-      tensor_split_dims_mapping=wt, fan_in_axes=None, fan_out_axes=None)
-    self.create_variable('w', pc)
-
-    if self.scale_shared_key:
-        pc_shape = [self.num_groups, self.num_heads_per_group, 3 * self.shared_dim_per_group]
-        wt = ['mdl', None, None]
-        pc = WeightHParams(shape=pc_shape, mesh_shape=self.mesh_shape,
-          tensor_split_dims_mapping=wt, fan_in_axes=None, fan_out_axes=None)
-        self.create_variable('scale', pc)
-    else:
-      for name in ['q_scale', 'v_scale']:
-        pc_shape = [self.num_groups, self.num_heads_per_group, self.num_shared_heads_per_group]
-        wt = ['mdl', None, None]
-        pc = WeightHParams(shape=pc_shape, mesh_shape=self.mesh_shape, init=self.scale_init,
-          tensor_split_dims_mapping=wt, fan_in_axes=None, fan_out_axes=None,)
-        self.create_variable(name, pc)
-
-  def __call__(self, inputs: JTensor) -> JTensor:
-    theta = self.theta
-    inputs = self._cast_to_fprop_dtype(inputs)
-    if self.scale_shared_key:
-      # qkv = jnp.einsum('BTD,DGC->BTGC', inputs, theta.w)  # G: group, C: 3 * shared_dim
-      # qkv = jnp.einsum('BTGC,GMC->BTGMC', qkv, theta.scale)
-      qkv = jnp.einsum('BTD,DGC,GMC->BTGMC', inputs, theta.w, theta.scale)
-      shape = qkv.shape[:2] + (qkv.shape[2] * qkv.shape[3],) + qkv.shape[4:]  # BTGMC->BTNC
-      qkv = jnp.reshape(qkv, shape)
-      return jnp.split(qkv, 3, axis=-1)
-    qkv = jnp.einsum('BTD,DGC->BTGC', inputs, theta.w)  # G: group, C: 3 * shared_dim_per_group
-    query, key, value = jnp.split(qkv, 3, axis=-1)
-    # query, key, value = qkv  # jnp.split(qkv, 3, axis=0)
-    query = jnp.reshape(query, query.shape[:3] + (self.num_shared_heads_per_group, self.dim_per_shared_head))  # BTGd->BTGnh
-    query = jnp.einsum('BTGnh,GMn->BTGMnh', query, jax.nn.silu(theta.q_scale + self.scale_bias))
-    query = jnp.reshape(query, query.shape[:2] + (self.num_heads, self.shared_dim_per_group))  # BTGMnh->BT(GM)(nh)->BTNd
-    key = jnp.repeat(jnp.expand_dims(key, axis=3), self.num_heads_per_group, axis=3)  # BTGd->BTG1d->BTGMd
-    key = jnp.reshape(key, key.shape[:2] + (self.num_heads, self.shared_dim_per_group))  # BTGMd->BTNd
-    value = jnp.reshape(value, value.shape[:3] + (self.num_shared_heads_per_group, self.dim_per_shared_head))  # BTGd->BTGnh
-    value = jnp.einsum('BTGnh,GMn->BTGMnh', value, jax.nn.silu(theta.v_scale + self.scale_bias))
-    value = jnp.reshape(value, value.shape[:2] + (self.num_heads, self.shared_dim_per_group))  # BTGMnh->BT(GM)(nh)->BTNd
-    return query, key, value
-    # query = jnp.einsum('BTGC,GMC->BTGMC', query, theta.q_scale)  # m: num_heads_per_group
-    # key = jnp.repeat(jnp.expand_dims(key, axis=3), self.num_heads_per_group, axis=3)  # BTGC->BTG1C->BTGMC
-    # value = jnp.einsum('BTGC,GMC->BTGMC', value, theta.v_scale)
-    shape = query.shape[:2] + (query.shape[2] * query.shape[3],) + query.shape[4:]  # BTGMC->BTNC
-    return jnp.reshape(query, shape), jnp.reshape(key, shape), jnp.reshape(value, shape)
-    # return tuple([jnp.reshape(x, shape) for x in [query, key, value]])
 
 class ScaleQKVProjectionLayer(base_layer.BaseLayer):
   num_groups: int = 0
@@ -781,10 +725,13 @@ class ScaleQKVProjectionLayer(base_layer.BaseLayer):
     if self.rotary_position_emb is not None:
       inputs = self.rotary_position_emb(inputs)
       inputs = self._cast_to_fprop_dtype(inputs)
-    ret = jnp.reshape(inputs, inputs.shape[:2] + (self.num_groups, self.num_heads_per_group) + inputs.shape[3:])  # BTNH->BTGMH
-    ret = jnp.einsum('BTGMH,GML->BTGMLH', ret, theta.w + self.scale_bias) if self.do_scale  else \
-      jnp.repeat(jnp.expand_dims(ret, axis=3), self.num_heads_per_group, axis=3)  # key_scale: BTGLH->BTGMLH
-    ret = jnp.reshape(ret, ret.shape[:2] + (self.num_heads, -1))  # BTGMLH->BT(GM)(LH)->BTNC
+    # ret = jnp.reshape(inputs, inputs.shape[:2] + (self.num_groups, self.num_heads_per_group) + inputs.shape[3:])  # BTNH->BTGMH
+    ret = rearrange(inputs, 'B T (G L) H -> B T G L H', G=self.num_groups)
+    ret = jnp.einsum('BTGLH,GML->BTGMLH', ret, theta.w + self.scale_bias) if self.do_scale  else \
+      repeat(ret, 'B T G L H -> B T G M L H', M=self.num_heads_per_group)
+      # jnp.repeat(jnp.expand_dims(ret, axis=3), self.num_heads_per_group, axis=3)  # key_scale: BTGLH->BTGMLH
+    # ret = jnp.reshape(ret, ret.shape[:2] + (self.num_heads, -1))  # BTGMLH->BT(GM)(LH)->BTNC
+    ret = rearrange(ret, 'B T G M L H -> B T G M (L H)')
     return ret
 
 class SharedPostProjection(base_layer.BaseLayer):
@@ -982,11 +929,10 @@ class AttentionProjection(base_layer.BaseLayer):
 
   def project_shared_output(self, inputs: JTensor) -> JTensor:  # XD
     theta = self.theta
-    inputs = self._cast_to_fprop_dtype(inputs)
-    w = jnp.reshape(theta.w, [self.input_dim, self.num_groups,
-      self.num_heads_per_group, self.dim_per_head])  # DNH->DGLH
-    inputs = jnp.reshape(inputs, inputs.shape[:2] + (self.num_groups, self.num_heads_per_group, 
-      self.num_shared_heads_per_group, self.dim_per_shared_head))  # BTNC->BT(GM)(LH)->BTGMLH
+    # inputs = self._cast_to_fprop_dtype(inputs)
+    w = rearrange(theta.w, 'D (G L) H -> D G L H', G=self.num_groups)
+    inputs = rearrange(inputs, 'B T (G M) (L H) -> B T G M L H',
+      G=self.num_groups, L=self.num_shared_heads_per_group)
     ret = jnp.einsum('BTGMLH,DGLH->BTD', inputs, w)  # num_heads_per_group dim M is contracted (summed out)
     return ret
 
@@ -1372,6 +1318,7 @@ class DotProductAttention(base_layer.BaseLayer):
   cross_head_proj_tpl: LayerTpl = template_field(CrossHeadProjection)
   cross_head_ffn_tpl: LayerTpl = template_field(CrossHeadFFN)
   transpose_logits: bool = False
+  left_mul: bool = False
 
   dim_per_head: Optional[int] = None
   # XD: gated attention related
@@ -1395,7 +1342,7 @@ class DotProductAttention(base_layer.BaseLayer):
   scale_bias: float = 0. # XD
   scale_qkv_proj_tpl: LayerTpl = template_field(ScaleQKVProjectionLayer)  # XD
   shared_post_proj_tpl: LayerTpl = template_field(SharedPostProjection)  # XD
-  # rotate_shared_qk: bool = True  # XD
+  rotate_shared_qk: bool = True  # XD
   use_bias: bool = True
   output_proj_use_nhd_shape: bool = False
   internal_enable_query_scale: bool = True
@@ -1404,6 +1351,7 @@ class DotProductAttention(base_layer.BaseLayer):
   scale_logits_by_head_dims: bool = False
   atten_logit_cap: float = 0.0
   float32_logits: bool = False  # XD
+  float32_value: bool = False  # XD
   qk_norm: bool = False  # XD
   qk_norm_tpl: LayerTpl = template_field(normalizations.LayerNorm)  # XD
   # TODO(pax-dev): merge use_rotary_position_emb and rotary_position_emb_tpl
@@ -1509,13 +1457,14 @@ class DotProductAttention(base_layer.BaseLayer):
       proj_p.weight_split_dims_mapping.wt = wp.proj
       return proj_p
 
-    def project_logits_or_probs(squeeze_ratio=None, squeeze_activation_cls=None, residual=True, gaussian_std=None):  # XD
+    def project_logits_or_probs(squeeze_ratio=None, squeeze_activation_cls=None,
+        residual=True, gaussian_std=None):  # XD
       cross_head_tpl, kwargs = (self.cross_head_ffn_tpl,
         dict(squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls)) \
         if squeeze_ratio is not None else (self.cross_head_proj_tpl, dict())
       proj_p = cross_head_tpl.clone().set(
         num_heads=self.num_heads, num_groups=self.num_groups, residual=residual,
-        init=self.scale_init, **kwargs)
+        init=self.scale_init, transpose=self.transpose_logits, left_mul=self.left_mul, **kwargs)
       if gaussian_std:
         proj_p.params_init = WeightInit.Gaussian(gaussian_std)
       proj_p.weight_split_dims_mapping.wt = wp.proj
@@ -1589,17 +1538,16 @@ class DotProductAttention(base_layer.BaseLayer):
         assert self.num_shared_heads == self.shared_dim // self.dim_per_shared_head, \
           f'{self.num_shared_heads} != {self.shared_dim} // {self.dim_per_shared_head}'
         num_shared_heads = self.num_shared_heads
-      rotary_position_emb = self.rotary_position_emb
       if self.shared_dim != self.hidden_dim:
-        # self.create_child('shared_qkv', shared_qkv_project_input(query_input_dim))
         self.create_child('shared_qkv', combined_qkv_project_input(
           query_input_dim, num_shared_heads, self.dim_per_shared_head))
-        if self.use_rotary_position_emb:
-          self._create_rotary_position_emb(
-              self.rotary_position_emb_tpl, self.dim_per_shared_head,
-              name='shared_rotary_position_emb')
-          rotary_position_emb = self.shared_rotary_position_emb
       if self.shared_qk_dim > 0:
+        rotary_position_emb = None
+        if self.shared_dim != self.hidden_dim and self.rotate_shared_qk:
+            self._create_rotary_position_emb(
+                self.rotary_position_emb_tpl, self.dim_per_shared_head,
+                name='shared_rotary_position_emb')
+            rotary_position_emb = self.shared_rotary_position_emb
         self.create_child('query_scale', scale_qkv_projections(num_shared_heads, True,
           rotary_position_emb=rotary_position_emb))
         self.create_child('key_scale', scale_qkv_projections(num_shared_heads, False,
@@ -1831,7 +1779,8 @@ class DotProductAttention(base_layer.BaseLayer):
     asserts.in_set(atten_mask.shape[2], [t, 1])
     asserts.in_set(atten_mask.shape[0], [b, 1])
 
-    if not self.qk_norm: query = self._scale_query(query)  # XD: add if
+    if not self.qk_norm and not (self.shared_qk_dim > 0 and self.float32_logits):  # XD
+      query = self._scale_query(query)
     logits = self._atten_logits(query, key)
     if relative_bias is not None:
       # The relative_bias has shape [1, n, t, s] or [b, n, t, s].
@@ -1841,6 +1790,9 @@ class DotProductAttention(base_layer.BaseLayer):
 
     if self.scale_logits_by_head_dims:
       logits = jnp.multiply(logits, 1.0 / np.sqrt(h))
+    if self.shared_qk_dim > 0 and self.float32_logits:  # XD
+      assert not self.scale_logits_by_head_dims
+      logits = jnp.multiply(logits, 1.0 / np.sqrt(self.dim_per_head))
 
     logits = self._cross_head_proj(logits, 'pre_proj')  # XD
 
@@ -1864,7 +1816,8 @@ class DotProductAttention(base_layer.BaseLayer):
     if self.attention_mask_summary:
       self.add_summary('attention_mask', atten_mask)
     if self.attention_extra_logit is None:
-      probs = jax.nn.softmax(padded_logits, axis=-1 - int(self.transpose_logits)).astype(key.dtype) # XD: -1 -> -2
+      # XD: -1 -> -2; key -> value: key may have already been turned to fp32 by float32_logits
+      probs = jax.nn.softmax(padded_logits, axis=-1 - int(self.transpose_logits)).astype(value.dtype)
     else:
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
           key.dtype
@@ -2020,15 +1973,6 @@ class DotProductAttention(base_layer.BaseLayer):
       query_proj = self.query(query_vec)
       key_proj = self.key(key_vec)
       value_proj = self.value(value_vec)
-    if self.shared_dim > 0:  # XD: BTD->BTNC
-      shared_query_proj, shared_key_proj, shared_value_proj = self.shared_qkv(query_vec) \
-        if hasattr(self, 'shared_qkv') else (query_proj, key_proj, value_proj)
-      if self.shared_qk_dim > 0:
-        shared_query_proj = self.query_scale(shared_query_proj)
-        shared_key_proj = self.key_scale(shared_key_proj)
-      if self.shared_ov_dim > 0:
-        shared_value_proj = self.value_scale(shared_value_proj)
-        value_proj = jnp.concatenate([value_proj, shared_value_proj], axis=-1)
 
     self._fprop_update_decode_state('key_state', key_proj)
     self._fprop_update_decode_state('value_state', value_proj)
@@ -2054,12 +1998,23 @@ class DotProductAttention(base_layer.BaseLayer):
       key_proj = self.rotary_position_emb(key_proj, key_segment_pos)
       # query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)  # XD
       self._fprop_update_decode_state('key_post_rotary_pos_emb', key_proj)
-    if self.shared_qk_dim > 0:  # XD: BTNH+BTNC->BTN(H+C)
-      query_proj = jnp.concatenate([query_proj, shared_query_proj], axis=-1)
-      key_proj = jnp.concatenate([key_proj, shared_key_proj], axis=-1)
-
+    
     if self.float32_logits:  # xd
       query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)
+    if self.float32_value: value_proj = value_proj.astype(jnp.float32)
+    if self.shared_dim > 0:  # XD: BTD->BTNC
+      def cat(proj0, proj1):
+        proj0 = rearrange(proj0, 'B T (G M) H -> B T G M H', G=self.num_groups)
+        proj = jnp.concatenate([proj0, proj1], axis=-1)  # BTGMH+BTGMC->BTGM(H+C)
+        return rearrange(proj, 'B T G M H -> B T (G M) H')
+
+      shared_query_proj, shared_key_proj, shared_value_proj = self.shared_qkv(query_vec) \
+        if hasattr(self, 'shared_qkv') else (query_proj, key_proj, value_proj)
+      if self.shared_qk_dim > 0:
+        query_proj = cat(query_proj, self.query_scale(shared_query_proj))
+        key_proj = cat(key_proj, self.key_scale(shared_key_proj))
+      if self.shared_ov_dim > 0:
+        value_proj = cat(value_proj, self.value_scale(shared_value_proj))
 
     # Apply relative bias.
     # Paper: https://aclanthology.org/N18-2074.pdf.
@@ -2094,12 +2049,14 @@ class DotProductAttention(base_layer.BaseLayer):
     # Post projection
     if self.shared_ov_dim > 0:  # XD
       dim_per_head = self.dim_per_head or self.dim_per_head_v or self.hidden_dim // self.num_heads
-      encoded, shared_encoded = jnp.split(encoded, [dim_per_head,], axis=-1)  # BT(D+C)
+      encoded, shared_encoded = jnp.split(encoded, [dim_per_head,], axis=-1)  # BTN(H+C)
       shared_encoded = self.shared_post(shared_encoded) \
         if self.shared_ov_dim != self.hidden_dim else \
         self.post.project_shared_output(shared_encoded)
     encoded = self.post(encoded)
-    if self.shared_ov_dim > 0: encoded = encoded + shared_encoded  # XD
+    if self.shared_ov_dim > 0:  # XD
+      encoded = encoded + shared_encoded
+      if self.float32_value: encoded = self._cast_to_fprop_dtype(encoded)
     encoded = self._shard_bld(encoded)
     encoded = checkpoint_name(encoded, 'out_proj')
 
