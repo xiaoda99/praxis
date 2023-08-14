@@ -610,11 +610,15 @@ class CrossHeadProjection(base_layer.BaseLayer):
 
     # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
     wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
+    def init_fn(out_dim):
+      if self.residual or self.init is not None: return self.init
+      in_dim = self.num_heads_per_group
+      return WeightInit.Gaussian(math.sqrt(2.0 / (in_dim + out_dim)))
 
     if self.squeeze_ratio is None:
       pc = WeightHParams(
           shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group], 
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=self.init, 
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=init_fn(self.num_heads_per_group), 
           fan_in_axes=None, fan_out_axes=None,
       )
       self.create_variable('w', pc)
@@ -622,11 +626,11 @@ class CrossHeadProjection(base_layer.BaseLayer):
       self.hidden_dim = self.num_heads_per_group // self.squeeze_ratio
       pc1 = WeightHParams(
           shape=[self.num_groups, self.num_heads_per_group, self.hidden_dim],
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=self.init,
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=init_fn(self.hidden_dim),
           fan_in_axes=None, fan_out_axes=None,
       )
       self.create_variable('w1', pc1)
-      
+
       if self.use_bias:
         pc_bias = WeightHParams(
             shape=[self.hidden_dim],
@@ -640,7 +644,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
 
       pc2 = WeightHParams(
           shape=[self.num_groups, self.hidden_dim, self.num_heads_per_group],
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=self.init,
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=init_fn(self.hidden_dim),
           fan_in_axes=None, fan_out_axes=None,
       )
       self.create_variable('w2', pc2)
@@ -1867,7 +1871,12 @@ class DotProductAttention(base_layer.BaseLayer):
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
           key.dtype
       )
-    probs = self._cross_head_proj(probs, 'post_proj')  # XD
+    # XD
+    probs = self._cross_head_proj(probs, 'post_proj')
+    # mask probs similar to py_utilsapply_mask_to_logits
+    min_value = py_utils.get_large_negative_number(probs.dtype)
+    probs = jnp.where((atten_mask >= min_value * 0.5), probs, 0.)
+
     # Apply attention dropout.
     probs = self.atten_dropout(probs)
     # Compute the attention context.
