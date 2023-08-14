@@ -582,6 +582,7 @@ class RelativeBias(base_layer.BaseLayer):
     return relative_bias
 
 from jax import lax # XD
+from praxis.layers import activations as activations_lib
 class CrossHeadProjection(base_layer.BaseLayer):
   num_heads: int = 0
   num_groups: int = 0
@@ -590,25 +591,59 @@ class CrossHeadProjection(base_layer.BaseLayer):
   transpose: bool = False
   left_mul: bool = False
   use_conv: bool = False
+  squeeze_ratio: int = None
+  use_bias: bool = True
+  squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
     self.num_heads_per_group = self.num_heads // self.num_groups
     if self.use_conv:
       assert self.num_groups == 1, f'{self.num_groups} != 1'
-      shape = [self.num_heads_per_group, self.num_heads_per_group, 1, 1]  # OIWH
-      wt = [None, None, None, None]
-    else:
-      shape = [self.num_groups, self.num_heads_per_group, self.num_heads_per_group]
-      # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
-      wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
+      pc = WeightHParams(
+          shape=[self.num_heads_per_group, self.num_heads_per_group, 1, 1],  # OIWH
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None, None, None],
+          init=self.init, fan_in_axes=None, fan_out_axes=None,
+      )
+      self.create_variable('w', pc)
+      return
 
-    pc = WeightHParams(
-        shape=shape, mesh_shape=self.mesh_shape,
-        tensor_split_dims_mapping=wt, init=self.init, 
-        fan_in_axes=None, fan_out_axes=None,
-    )
-    self.create_variable('w', pc)
+    # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
+    wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
+
+    if self.squeeze_ratio is None:
+      pc = WeightHParams(
+          shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group], 
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=self.init, 
+          fan_in_axes=None, fan_out_axes=None,
+      )
+      self.create_variable('w', pc)
+    else:
+      self.hidden_dim = self.num_heads_per_group // self.squeeze_ratio
+      pc1 = WeightHParams(
+          shape=[self.num_groups, self.num_heads_per_group, self.hidden_dim],
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=self.init,
+          fan_in_axes=None, fan_out_axes=None,
+      )
+      self.create_variable('w1', pc1)
+      
+      if self.use_bias:
+        pc_bias = WeightHParams(
+            shape=[self.hidden_dim],
+            init=WeightInit.Constant(0.0),
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=None,
+        )
+        self.create_variable('b', pc_bias)
+      self.activation_tpl = pax_fiddle.Config(self.squeeze_activation_cls)
+      self.create_child('activation', self.activation_tpl.clone())
+
+      pc2 = WeightHParams(
+          shape=[self.num_groups, self.hidden_dim, self.num_heads_per_group],
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=self.init,
+          fan_in_axes=None, fan_out_axes=None,
+      )
+      self.create_variable('w2', pc2)
 
   def __call__(self, inputs: JTensor) -> JTensor:
     shape = inputs.shape
@@ -616,22 +651,30 @@ class CrossHeadProjection(base_layer.BaseLayer):
     # assert shape[1] == self.num_heads
     if self.use_conv:  # an order of magnitude slower than einsum!
       ret = lax.conv(inputs, self.theta.w, (1, 1), 'SAME') # BNTS,MN11->BMTS
+      if self.residual: ret = ret + inputs
+      return jnp.reshape(ret, shape)
+    if self.transpose:
+      # inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
+      # inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))
+      inputs = rearrange(inputs, 'B T S (G M) -> B T S G M', G=self.num_groups)
+      exp = 'BTSGM,GMN->BTSGN'
     else:
-      if self.transpose:
-        # inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
-        inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))  # BTSN->BTSGM
-        exp = 'BTSGM,GMN->BTSGN'
-      else:
-        inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
-        # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
-        exp = 'BGMTS,GMN->BGNTS' if not self.left_mul else 'GNM,BGMTS->BGNTS'
+      # inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])
+      inputs = rearrange(inputs, 'B (G M) T S -> B G M T S', G=self.num_groups)
+      # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
+      exp = 'BGMTS,GMN->BGNTS' if not self.left_mul else 'GNM,BGMTS->BGNTS'
+    if self.squeeze_ratio is None:
       ret = jnp.einsum(exp, inputs, self.theta.w) if not self.left_mul else jnp.einsum(exp, self.theta.w, inputs)
+    else:
+      ret = jnp.einsum(exp, inputs, self.theta.w1) if not self.left_mul else jnp.einsum(exp, self.theta.w1, inputs)
+      if self.use_bias: ret = ret + (self.theta.b if self.transpose else jnp.expand_dims(self.theta.b, axis=(1, 2)))
+      ret = self.activation(ret)
+      ret = jnp.einsum(exp, ret, self.theta.w2) if not self.left_mul else jnp.einsum(exp, self.theta.w2, ret)
     if self.residual: ret = ret + inputs
     # if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
     # inputs = inputs + jnp.repeat(inputs[:, :, 0:1, :, :], self.num_heads_per_group, axis=2)  # jnp.roll(inputs, 1, axis=2) #
     return jnp.reshape(ret, shape)  # BGMTS->BNTS
 
-from praxis.layers import activations as activations_lib
 class CrossHeadFFN(base_layer.BaseLayer):
   num_heads: int = 0
   num_groups: int = 0
@@ -1316,7 +1359,7 @@ class DotProductAttention(base_layer.BaseLayer):
   logits_squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
   probs_squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
   cross_head_proj_tpl: LayerTpl = template_field(CrossHeadProjection)
-  cross_head_ffn_tpl: LayerTpl = template_field(CrossHeadFFN)
+  # cross_head_ffn_tpl: LayerTpl = template_field(CrossHeadFFN)
   transpose_logits: bool = False
   left_mul: bool = False
 
@@ -1459,12 +1502,14 @@ class DotProductAttention(base_layer.BaseLayer):
 
     def project_logits_or_probs(squeeze_ratio=None, squeeze_activation_cls=None,
         residual=True, gaussian_std=None):  # XD
-      cross_head_tpl, kwargs = (self.cross_head_ffn_tpl,
-        dict(squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls)) \
-        if squeeze_ratio is not None else (self.cross_head_proj_tpl, dict())
-      proj_p = cross_head_tpl.clone().set(
+      # cross_head_tpl, kwargs = (self.cross_head_ffn_tpl,
+      #   dict(squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls)) \
+      #   if squeeze_ratio is not None else (self.cross_head_proj_tpl, dict())
+      # proj_p = cross_head_tpl.clone().set(
+      proj_p = self.cross_head_proj_tpl.clone().set(
         num_heads=self.num_heads, num_groups=self.num_groups, residual=residual,
-        init=self.scale_init, transpose=self.transpose_logits, left_mul=self.left_mul, **kwargs)
+        init=self.scale_init, transpose=self.transpose_logits, left_mul=self.left_mul,
+        squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls)
       if gaussian_std:
         proj_p.params_init = WeightInit.Gaussian(gaussian_std)
       proj_p.weight_split_dims_mapping.wt = wp.proj
