@@ -587,15 +587,18 @@ class CrossHeadProjection(base_layer.BaseLayer):
   num_heads: int = 0
   num_groups: int = 0
   residual: bool = True
+  absorb_residual: bool = False
   init: WeightInit = None
   transpose: bool = False
-  left_mul: bool = False
+  left_mul: bool = False  # no effect
   use_conv: bool = False
   squeeze_ratio: int = None
   use_bias: bool = True
   squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
+  output_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
 
   def setup(self) -> None:
+    if self.absorb_residual: assert self.squeeze_ratio is None and self.residual
     wp = self.weight_split_dims_mapping
     self.num_heads_per_group = self.num_heads // self.num_groups
     if self.use_conv:
@@ -648,17 +651,18 @@ class CrossHeadProjection(base_layer.BaseLayer):
           fan_in_axes=None, fan_out_axes=None,
       )
       self.create_variable('w2', pc2)
+    self.create_child('output_activation', pax_fiddle.Config(self.output_activation_cls).clone())
 
   def __call__(self, inputs: JTensor) -> JTensor:
     shape = inputs.shape
-    inputs = self._cast_to_fprop_dtype(inputs)
+    # inputs = self._cast_to_fprop_dtype(inputs)  # preserve float32 logits
     # assert shape[1] == self.num_heads
     if self.use_conv:  # an order of magnitude slower than einsum!
       ret = lax.conv(inputs, self.theta.w, (1, 1), 'SAME') # BNTS,MN11->BMTS
       if self.residual: ret = ret + inputs
       return jnp.reshape(ret, shape)
     if self.transpose:
-      # inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
+      inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
       # inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))
       inputs = rearrange(inputs, 'B T S (G M) -> B T S G M', G=self.num_groups)
       exp = 'BTSGM,GMN->BTSGN'
@@ -668,14 +672,18 @@ class CrossHeadProjection(base_layer.BaseLayer):
       # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
       exp = 'BGMTS,GMN->BGNTS' if not self.left_mul else 'GNM,BGMTS->BGNTS'
     if self.squeeze_ratio is None:
-      ret = jnp.einsum(exp, inputs, self.theta.w) if not self.left_mul else jnp.einsum(exp, self.theta.w, inputs)
+      w = self.theta.w + jnp.eye(self.num_heads_per_group) \
+        if self.residual and self.absorb_residual else self.theta.w
+      ret = jnp.einsum(exp, inputs, w) if not self.left_mul else jnp.einsum(exp, w, inputs)
     else:
       ret = jnp.einsum(exp, inputs, self.theta.w1) if not self.left_mul else jnp.einsum(exp, self.theta.w1, inputs)
       if self.use_bias: ret = ret + (self.theta.b if self.transpose else jnp.expand_dims(self.theta.b, axis=(1, 2)))
       ret = self.activation(ret)
       ret = jnp.einsum(exp, ret, self.theta.w2) if not self.left_mul else jnp.einsum(exp, self.theta.w2, ret)
-    if self.residual: ret = ret + inputs
-    # if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
+    # ret = self.output_activation(ret)  # for post_proj, relu here degrade performance to baseline
+    if self.residual and not self.absorb_residual: ret = ret + inputs
+    # ret = self.output_activation(ret)  # for post_proj, relu here has no effect on performance
+    if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
     # inputs = inputs + jnp.repeat(inputs[:, :, 0:1, :, :], self.num_heads_per_group, axis=2)  # jnp.roll(inputs, 1, axis=2) #
     return jnp.reshape(ret, shape)  # BGMTS->BNTS
 
@@ -1362,10 +1370,14 @@ class DotProductAttention(base_layer.BaseLayer):
   probs_squeeze_ratio: int = None
   logits_squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
   probs_squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
+  logits_output_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
+  probs_output_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
   cross_head_proj_tpl: LayerTpl = template_field(CrossHeadProjection)
   # cross_head_ffn_tpl: LayerTpl = template_field(CrossHeadFFN)
   transpose_logits: bool = False
   left_mul: bool = False
+  logits_absorb_residual: bool = False
+  probs_absorb_residual: bool = False
 
   dim_per_head: Optional[int] = None
   # XD: gated attention related
@@ -1398,6 +1410,7 @@ class DotProductAttention(base_layer.BaseLayer):
   scale_logits_by_head_dims: bool = False
   atten_logit_cap: float = 0.0
   float32_logits: bool = False  # XD
+  float32_probs: bool = False  # XD
   float32_value: bool = False  # XD
   qk_norm: bool = False  # XD
   qk_norm_tpl: LayerTpl = template_field(normalizations.LayerNorm)  # XD
@@ -1466,6 +1479,8 @@ class DotProductAttention(base_layer.BaseLayer):
 
   def setup(self) -> None:
     self.shared_dim = max(self.shared_qk_dim, self.shared_ov_dim)
+    if self.float32_probs: assert self.float32_logits
+    
     wp = self.weight_split_dims_mapping
     assert self.input_dim, 'input_dim is {}'.format(self.input_dim)
     assert self.hidden_dim, 'hidden_dim is {}'.format(self.hidden_dim)
@@ -1505,15 +1520,16 @@ class DotProductAttention(base_layer.BaseLayer):
       return proj_p
 
     def project_logits_or_probs(squeeze_ratio=None, squeeze_activation_cls=None,
-        residual=True, gaussian_std=None):  # XD
+        output_activation_cls=None, residual=True, absorb_residual=False, gaussian_std=None):  # XD
       # cross_head_tpl, kwargs = (self.cross_head_ffn_tpl,
       #   dict(squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls)) \
       #   if squeeze_ratio is not None else (self.cross_head_proj_tpl, dict())
       # proj_p = cross_head_tpl.clone().set(
       proj_p = self.cross_head_proj_tpl.clone().set(
-        num_heads=self.num_heads, num_groups=self.num_groups, residual=residual,
+        num_heads=self.num_heads, num_groups=self.num_groups,
         init=self.scale_init, transpose=self.transpose_logits, left_mul=self.left_mul,
-        squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls)
+        squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls,
+        residual=residual, absorb_residual=absorb_residual, output_activation_cls=output_activation_cls)
       if gaussian_std:
         proj_p.params_init = WeightInit.Gaussian(gaussian_std)
       proj_p.weight_split_dims_mapping.wt = wp.proj
@@ -1608,12 +1624,14 @@ class DotProductAttention(base_layer.BaseLayer):
       self.create_child('pre_proj', project_logits_or_probs(
         squeeze_ratio=self.logits_squeeze_ratio,
         squeeze_activation_cls=self.logits_squeeze_activation_cls,
-        residual=self.logits_residual))
+        output_activation_cls=self.logits_output_activation_cls,
+        residual=self.logits_residual, absorb_residual=self.logits_absorb_residual))
     if self.project_probs:  # XD
       self.create_child('post_proj', project_logits_or_probs(
         squeeze_ratio=self.probs_squeeze_ratio,
         squeeze_activation_cls=self.probs_squeeze_activation_cls,
-        residual=self.probs_residual))
+        output_activation_cls=self.probs_output_activation_cls,
+        residual=self.probs_residual, absorb_residual=self.probs_absorb_residual))
 
     if self.relative_bias_tpl is not None:
       relative_bias_p = self.relative_bias_tpl.clone()
@@ -1866,13 +1884,13 @@ class DotProductAttention(base_layer.BaseLayer):
       self.add_summary('attention_mask', atten_mask)
     if self.attention_extra_logit is None:
       # XD: -1 -> -2; key -> value: key may have already been turned to fp32 by float32_logits
-      probs = jax.nn.softmax(padded_logits, axis=-1 - int(self.transpose_logits)).astype(value.dtype)
+      probs = jax.nn.softmax(padded_logits, axis=-1 - int(self.transpose_logits))#.astype(value.dtype)
     else:
-      probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
-          key.dtype
-      )
+      probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits))#.astype(value.dtype)
     # XD
+    if not self.float32_probs: probs = probs.astype(value.dtype)
     probs = self._cross_head_proj(probs, 'post_proj')
+    if self.float32_probs: probs = probs.astype(value.dtype)
     # mask probs similar to py_utilsapply_mask_to_logits
     min_value = py_utils.get_large_negative_number(probs.dtype)
     probs = jnp.where((atten_mask >= min_value * 0.5), probs, 0.)
