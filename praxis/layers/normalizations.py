@@ -390,6 +390,7 @@ class RmsNorm(BaseNormalization):
   epsilon: float = 1e-6
   direct_scale: bool = True
   intermediate_dtype: Optional[jnp.dtype] = None
+  skip_weight_decay: bool = True  # XD
 
   def setup(self) -> None:
     """Creates RMS normalization variables."""
@@ -407,6 +408,9 @@ class RmsNorm(BaseNormalization):
             init=WeightInit.Constant(init_value),
             mesh_shape=self.mesh_shape,
             tensor_split_dims_mapping=wp_scale,
+            collections=None if not self.skip_weight_decay else [
+                base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION  # XD
+            ],
         ),
     )
 

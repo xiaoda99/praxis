@@ -582,7 +582,9 @@ class RelativeBias(base_layer.BaseLayer):
     return relative_bias
 
 from jax import lax # XD
+from praxis import layers
 from praxis.layers import activations as activations_lib
+
 class CrossHeadProjection(base_layer.BaseLayer):
   num_heads: int = 0
   num_groups: int = 0
@@ -596,50 +598,65 @@ class CrossHeadProjection(base_layer.BaseLayer):
   use_bias: bool = True
   squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
   output_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
+  learnable_diag: bool = False
+  relative_scale: float = 0.1
+  gate_relative_scale: float = 0.01
+  skip_ffn_weight_decay: bool = False
+  dynamic_squeeze_gate_act_cls: activations_lib.BaseActivation = None
+  addictive_gate: bool = False
+  query_input_dim: int = None
+  key_input_dim: int = None
+  dynamic_w_init: WeightInit = None
+  src_dependent: bool = True
 
   def setup(self) -> None:
     if self.absorb_residual: assert self.squeeze_ratio is None and self.residual
+    if self.addictive_gate or self.dynamic_w_init is not None: assert self.transpose
     wp = self.weight_split_dims_mapping
     self.num_heads_per_group = self.num_heads // self.num_groups
     if self.use_conv:
       assert self.num_groups == 1, f'{self.num_groups} != 1'
       pc = WeightHParams(
           shape=[self.num_heads_per_group, self.num_heads_per_group, 1, 1],  # OIWH
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None, None, None],
-          init=self.init, fan_in_axes=None, fan_out_axes=None,
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None, None, None], init=self.init,
       )
       self.create_variable('w', pc)
       return
 
     # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
     wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
-    def init_fn(out_dim):
-      if self.residual or self.init is not None: return self.init
-      in_dim = self.num_heads_per_group
-      return WeightInit.Gaussian(math.sqrt(2.0 / (in_dim + out_dim)))
-
+    def init_fn(out_dim, in_dim=None):
+      if self.init is not None: return self.init
+      if in_dim is None: in_dim = self.num_heads_per_group
+      if not self.residual or in_dim == self.num_heads_per_group:
+        relative_scale = 1.0
+      elif in_dim in [self.query_input_dim, self.key_input_dim]:
+        relative_scale = self.gate_relative_scale  # for dynamic_squeeze_gate
+      else:
+        relative_scale = self.relative_scale
+      return WeightInit.Gaussian(math.sqrt(2.0 / (in_dim + out_dim)) * relative_scale)
+    
+    collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION] \
+      if self.skip_ffn_weight_decay else None
     if self.squeeze_ratio is None:
       pc = WeightHParams(
           shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group], 
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=init_fn(self.num_heads_per_group), 
-          fan_in_axes=None, fan_out_axes=None,
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=init_fn(self.num_heads_per_group),
       )
       self.create_variable('w', pc)
     else:
       self.hidden_dim = self.num_heads_per_group // self.squeeze_ratio
       pc1 = WeightHParams(
           shape=[self.num_groups, self.num_heads_per_group, self.hidden_dim],
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=init_fn(self.hidden_dim),
-          fan_in_axes=None, fan_out_axes=None,
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, 
+          init=init_fn(self.hidden_dim), collections=collections,
       )
       self.create_variable('w1', pc1)
 
-      if self.use_bias:
-        pc_bias = WeightHParams(
-            shape=[self.hidden_dim],
-            init=WeightInit.Constant(0.0),
-            mesh_shape=self.mesh_shape,
-            tensor_split_dims_mapping=None,
+      if self.use_bias and self.squeeze_activation_cls not in [None, activations_lib.Identity]:
+        pc_bias = WeightHParams(shape=[self.hidden_dim], init=WeightInit.Constant(0.0),
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=None,
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
         )
         self.create_variable('b', pc_bias)
       self.activation_tpl = pax_fiddle.Config(self.squeeze_activation_cls)
@@ -647,106 +664,127 @@ class CrossHeadProjection(base_layer.BaseLayer):
 
       pc2 = WeightHParams(
           shape=[self.num_groups, self.hidden_dim, self.num_heads_per_group],
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=init_fn(self.hidden_dim),
-          fan_in_axes=None, fan_out_axes=None,
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,
+          init=init_fn(self.hidden_dim), collections=collections,
       )
       self.create_variable('w2', pc2)
+
+      if self.dynamic_squeeze_gate_act_cls is not None:
+        pc = WeightHParams(shape=[self.query_input_dim, self.num_groups, self.hidden_dim],  # DGI
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
+            init=init_fn(self.hidden_dim, in_dim=self.query_input_dim),
+            collections=collections,
+        )
+        self.create_variable('wg', pc)
+        if self.addictive_gate:
+          pc = WeightHParams(shape=[self.key_input_dim, self.num_groups, self.hidden_dim],  # DGI
+              mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
+              init=init_fn(self.hidden_dim, in_dim=self.key_input_dim),
+              collections=collections,
+          )
+          self.create_variable('wg2', pc)
+
+        b0 = 1.0 if self.dynamic_squeeze_gate_act_cls == layers.SiLU else 0.0
+        pc_bias = WeightHParams(shape=[self.hidden_dim], init=WeightInit.Constant(b0),
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=None,
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+        )
+        self.create_variable('bg', pc_bias)
+
+        self.gate_activation_tpl = pax_fiddle.Config(self.dynamic_squeeze_gate_act_cls)
+        self.create_child('gate_activation', self.gate_activation_tpl.clone())
+    
+      if self.dynamic_w_init is not None:
+        pc = WeightHParams(
+          shape=[self.query_input_dim, self.num_groups, self.num_heads_per_group, self.hidden_dim * 4],  # DGM(4I)
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt + [None],  # ['data', 'mdl', None, None]
+          init=self.dynamic_w_init,
+        )
+        self.create_variable('dw', pc)
+        if self.learnable_diag:
+          pc = WeightHParams(
+            shape=[self.query_input_dim, self.num_groups, self.num_heads_per_group * 2],  # DG(2M)
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
+            init=self.dynamic_w_init,
+          )
+          self.create_variable('dd', pc)
+        
+    if self.learnable_diag and self.dynamic_w_init is None:
+      pc = WeightHParams(shape=[self.num_groups, self.num_heads_per_group], 
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt[:-1],
+          init=WeightInit.Constant(1.0),
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+      )
+      self.create_variable('d', pc)
     self.create_child('output_activation', pax_fiddle.Config(self.output_activation_cls).clone())
 
-  def __call__(self, inputs: JTensor) -> JTensor:
+  def __call__(self, inputs: JTensor,
+      query_vec: JTensor = None,
+      key_vec: JTensor = None,
+    ) -> JTensor:
+    theta = self.theta
     shape = inputs.shape
     # inputs = self._cast_to_fprop_dtype(inputs)  # preserve float32 logits
     # assert shape[1] == self.num_heads
     if self.use_conv:  # an order of magnitude slower than einsum!
-      ret = lax.conv(inputs, self.theta.w, (1, 1), 'SAME') # BNTS,MN11->BMTS
+      ret = lax.conv(inputs, theta.w, (1, 1), 'SAME') # BNTS,MN11->BMTS
       if self.residual: ret = ret + inputs
       return jnp.reshape(ret, shape)
     if self.transpose:
-      inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
       # inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))
-      inputs = rearrange(inputs, 'B T S (G M) -> B T S G M', G=self.num_groups)
-      exp = 'BTSGM,GMN->BTSGN'
+      inputs = rearrange(inputs, 'B (G M) T S -> B T S G M', G=self.num_groups)
+      exp = 'BTSGM,GMN->BTSGN'; exp_gate = 'BTSGI,BTGI->BTSGI'; exp2 = 'BTSGM,GM->BTSGM'
+      if hasattr(self, 'b'): b = theta.b
     else:
       # inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])
       inputs = rearrange(inputs, 'B (G M) T S -> B G M T S', G=self.num_groups)
-      # w = jnp.repeat(jnp.expand_dims(jnp.eye(self.num_heads_per_group), axis=0), self.num_groups, axis=0) # MM->GMM
       exp = 'BGMTS,GMN->BGNTS' if not self.left_mul else 'GNM,BGMTS->BGNTS'
+      exp_gate = 'BGITS,BTGI->BGITS'; exp2 = 'BGMTS,GM->BGMTS'  # for ffn, N=I=hidden_dim
+      if hasattr(self, 'b'): b = jnp.expand_dims(theta.b, axis=(1, 2))
     if self.squeeze_ratio is None:
-      w = self.theta.w + jnp.eye(self.num_heads_per_group) \
-        if self.residual and self.absorb_residual else self.theta.w
+      w = theta.w + (jnp.diag(theta.d) if self.learnable_diag else jnp.eye(self.num_heads_per_group)) \
+        if self.residual and self.absorb_residual else theta.w
       ret = jnp.einsum(exp, inputs, w) if not self.left_mul else jnp.einsum(exp, w, inputs)
     else:
-      ret = jnp.einsum(exp, inputs, self.theta.w1) if not self.left_mul else jnp.einsum(exp, self.theta.w1, inputs)
-      if self.use_bias: ret = ret + (self.theta.b if self.transpose else jnp.expand_dims(self.theta.b, axis=(1, 2)))
+      ret = jnp.einsum(exp, inputs, theta.w1) if not self.left_mul else jnp.einsum(exp, theta.w1, inputs)
+      if hasattr(self, 'b'): ret = ret + b
       ret = self.activation(ret)
-      ret = jnp.einsum(exp, ret, self.theta.w2) if not self.left_mul else jnp.einsum(exp, self.theta.w2, ret)
+      if self.dynamic_squeeze_gate_act_cls is not None:
+        if not self.addictive_gate:
+          gate_value = jnp.einsum('BTD,DGI->BTGI', query_vec, theta.wg) + theta.bg
+          ret = jnp.einsum(exp_gate, ret, self.gate_activation(gate_value))
+        else:
+          gate_value = jnp.einsum('BTD,DGI->BTGI', query_vec, theta.wg)
+          gate_value = rearrange(gate_value, 'B T G I -> B T 1 G I')
+          ret = ret + gate_value
+          gate_value2 = jnp.einsum('BSD,DGI->BSGI', key_vec, theta.wg2)
+          gate_value2 = rearrange(gate_value2, 'B S G I -> B 1 S G I')
+          ret = ret + gate_value2
+      ret = jnp.einsum(exp, ret, theta.w2) if not self.left_mul else jnp.einsum(exp, theta.w2, ret)
+      
+      if self.dynamic_w_init is not None:
+        dw = jnp.einsum('BTD,DGMI->BTGMI', query_vec, theta.dw)
+        qw1, qw2, kw1, kw2 = jnp.split(dw, 4, axis=-1)
+        qw2, kw2 = rearrange(qw2, 'B T G M I -> B T G I M'), rearrange(kw2, 'B T G M I -> B T G I M')
+        hidden = jnp.einsum('BTSGM,BTGMI->BTSGI', inputs, qw1)
+        ret = ret + jnp.einsum('BTSGI,BTGIM->BTSGM', hidden, qw2)
+        if self.src_dependent:
+          hidden = jnp.einsum('BTSGM,BSGMI->BTSGI', inputs, kw1)
+          ret = ret + jnp.einsum('BTSGI,BSGIM->BTSGM', hidden, kw2)
+        if self.learnable_diag:
+          dd = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.dd)
+          qdd, kdd = jnp.split(dd, 2, axis=-1)
+          ret = ret + jnp.einsum('BTSGM,BTGM->BTSGM', inputs, qdd)
+          if self.src_dependent:
+            ret = ret + jnp.einsum('BTSGM,BSGM->BTSGM', inputs, kdd)
+
     # ret = self.output_activation(ret)  # for post_proj, relu here degrade performance to baseline
-    if self.residual and not self.absorb_residual: ret = ret + inputs
+    if self.residual and not self.absorb_residual:
+      ret = ret + (jnp.einsum(exp2, inputs, theta.d) \
+        if self.learnable_diag and self.dynamic_w_init is None else inputs)
     # ret = self.output_activation(ret)  # for post_proj, relu here has no effect on performance
     if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
     # inputs = inputs + jnp.repeat(inputs[:, :, 0:1, :, :], self.num_heads_per_group, axis=2)  # jnp.roll(inputs, 1, axis=2) #
-    return jnp.reshape(ret, shape)  # BGMTS->BNTS
-
-class CrossHeadFFN(base_layer.BaseLayer):
-  num_heads: int = 0
-  num_groups: int = 0
-  squeeze_ratio: int = 0
-  squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
-  residual: bool = True
-  init: WeightInit = None
-  use_bias = True
-  transpose: bool = False
-  left_mul: bool = False
-
-  def setup(self) -> None:
-    wp = self.weight_split_dims_mapping
-    # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
-    wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
-    self.num_heads_per_group = self.num_heads // self.num_groups
-    self.hidden_dim = self.num_heads_per_group // self.squeeze_ratio
-
-    pc1 = WeightHParams(
-        shape=[self.num_groups, self.num_heads_per_group, self.hidden_dim],
-        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=self.init,
-        fan_in_axes=None, fan_out_axes=None,
-    )
-    self.create_variable('w1', pc1)
-    self.activation_tpl = pax_fiddle.Config(self.squeeze_activation_cls)
-    self.create_child('activation', self.activation_tpl.clone())
-
-    if self.use_bias:
-      pc_bias = WeightHParams(
-          shape=[self.hidden_dim],
-          init=WeightInit.Constant(0.0),
-          mesh_shape=self.mesh_shape,
-          tensor_split_dims_mapping=None,
-      )
-      self.create_variable('b', pc_bias)
-
-    pc2 = WeightHParams(
-        shape=[self.num_groups, self.hidden_dim, self.num_heads_per_group],
-        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, init=self.init,
-        fan_in_axes=None, fan_out_axes=None,
-    )
-    self.create_variable('w2', pc2)
-
-  def __call__(self, inputs: JTensor) -> JTensor:
-    shape = inputs.shape
-    inputs = self._cast_to_fprop_dtype(inputs)
-    # assert shape[1] == self.num_heads
-    if self.transpose:
-      # inputs = jnp.transpose(inputs, (0, 3, 4, 1, 2))  # BGMTS->BTSGM
-      inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))  # BTSN->BTSGM
-      exp = 'BTSGM,GMN->BTSGN'
-    else:
-      inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])  # BNTS->BGMTS
-      exp = 'BGMTS,GMN->BGNTS' if not self.left_mul else 'GNM,BGMTS->BGNTS'
-    ret = jnp.einsum(exp, inputs, self.theta.w1) if not self.left_mul else jnp.einsum(exp, self.theta.w1, inputs)
-    if self.use_bias: ret = ret + (self.theta.b if self.transpose else jnp.expand_dims(self.theta.b, axis=(1, 2)))
-    ret = self.activation(ret)
-    ret = jnp.einsum(exp, ret, self.theta.w2) if not self.left_mul else jnp.einsum(exp, self.theta.w2, ret)
-    if self.residual: ret = ret + inputs
-    # if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
     return jnp.reshape(ret, shape)  # BGMTS->BNTS
 
 class ScaleQKVProjectionLayer(base_layer.BaseLayer):
@@ -1519,22 +1557,6 @@ class DotProductAttention(base_layer.BaseLayer):
       proj_p.weight_split_dims_mapping.wt = wp.proj
       return proj_p
 
-    def project_logits_or_probs(squeeze_ratio=None, squeeze_activation_cls=None,
-        output_activation_cls=None, residual=True, absorb_residual=False, gaussian_std=None):  # XD
-      # cross_head_tpl, kwargs = (self.cross_head_ffn_tpl,
-      #   dict(squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls)) \
-      #   if squeeze_ratio is not None else (self.cross_head_proj_tpl, dict())
-      # proj_p = cross_head_tpl.clone().set(
-      proj_p = self.cross_head_proj_tpl.clone().set(
-        num_heads=self.num_heads, num_groups=self.num_groups,
-        init=self.scale_init, transpose=self.transpose_logits, left_mul=self.left_mul,
-        squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls,
-        residual=residual, absorb_residual=absorb_residual, output_activation_cls=output_activation_cls)
-      if gaussian_std:
-        proj_p.params_init = WeightInit.Gaussian(gaussian_std)
-      proj_p.weight_split_dims_mapping.wt = wp.proj
-      return proj_p
-
     if isinstance(self.input_dim, Mapping):
       key_input_dim = self.input_dim['key']
       value_input_dim = self.input_dim['value']
@@ -1581,6 +1603,19 @@ class DotProductAttention(base_layer.BaseLayer):
           self.rotary_position_emb_tpl, dim_per_head
       )
 
+    def project_logits_or_probs(squeeze_ratio=None, squeeze_activation_cls=None,
+        output_activation_cls=None, residual=True, absorb_residual=False, gaussian_std=None):  # XD
+      proj_p = self.cross_head_proj_tpl.clone().set(
+        num_heads=self.num_heads, num_groups=self.num_groups,
+        init=self.scale_init, left_mul=self.left_mul,
+        squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls,
+        residual=residual, absorb_residual=absorb_residual, output_activation_cls=output_activation_cls,
+        query_input_dim=query_input_dim, key_input_dim=key_input_dim)
+      if gaussian_std:
+        proj_p.params_init = WeightInit.Gaussian(gaussian_std)
+      proj_p.weight_split_dims_mapping.wt = wp.proj
+      return proj_p
+      
     def scale_qkv_projections(num_shared_heads, do_scale, rotary_position_emb=None, gaussian_std=None):  # XD
       scale_p = self.scale_qkv_proj_tpl.clone().set(
           num_groups=self.num_groups,
@@ -1800,9 +1835,9 @@ class DotProductAttention(base_layer.BaseLayer):
       if not self.transpose_logits else self.qk_einsum('BTNH,BSNH->BTSN', query, key) # XD
     return logits
 
-  def _cross_head_proj(self, bnts, proj_name):  # XD: bnts is attn logits or weights
+  def _cross_head_proj(self, bnts, proj_name, query_vec=None, key_vec=None):  # XD: bnts is attn logits or weights
     if getattr(self, proj_name, None) is None: return bnts
-    return getattr(self, proj_name)(bnts) #* getattr(self, proj_name + '_gate', 1.)
+    return getattr(self, proj_name)(bnts, query_vec=query_vec, key_vec=key_vec)
 
   def _dot_atten(
       self,
@@ -1811,6 +1846,8 @@ class DotProductAttention(base_layer.BaseLayer):
       value: JTensor,
       atten_mask: JTensor,
       relative_bias: Optional[JTensor] = None,
+      query_vec: Optional[JTensor] = None,  # XD
+      key_vec: Optional[JTensor] = None,  # XD
   ) -> Tuple[JTensor, JTensor]:
     """Main attention function.
 
@@ -1861,7 +1898,7 @@ class DotProductAttention(base_layer.BaseLayer):
       assert not self.scale_logits_by_head_dims
       logits = jnp.multiply(logits, 1.0 / np.sqrt(self.dim_per_head))
 
-    logits = self._cross_head_proj(logits, 'pre_proj')  # XD
+    logits = self._cross_head_proj(logits, 'pre_proj', query_vec=query_vec, key_vec=key_vec)  # XD
 
     if self.transpose_logits:
       atten_mask = jnp.transpose(atten_mask, (0, 2, 3, 1))  # XD: BNTS->BTSN
@@ -1889,7 +1926,7 @@ class DotProductAttention(base_layer.BaseLayer):
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits))#.astype(value.dtype)
     # XD
     if not self.float32_probs: probs = probs.astype(value.dtype)
-    probs = self._cross_head_proj(probs, 'post_proj')
+    probs = self._cross_head_proj(probs, 'post_proj', query_vec=query_vec, key_vec=key_vec)
     if self.float32_probs: probs = probs.astype(value.dtype)
     # mask probs similar to py_utilsapply_mask_to_logits
     min_value = py_utils.get_large_negative_number(probs.dtype)
@@ -2096,7 +2133,8 @@ class DotProductAttention(base_layer.BaseLayer):
       relative_bias = None
 
     encoded, atten_probs = self._dot_atten(
-        query_proj, key_proj, value_proj, atten_mask, relative_bias
+        query_proj, key_proj, value_proj, atten_mask, relative_bias,
+        query_vec=query_vec, key_vec=key_vec,  # xd
     )
     if self.value_gate_activation_cls:  # XD
       value_gate_proj = self.value_gate(value_vec)
