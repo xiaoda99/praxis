@@ -133,6 +133,11 @@ class Tanh(BaseActivation):
     """Applies the activation function."""
     return jax.nn.tanh(inputs)
 
+class Clip(BaseActivation):  # XD
+  a_min: float = -1.0
+  a_max: float = 1.0
+  def __call__(self, inputs: JTensor) -> JTensor:
+    return jnp.clip(inputs, a_min=self.a_min, a_max=self.a_max)
 
 class GELU(BaseActivation):
   """Gaussian Error Linear Unit (GELU) activation layer.
