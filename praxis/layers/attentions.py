@@ -597,7 +597,6 @@ class CrossHeadProjection(base_layer.BaseLayer):
   squeeze_ratio: int = None
   use_squeeze_bias: bool = True
   squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
-  dw_activation_cls: activations_lib.BaseActivation = None # activations_lib.Identity
   output_activation_cls: activations_lib.BaseActivation = None # activations_lib.Identity
   learnable_diag: bool = False
   relative_scale: float = 0.1
@@ -609,7 +608,11 @@ class CrossHeadProjection(base_layer.BaseLayer):
   key_input_dim: int = None
   use_static_w: bool = True
   dynamic_w_init: WeightInit = None
+  dynamic_squeeze_ratio: int = None
   use_dw_bias: bool = False
+  dw_activation_cls: activations_lib.BaseActivation = None
+  dynamic_w_hidden_dim: int = None
+  dw_hidden_activation_cls: activations_lib.BaseActivation = None
   tgt_dependent: bool = True
   src_dependent: bool = True
 
@@ -634,8 +637,11 @@ class CrossHeadProjection(base_layer.BaseLayer):
       if in_dim is None: in_dim = self.num_heads_per_group
       if not self.residual or in_dim == self.num_heads_per_group and in_dim > out_dim: # ffn.w1
         relative_scale = 1.0
-      elif in_dim in [self.query_input_dim, self.key_input_dim]:
-        relative_scale = self.gate_relative_scale  # for dynamic_squeeze_gate
+      # elif in_dim in [self.query_input_dim, self.key_input_dim]:
+      #   relative_scale = self.gate_relative_scale  # for dynamic_squeeze_gate
+      elif in_dim in [self.query_input_dim, self.key_input_dim] and \
+        self.dynamic_w_hidden_dim and out_dim == self.dynamic_w_hidden_dim * 2:
+        relative_scale = 1.  # for dynamic_w1
       elif out_dim == self.num_heads_per_group and in_dim <= out_dim:  # ffn.w2 or w
         relative_scale = self.relative_scale
       else:
@@ -644,87 +650,120 @@ class CrossHeadProjection(base_layer.BaseLayer):
     
     collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION] \
       if self.skip_ffn_weight_decay else None
-    if self.squeeze_ratio is None:
-      pc = WeightHParams(
-          shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group], 
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,
-          init=init_fn(self.num_heads_per_group),
-      )
-      self.create_variable('w', pc)
-    else:
-      self.hidden_dim = self.num_heads_per_group // self.squeeze_ratio
-      pc1 = WeightHParams(
-          shape=[self.num_groups, self.num_heads_per_group, self.hidden_dim],
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, 
-          init=init_fn(self.hidden_dim), collections=collections,
-      )
-      self.create_variable('w1', pc1)
-
-      if self.use_squeeze_bias and self.squeeze_activation_cls not in [None, activations_lib.Identity]:
-        pc_bias = WeightHParams(shape=[self.hidden_dim], init=WeightInit.Constant(0.0),
-            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=None,
-            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
-        )
-        self.create_variable('b', pc_bias)
-      self.activation_tpl = pax_fiddle.Config(self.squeeze_activation_cls)
-      self.create_child('activation', self.activation_tpl.clone())
-
-      pc2 = WeightHParams(
-          shape=[self.num_groups, self.hidden_dim, self.num_heads_per_group],
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,
-          init=init_fn(self.num_heads_per_group, in_dim=self.hidden_dim), collections=collections,
-      )
-      self.create_variable('w2', pc2)
-
-      if self.dynamic_squeeze_gate_act_cls is not None:
-        pc = WeightHParams(shape=[self.query_input_dim, self.num_groups, self.hidden_dim],  # DGI
-            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
-            init=init_fn(self.hidden_dim, in_dim=self.query_input_dim),
-            collections=collections,
-        )
-        self.create_variable('wg', pc)
-        if self.addictive_gate:
-          pc = WeightHParams(shape=[self.key_input_dim, self.num_groups, self.hidden_dim],  # DGI
-              mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
-              init=init_fn(self.hidden_dim, in_dim=self.key_input_dim),
-              collections=collections,
-          )
-          self.create_variable('wg2', pc)
-
-        b0 = 1.0 if self.dynamic_squeeze_gate_act_cls == layers.SiLU else 0.0
-        pc_bias = WeightHParams(shape=[self.hidden_dim], init=WeightInit.Constant(b0),
-            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=None,
-            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
-        )
-        self.create_variable('bg', pc_bias)
-
-        self.gate_activation_tpl = pax_fiddle.Config(self.dynamic_squeeze_gate_act_cls)
-        self.create_child('gate_activation', self.gate_activation_tpl.clone())
-    
-      if self.dynamic_w_init is not None:
-        dynamic_hidden_dim = 1
-        out_shape = [self.num_groups, self.num_heads_per_group, dynamic_hidden_dim * 4] # GM(4I)
+    if self.use_static_w:
+      if self.squeeze_ratio is None:
         pc = WeightHParams(
-          shape=[self.query_input_dim] + out_shape,
-          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt + [None],  # ['data', 'mdl', None, None]
-          init=self.dynamic_w_init,
+            shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group], 
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,
+            init=init_fn(self.num_heads_per_group),
         )
-        self.create_variable('dw', pc)
-        if self.use_dw_bias:
-          pc_bias = WeightHParams(shape=out_shape, init=WeightInit.Constant(0.0),
-              mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt[1:] + [None],  # ['mdl', None, None]
+        self.create_variable('w', pc)
+      else:
+        self.hidden_dim = self.num_heads_per_group // self.squeeze_ratio
+        pc1 = WeightHParams(
+            shape=[self.num_groups, self.num_heads_per_group, self.hidden_dim],
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt, 
+            init=init_fn(self.hidden_dim), collections=collections,
+        )
+        self.create_variable('w1', pc1)
+
+        if self.use_squeeze_bias and self.squeeze_activation_cls not in [None, activations_lib.Identity]:
+          pc_bias = WeightHParams(shape=[self.hidden_dim], init=WeightInit.Constant(0.0),
+              mesh_shape=self.mesh_shape, tensor_split_dims_mapping=None,
               collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
           )
-          self.create_variable('dwb', pc_bias)
-        if self.learnable_diag:
-          pc = WeightHParams(
-            shape=[self.query_input_dim, self.num_groups, self.num_heads_per_group * 2],  # DG(2M)
+          self.create_variable('b', pc_bias)
+        self.activation_tpl = pax_fiddle.Config(self.squeeze_activation_cls)
+        self.create_child('activation', self.activation_tpl.clone())
+
+        pc2 = WeightHParams(
+            shape=[self.num_groups, self.hidden_dim, self.num_heads_per_group],
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,
+            init=init_fn(self.num_heads_per_group, in_dim=self.hidden_dim), collections=collections,
+        )
+        self.create_variable('w2', pc2)
+
+    if self.dynamic_squeeze_gate_act_cls is not None:
+      pc = WeightHParams(shape=[self.query_input_dim, self.num_groups, self.hidden_dim],  # DGI
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
+          init=init_fn(self.hidden_dim, in_dim=self.query_input_dim),
+          collections=collections,
+      )
+      self.create_variable('wg', pc)
+      if self.addictive_gate:
+        pc = WeightHParams(shape=[self.key_input_dim, self.num_groups, self.hidden_dim],  # DGI
             mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
-            init=self.dynamic_w_init,
+            init=init_fn(self.hidden_dim, in_dim=self.key_input_dim),
+            collections=collections,
+        )
+        self.create_variable('wg2', pc)
+
+      b0 = 1.0 if self.dynamic_squeeze_gate_act_cls == layers.SiLU else 0.0
+      pc_bias = WeightHParams(shape=[self.hidden_dim], init=WeightInit.Constant(b0),
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=None,
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+      )
+      self.create_variable('bg', pc_bias)
+
+      self.gate_activation_tpl = pax_fiddle.Config(self.dynamic_squeeze_gate_act_cls)
+      self.create_child('gate_activation', self.gate_activation_tpl.clone())
+  
+    dynamic_hidden_dim = self.num_heads_per_group // self.dynamic_squeeze_ratio \
+      if self.dynamic_squeeze_ratio is not None else 1
+    if self.dynamic_w_hidden_dim is not None:
+      assert self.dynamic_w_init is not None
+      pc = WeightHParams(shape=[self.query_input_dim, self.num_groups, self.dynamic_w_hidden_dim * 2],
+        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
+        init=init_fn(self.dynamic_w_hidden_dim * 2, in_dim=self.query_input_dim),
+      )
+      self.create_variable('dw1', pc)
+
+      pc_bias = WeightHParams(
+        shape=[self.dynamic_w_hidden_dim], init=WeightInit.Constant(0.0),
+        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None],
+        collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+      )
+      self.create_variable('dwhb', pc_bias)
+      self.create_child('dw_hidden_activation', pax_fiddle.Config(self.dw_hidden_activation_cls).clone())
+
+      for w_name in ['w1', 'w2', 'd']:
+        G, K, M, I = self.num_groups, self.dynamic_w_hidden_dim, self.num_heads_per_group, dynamic_hidden_dim
+        shape=[G, K, M, I] if w_name != 'd' else [G, K, M]
+        bias_shape = [G, M, I]
+        pc = WeightHParams(shape=shape, init=self.dynamic_w_init,
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl'] + [None]*(len(shape)-1),
+        )
+        self.create_variable(f'dw2_{w_name}', pc)
+        if self.use_dw_bias and w_name != 'd':
+          pc_bias = WeightHParams(shape=bias_shape, init=WeightInit.Constant(0.0),
+              mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl', None, None],
+              collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
           )
-          self.create_variable('dd', pc)
-      if self.dw_activation_cls is not None:
-        self.create_child('dw_activation', pax_fiddle.Config(self.dw_activation_cls).clone())
+          self.create_variable(f'dwb_{w_name}', pc_bias)
+      
+    elif self.dynamic_w_init is not None:
+      out_shape = [self.num_groups, self.num_heads_per_group, dynamic_hidden_dim * 4] # GM(4I)
+      pc = WeightHParams(
+        shape=[self.query_input_dim] + out_shape,
+        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt + [None],  # ['data', 'mdl', None, None]
+        init=self.dynamic_w_init,
+      )
+      self.create_variable('dw', pc)
+      if self.use_dw_bias:
+        pc_bias = WeightHParams(shape=out_shape, init=WeightInit.Constant(0.0),
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt[1:] + [None],  # ['mdl', None, None]
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+        )
+        self.create_variable('dwb', pc_bias)
+      if self.learnable_diag:
+        pc = WeightHParams(
+          shape=[self.query_input_dim, self.num_groups, self.num_heads_per_group * 2],  # DG(2M)
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
+          init=self.dynamic_w_init,
+        )
+        self.create_variable('dd', pc)
+    if self.dw_activation_cls is not None:
+      self.create_child('dw_activation', pax_fiddle.Config(self.dw_activation_cls).clone())
         
     if self.learnable_diag and self.dynamic_w_init is None:
       pc = WeightHParams(shape=[self.num_groups, self.num_heads_per_group], 
@@ -759,13 +798,14 @@ class CrossHeadProjection(base_layer.BaseLayer):
       exp = 'BGMTS,GMN->BGNTS' if not self.left_mul else 'GNM,BGMTS->BGNTS'
       exp_gate = 'BGITS,BTGI->BGITS'; exp2 = 'BGMTS,GM->BGMTS'  # for ffn, N=I=hidden_dim
       if hasattr(self, 'b'): b = jnp.expand_dims(theta.b, axis=(1, 2))
-    if self.squeeze_ratio is None:
-      w = theta.w + (jnp.diag(theta.d) if self.learnable_diag else jnp.eye(self.num_heads_per_group)) \
-        if self.residual and self.absorb_residual else theta.w
-      ret = jnp.einsum(exp, inputs, w) if not self.left_mul else jnp.einsum(exp, w, inputs)
-    else:
-      ret = 0.
-      if self.use_static_w:
+    
+    ret = 0.
+    if self.use_static_w:
+      if self.squeeze_ratio is None:
+        w = theta.w + jnp.eye(self.num_heads_per_group) \
+          if self.residual and self.absorb_residual else theta.w
+        ret = jnp.einsum(exp, inputs, w) if not self.left_mul else jnp.einsum(exp, w, inputs)
+      else:
         ret = jnp.einsum(exp, inputs, theta.w1) if not self.left_mul else jnp.einsum(exp, theta.w1, inputs)
         if hasattr(self, 'b'): ret = ret + b
         ret = self.activation(ret)
@@ -782,29 +822,50 @@ class CrossHeadProjection(base_layer.BaseLayer):
             ret = ret + gate_value2
         ret = jnp.einsum(exp, ret, theta.w2) if not self.left_mul else jnp.einsum(exp, theta.w2, ret)
       
-      if self.dynamic_w_init is not None:
-        dw = jnp.einsum('BTD,DGMI->BTGMI', query_vec, theta.dw)
-        if self.use_dw_bias: dw = dw + theta.dwb  # BTGM(4I)+GM(4I)=BTGM(4I)
-        if self.dw_activation_cls is not None: dw = self.dw_activation(dw)
-        qw1, qw2, kw1, kw2 = jnp.split(dw, 4, axis=-1)
-        qw2, kw2 = rearrange(qw2, 'B T G M I -> B T G I M'), rearrange(kw2, 'B T G M I -> B T G I M')
-        if self.tgt_dependent:
-          hidden = self.activation(jnp.einsum('BTSGM,BTGMI->BTSGI', inputs, qw1))
-          ret = ret + jnp.einsum('BTSGI,BTGIM->BTSGM', hidden, qw2)
-        if self.src_dependent:
-          hidden = self.activation(jnp.einsum('BTSGM,BSGMI->BTSGI', inputs, kw1))
-          ret = ret + jnp.einsum('BTSGI,BSGIM->BTSGM', hidden, kw2)
-        if self.learnable_diag:
-          dd = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.dd)
-          if self.dw_activation_cls is not None: dd = self.dw_activation(dd)
-          qdd, kdd = jnp.split(dd, 2, axis=-1)
-          if self.tgt_dependent or not self.tgt_dependent and not self.src_dependent:
-            ret = ret + jnp.einsum('BTSGM,BTGM->BTSGM', inputs, qdd)
-          if self.src_dependent or not self.tgt_dependent and not self.src_dependent:
-            ret = ret + jnp.einsum('BTSGM,BSGM->BTSGM', inputs, kdd)
+    if self.dynamic_w_hidden_dim is not None:
+      dw_hidden = jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1)
+      q_hidden, k_hidden = jnp.split(dw_hidden, 2, axis=-1)
+      dw_hidden = rearrange(q_hidden, 'B T G K -> B T 1 G K') + \
+        rearrange(k_hidden, 'B S G K -> B 1 S G K')  # BTSGK
+      dw_hidden = self.dw_hidden_activation(dw_hidden + theta.dwhb)
+
+      w1 = jnp.einsum('BTSGK,GKMI->BTSGMI', dw_hidden, theta.dw2_w1)
+      if self.use_dw_bias: w1 = w1 + theta.dwb_w1
+      if self.dw_activation_cls is not None: w1 = self.dw_activation(w1)
+      hidden = jnp.einsum('BTSGM,BTSGMI->BTSGI', inputs, w1)
+      w2 = jnp.einsum('BTSGK,GKMI->BTSGIM', dw_hidden, theta.dw2_w2)
+      if self.use_dw_bias: w2 = w2 + theta.dwb_w2
+      if self.dw_activation_cls is not None: w2 = self.dw_activation(w2)
+      ret = ret + jnp.einsum('BTSGI,BTSGIM->BTSGM', hidden, w2)
+
+      if self.learnable_diag:
+        d = jnp.einsum('BTSGK,GKM->BTSGM', dw_hidden, theta.dw2_d)
+        if self.dw_activation_cls is not None: d = self.dw_activation(d)
+        ret = ret + inputs * d # jnp.einsum('BTSGM,BTSGM->BTSGM', inputs, d)
+
+    elif self.dynamic_w_init is not None:
+      dw = jnp.einsum('BTD,DGMI->BTGMI', query_vec, theta.dw)
+      if self.use_dw_bias: dw = dw + theta.dwb  # BTGM(4I)+GM(4I)=BTGM(4I)
+      if self.dw_activation_cls is not None: dw = self.dw_activation(dw)
+      qw1, qw2, kw1, kw2 = jnp.split(dw, 4, axis=-1)
+      qw2, kw2 = rearrange(qw2, 'B T G M I -> B T G I M'), rearrange(kw2, 'B T G M I -> B T G I M')
+      if self.tgt_dependent:
+        hidden = jnp.einsum('BTSGM,BTGMI->BTSGI', inputs, qw1)
+        ret = ret + jnp.einsum('BTSGI,BTGIM->BTSGM', hidden, qw2)
+      if self.src_dependent:
+        hidden = jnp.einsum('BTSGM,BSGMI->BTSGI', inputs, kw1)
+        ret = ret + jnp.einsum('BTSGI,BSGIM->BTSGM', hidden, kw2)
+      if self.learnable_diag:
+        dd = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.dd)
+        if self.dw_activation_cls is not None: dd = self.dw_activation(dd)
+        qdd, kdd = jnp.split(dd, 2, axis=-1)
+        if self.tgt_dependent or not self.tgt_dependent and not self.src_dependent:
+          ret = ret + jnp.einsum('BTSGM,BTGM->BTSGM', inputs, qdd)
+        if self.src_dependent or not self.tgt_dependent and not self.src_dependent:
+          ret = ret + jnp.einsum('BTSGM,BSGM->BTSGM', inputs, kdd)
 
     # ret = self.output_activation(ret)  # for post_proj, relu here degrade performance to baseline
-    if self.residual and not self.absorb_residual:
+    if self.use_static_w and self.residual and not self.absorb_residual:
       ret = ret + (jnp.einsum(exp2, inputs, theta.d) \
         if self.learnable_diag and self.dynamic_w_init is None else inputs)
     if self.output_activation_cls is not None:
@@ -1436,7 +1497,8 @@ class DotProductAttention(base_layer.BaseLayer):
   probs_squeeze_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
   logits_output_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
   probs_output_activation_cls: activations_lib.BaseActivation = activations_lib.Identity
-  cross_head_proj_tpl: LayerTpl = template_field(CrossHeadProjection)
+  cross_head_pre_proj_tpl: LayerTpl = template_field(CrossHeadProjection)
+  cross_head_post_proj_tpl: LayerTpl = template_field(CrossHeadProjection)
   transpose_logits: bool = False
   left_mul: bool = False
   logits_absorb_residual: bool = False
@@ -1628,9 +1690,9 @@ class DotProductAttention(base_layer.BaseLayer):
           self.rotary_position_emb_tpl, dim_per_head
       )
 
-    def project_logits_or_probs(squeeze_ratio=None, squeeze_activation_cls=None,
+    def project_logits_or_probs(proj_tpl, squeeze_ratio=None, squeeze_activation_cls=None,
         output_activation_cls=None, residual=True, absorb_residual=False, gaussian_std=None):  # XD
-      proj_p = self.cross_head_proj_tpl.clone().set(
+      proj_p = proj_tpl.clone().set(
         num_heads=self.num_heads, num_groups=self.num_groups,
         init=self.scale_init, left_mul=self.left_mul,
         squeeze_ratio=squeeze_ratio, squeeze_activation_cls=squeeze_activation_cls,
@@ -1682,12 +1744,14 @@ class DotProductAttention(base_layer.BaseLayer):
 
     if self.project_logits:  # XD
       self.create_child('pre_proj', project_logits_or_probs(
+        self.cross_head_pre_proj_tpl,
         squeeze_ratio=self.logits_squeeze_ratio,
         squeeze_activation_cls=self.logits_squeeze_activation_cls,
         output_activation_cls=self.logits_output_activation_cls,
         residual=self.logits_residual, absorb_residual=self.logits_absorb_residual))
     if self.project_probs:  # XD
       self.create_child('post_proj', project_logits_or_probs(
+        self.cross_head_post_proj_tpl,
         squeeze_ratio=self.probs_squeeze_ratio,
         squeeze_activation_cls=self.probs_squeeze_activation_cls,
         output_activation_cls=self.probs_output_activation_cls,
