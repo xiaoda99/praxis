@@ -445,9 +445,11 @@ class RmsNormNoScale(BaseNormalization):
     epsilon: Tiny value to guard rsqrt.
   """
   epsilon: float = 1e-6
+  axis: int = -1  # XD -2 for dynamic w1 (BTGMI) normalization on M dim
 
   def __call__(self,
                inputs: JTensor,
+               bias: Optional[JTensor] = None,  # XD
                paddings: Optional[JTensor] = None) -> JTensor:
     """Applies RMS norm to inputs.
 
@@ -461,8 +463,9 @@ class RmsNormNoScale(BaseNormalization):
     """
     del paddings  # Unused.
     var = jnp.mean(
-        jnp.square(inputs), axis=[-1], keepdims=True, dtype=jnp.float32)
-    normed_inputs = (inputs * jax.lax.rsqrt(var + self.epsilon)).astype(
+        jnp.square(inputs), axis=[self.axis], keepdims=True, dtype=jnp.float32)  # XD -1 -> self.axis
+    if bias is None: bias = 0.  # XD
+    normed_inputs = (inputs * jax.lax.rsqrt(var + self.epsilon + bias)).astype(
         inputs.dtype
     )
     return normed_inputs
