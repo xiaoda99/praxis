@@ -611,8 +611,8 @@ class TransformerLm(base_layer.BaseLayer):
         if not isinstance(aux_loss, jnp.ndarray):
           aux_loss = jnp.array(aux_loss, dtype=self.fprop_dtype)
           aux_loss_weight = jnp.array(aux_loss_weight, dtype=self.fprop_dtype)
-        self.add_summary('total_aux_loss', aux_loss)
-        self.add_summary('total_aux_loss_weight', aux_loss_weight)
+        # self.add_summary('total_aux_loss', aux_loss)  # XD remove
+        # self.add_summary('total_aux_loss_weight', aux_loss_weight)  # XD remove
         xent_output.aux_loss = aux_loss
         xent_output.aux_loss_weight = aux_loss_weight
         # This is the loss to minimize.

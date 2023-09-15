@@ -631,9 +631,14 @@ class CrossHeadProjection(base_layer.BaseLayer):
   dw1_norm_dbias_init: WeightInit = None
   dw1_norm_bias_init: float = None  # a little effective
   dw1_norm_bias_const: float = 0.
+  square_dw1_norm_bias: bool = False
+  skip_bias: bool = False  # to exactly reproduce the bug of squeeze_bias and dw1_norm_bias not being used
   dynamic_w_hidden_dim: int = None
+  dynamic_d_hidden_dim: int = None
   merge_dynamic_w_hidden: bool = False
   dw_hidden_activation_cls: activations_lib.BaseActivation = None
+  use_dw_hidden_bias: bool = True
+  dw_hidden_gate_act_cls: activations_lib.BaseActivation = None
   tgt_dependent: bool = True
   src_dependent: bool = True
   summary_verbosity: int = 9
@@ -663,7 +668,8 @@ class CrossHeadProjection(base_layer.BaseLayer):
       # elif in_dim in [self.query_input_dim, self.key_input_dim]:
       #   relative_scale = self.gate_relative_scale  # for dynamic_squeeze_gate
       elif in_dim in [self.query_input_dim, self.key_input_dim] and \
-        self.dynamic_w_hidden_dim and out_dim == self.dynamic_w_hidden_dim * 2:
+        self.dynamic_w_hidden_dim and out_dim in [self.dynamic_w_hidden_dim, self.dynamic_w_hidden_dim * 2]:
+        # TODO: should add self.dynamic_d_hidden_dim * 2 if it is not None
         relative_scale = 1.  # for dynamic_w1
       elif out_dim == self.num_heads_per_group and in_dim <= out_dim:  # ffn.w2 or w
         relative_scale = self.relative_scale
@@ -740,26 +746,38 @@ class CrossHeadProjection(base_layer.BaseLayer):
       if self.dynamic_squeeze_ratio is not None else 1
     if self.dynamic_w_hidden_dim:
       assert self.dynamic_w_init is not None
-      pc = WeightHParams(shape=[self.query_input_dim, self.num_groups, self.dynamic_w_hidden_dim * 2],
-        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
-        init=init_fn(self.dynamic_w_hidden_dim * 2, in_dim=self.query_input_dim),
-      )
-      self.create_variable('dw1', pc)
+      for name, hidden_dim in [('dw1', self.dynamic_w_hidden_dim * 2)] + \
+          ([('dd1', self.dynamic_d_hidden_dim * 2)] if self.dynamic_d_hidden_dim else []):
+        pc = WeightHParams(shape=[self.query_input_dim, self.num_groups, hidden_dim],
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
+          init=init_fn(hidden_dim, in_dim=self.query_input_dim))
+        self.create_variable(name, pc)
+
+        if self.dw_hidden_gate_act_cls is not None:
+          self.create_variable(name + 'g', pc)
+          if name == 'dw1':  # dw1 and dd1 share hidden_gate_activation
+            self.create_child('dw_hidden_gate_activation', pax_fiddle.Config(self.dw_hidden_gate_act_cls).clone())
 
       shape = [self.dynamic_w_hidden_dim * (1 if self.merge_dynamic_w_hidden else 2)]
-      pc_bias = WeightHParams(
-        shape=shape, init=WeightInit.Constant(0.0),
-        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None],
-        collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
-      )
-      self.create_variable('dwhb', pc_bias)
-      self.create_child('dw_hidden_activation', pax_fiddle.Config(self.dw_hidden_activation_cls).clone())
+      if self.dw_hidden_gate_act_cls is None:
+        if self.use_dw_hidden_bias:
+          pc_bias = WeightHParams(
+            shape=shape, init=WeightInit.Constant(0.0),
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None],
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION])
+          self.create_variable('dwhb', pc_bias)
+        self.create_child('dw_hidden_activation', pax_fiddle.Config(self.dw_hidden_activation_cls).clone())
 
-      w_names = ['dw2_w1', 'dw2_w2', 'dw2_d'] if self.merge_dynamic_w_hidden else ['qw', 'kw']
+      if self.merge_dynamic_w_hidden: w_names = ['dw2_w1', 'dw2_w2', 'dw2_d']
+      else: w_names = ['qw', 'kw'] + (['qd', 'kd'] if self.dynamic_d_hidden_dim else [])
       for w_name in w_names:
         G, K, M = self.num_groups, self.dynamic_w_hidden_dim, self.num_heads_per_group
-        I = dynamic_hidden_dim * (1 if self.merge_dynamic_w_hidden else 2)
-        shape=[G, K, M, I] if w_name != 'dw2_d' else [G, K, M]
+        if w_name not in ['dw2_d', 'qd', 'kd']:
+          I = dynamic_hidden_dim * (1 if self.merge_dynamic_w_hidden else 2)
+          shape = [G, K, M, I]
+        else:
+          K = self.dynamic_d_hidden_dim
+          shape = [G, K, M]
         pc = WeightHParams(shape=shape, init=self.dynamic_w_init,
           mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl'] + [None]*(len(shape)-1),
         )
@@ -868,13 +886,11 @@ class CrossHeadProjection(base_layer.BaseLayer):
       # inputs = jnp.reshape(inputs, shape[:3] + (self.num_groups, self.num_heads_per_group))
       inputs = rearrange(inputs, 'B (G M) T S -> B T S G M', G=self.num_groups)
       exp = 'BTSGM,GMN->BTSGN'; exp_gate = 'BTSGI,BTGI->BTSGI'; exp2 = 'BTSGM,GM->BTSGM'
-      if hasattr(self, 'b'): b = theta.b
     else:
       # inputs = jnp.reshape(inputs, (shape[0], self.num_groups, self.num_heads_per_group) + shape[2:])
       inputs = rearrange(inputs, 'B (G M) T S -> B G M T S', G=self.num_groups)
       exp = 'BGMTS,GMN->BGNTS' if not self.left_mul else 'GNM,BGMTS->BGNTS'
       exp_gate = 'BGITS,BTGI->BGITS'; exp2 = 'BGMTS,GM->BGMTS'  # for ffn, N=I=hidden_dim
-      if hasattr(self, 'b'): b = jnp.expand_dims(theta.b, axis=(1, 2))
 
     self.add_summaries('inp', inputs)
     ret = 0.
@@ -888,7 +904,8 @@ class CrossHeadProjection(base_layer.BaseLayer):
         if self.squeeze_gate_activation_cls is not None:
           ret = ret * self.gate_activation(jnp.einsum(exp, inputs, theta.w1g))
         else:
-          if hasattr(self, 'b'): ret = ret + b
+          if self.use_squeeze_bias and self.squeeze_activation_cls not in [None, activations_lib.Identity] and not self.skip_bias:
+            ret = ret + (theta.b if self.transpose else jnp.expand_dims(theta.b, axis=(1, 2)))
           ret = self.activation(ret)
         if self.dynamic_squeeze_gate_act_cls is not None:
           if not self.addictive_gate:
@@ -928,7 +945,11 @@ class CrossHeadProjection(base_layer.BaseLayer):
     elif self.dynamic_w_init is not None:
       if self.dynamic_w_hidden_dim and not self.merge_dynamic_w_hidden:
         dw_hidden = jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1)
-        dw_hidden = self.dw_hidden_activation(dw_hidden + theta.dwhb)
+        if self.dw_hidden_gate_act_cls is not None:
+          dw_hidden = dw_hidden * self.dw_hidden_gate_activation(jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1g))
+        else:
+          if self.use_dw_hidden_bias: dw_hidden += theta.dwhb
+          dw_hidden = self.dw_hidden_activation(dw_hidden)
         q_hidden, k_hidden = jnp.split(dw_hidden, 2, axis=-1)
         qw1, qw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', q_hidden, theta.qw), 2, axis=-1)
         kw1, kw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', k_hidden, theta.kw), 2, axis=-1)
@@ -951,12 +972,17 @@ class CrossHeadProjection(base_layer.BaseLayer):
           dw1_norm_db = jnp.square(jnp.einsum('BTD,DGI->BTGI', query_vec, theta.dw1_norm_db))
           dw1_norm_db = rearrange(dw1_norm_db, 'B T G I -> B T G 1 I')
           qw1_norm_bias, kw1_norm_bias = jnp.split(dw1_norm_db, 2, axis=-1)
+        if self.dw1_norm_bias_init is not None and not self.skip_bias:
+          if self.square_dw1_norm_bias:
+            qw1_norm_bias += jnp.square(theta.qw1_norm_b)
+            kw1_norm_bias += jnp.square(theta.kw1_norm_b)
+          else:  # TODO: may lead to loss nan??
+            qw1_norm_bias += theta.qw1_norm_b
+            qw1_norm_bias += theta.kw1_norm_b
           self.add_summaries('qw1', qw1, stat_keys=['rms'])
           self.add_summaries('kw1', kw1, stat_keys=['rms'])
-          self.add_summaries('qw1_norm_dbias', qw1_norm_bias, stat_keys=['mean'])
-          self.add_summaries('kw1_norm_dbias', kw1_norm_bias, stat_keys=['mean'])
-        if hasattr(self, 'qw1_norm_b'): qw1_norm_bias += theta.qw1_norm_b  # BTG1I+I=BTG1I
-        if hasattr(self, 'kw1_norm_b'): kw1_norm_bias += theta.kw1_norm_b  # BSG1I+I=BSG1I
+          self.add_summaries('qw1_norm_b', theta.qw1_norm_b, stat_keys=['mean'])
+          self.add_summaries('kw1_norm_b', theta.kw1_norm_b, stat_keys=['mean'])
         qw1 = self.dw1_norm(qw1, bias=qw1_norm_bias)
         kw1 = self.dw1_norm(kw1, bias=kw1_norm_bias)
       if self.dw_gate_activation_cls is not None and self.dw_gate_weights is not None:
@@ -979,12 +1005,22 @@ class CrossHeadProjection(base_layer.BaseLayer):
         ret = ret + kout
 
       if self.learnable_diag:
-        dd = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.dd)
-        if self.dw_activation_cls is not None: dd = self.dw_activation(dd)
-        if self.dd_gate_activation_cls is not None:
-          ddg = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.ddg)
-          dd = dd * self.dd_gate_activation(ddg)
-        qdd, kdd = jnp.split(dd, 2, axis=-1)
+        if self.dynamic_d_hidden_dim and not self.merge_dynamic_w_hidden:
+          dd_hidden = jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dd1)
+          if self.dw_hidden_gate_act_cls is not None:
+            dd_hidden = dd_hidden * self.dw_hidden_gate_activation(jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dd1g))
+          else:
+            dd_hidden = self.dw_hidden_activation(dd_hidden)
+          q_hidden, k_hidden = jnp.split(dd_hidden, 2, axis=-1)
+          qdd = jnp.einsum('BTGK,GKM->BTGM', q_hidden, theta.qd)
+          kdd = jnp.einsum('BTGK,GKM->BTGM', k_hidden, theta.kd)
+        else:
+          dd = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.dd)
+          if self.dw_activation_cls is not None: dd = self.dw_activation(dd)
+          if self.dd_gate_activation_cls is not None:
+            ddg = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.ddg)
+            dd = dd * self.dd_gate_activation(ddg)
+          qdd, kdd = jnp.split(dd, 2, axis=-1)
         # for k, v in zip(['qdd', 'kdd'], [qdd, kdd]): self.add_summaries(k, v)
         if self.dw_activation_weights is not None and 'dd' in self.dw_activation_weights: # not effective
           dd = rearrange(qdd, 'B T G M -> B T 1 G M') + rearrange(kdd, 'B S G M -> B 1 S G M')
