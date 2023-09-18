@@ -624,9 +624,11 @@ class CrossHeadProjection(base_layer.BaseLayer):
   use_dw_bias: bool = False
   dw_activation_cls: activations_lib.BaseActivation = None
   dw_activation_weights: list = None
+  dw_cap: dict = None
   dw_gate_activation_cls: activations_lib.BaseActivation = None  # not effective
   dw_gate_weights: list = None
   dd_gate_activation_cls: activations_lib.BaseActivation = None
+  dd_activation_cls: activations_lib.BaseActivation = None
   dw1_norm_cls: normalizations.BaseNormalization = None  # not effective without learned bias
   dw1_norm_dbias_init: WeightInit = None
   dw1_norm_bias_init: float = None  # a little effective
@@ -826,13 +828,20 @@ class CrossHeadProjection(base_layer.BaseLayer):
         self.create_child('dd_gate_activation', pax_fiddle.Config(self.dd_gate_activation_cls).clone())
         self.create_variable('ddg', pc)
       if self.dw_activation_weights is not None and 'dd' in self.dw_activation_weights:
-        pc_bias = WeightHParams(shape=[self.num_groups, self.num_heads_per_group],
-            init=WeightInit.Constant(1.2785),  # silu(x) = 1
-            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt[1:],  # ['mdl', None]
-            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+        # pc_bias = WeightHParams(shape=[self.num_groups, self.num_heads_per_group],
+        #     init=WeightInit.Constant(1.2785),  # silu(x) = 1
+        #     mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt[1:],  # ['mdl', None]
+        #     collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+        # )
+        # self.create_variable('ddb', pc_bias)
+        # self.create_child('dd_activation', pax_fiddle.Config(activations_lib.SiLU).clone())
+        self.create_child('dd_activation', pax_fiddle.Config(self.dd_activation_cls).clone())
+        pc = WeightHParams(
+          shape=[self.num_groups, self.num_heads_per_group, self.num_heads_per_group],
+          init=WeightInit.Gaussian(math.sqrt(1.0 / self.num_heads_per_group) * 1.),
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt[1:] + [None],  # ['mdl', None, None],
         )
-        self.create_variable('ddb', pc_bias)
-        self.create_child('dd_activation', pax_fiddle.Config(activations_lib.SiLU).clone())
+        self.create_variable('dd2', pc)
 
     if self.dw_activation_cls is not None:
       self.create_child('dw_activation', pax_fiddle.Config(self.dw_activation_cls).clone())
@@ -869,6 +878,9 @@ class CrossHeadProjection(base_layer.BaseLayer):
     for stat_key in stat_keys:
       self.add_summary(f'{name}.{stat_key}', getattr(stats, stat_key),
         verbosity=verbosity or self.summary_verbosity)
+
+  def _cap(self, tensor, thld):
+    return thld * jnp.tanh(tensor / thld)
 
   def __call__(self, inputs: JTensor,
       query_vec: JTensor = None,
@@ -992,6 +1004,11 @@ class CrossHeadProjection(base_layer.BaseLayer):
       if self.dw_activation_cls is not None and self.dw_activation_weights is not None:  # diverge
         if 'qw1' in self.dw_activation_weights: qw1 = self.dw_activation(qw1)
         if 'kw1' in self.dw_activation_weights: kw1 = self.dw_activation(kw1)
+      if self.dw_cap is not None:
+        if 'qw1' in self.dw_cap: qw1 = self._cap(qw1, self.dw_cap['qw1'])
+        if 'qw2' in self.dw_cap: qw2 = self._cap(qw2, self.dw_cap['qw2'])
+        if 'kw1' in self.dw_cap: kw1 = self._cap(kw1, self.dw_cap['kw1'])
+        if 'kw2' in self.dw_cap: kw2 = self._cap(kw2, self.dw_cap['kw2'])
       qw2, kw2 = rearrange(qw2, 'B T G M I -> B T G I M'), rearrange(kw2, 'B T G M I -> B T G I M')
       if self.tgt_dependent:
         hidden = jnp.einsum('BTSGM,BTGMI->BTSGI', inputs, qw1)
@@ -1021,10 +1038,17 @@ class CrossHeadProjection(base_layer.BaseLayer):
             ddg = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.ddg)
             dd = dd * self.dd_gate_activation(ddg)
           qdd, kdd = jnp.split(dd, 2, axis=-1)
+        if self.dw_cap is not None and 'dd' in self.dw_cap:
+          qdd = self._cap(qdd, self.dw_cap['dd'])
+          kdd = self._cap(kdd, self.dw_cap['dd'])
         # for k, v in zip(['qdd', 'kdd'], [qdd, kdd]): self.add_summaries(k, v)
         if self.dw_activation_weights is not None and 'dd' in self.dw_activation_weights: # not effective
+          # trickily implement dynamic_d_hidden_dim with merge_dynamic_d_hidden
+          # C4SpmdLlamaXLResTHLogitsFFN2GELUDynW00003LearnDiagDW1RmsNormOnlyDiagHD16 diverge
           dd = rearrange(qdd, 'B T G M -> B T 1 G M') + rearrange(kdd, 'B S G M -> B 1 S G M')
-          dd = self.dd_activation(dd + theta.ddb) - 1.
+          # dd = self.dd_activation(dd + theta.ddb) - 1.
+          dd = self.dd_activation(dd)
+          dd = jnp.einsum('BTSGK,GKM->BTSGM', dd, theta.dd2)
           ddout = jnp.einsum('BTSGM,BTSGM->BTSGM', inputs, dd)
           self.add_summaries('ddout', ddout)
           ret = ret + ddout
@@ -1296,6 +1320,69 @@ class AttentionProjection(base_layer.BaseLayer):
     del time_step  # Not used.
     return self.__call__(inputs)
 
+class OneHeadedAttentionProjection(base_layer.BaseLayer):  # XD: from mqa.py
+  """Layer that computes projection with one head.
+
+  This layer is expected to be used within MultiQueryAttention below.
+
+  Attributes:
+    input_dim: Input dimension.
+    output_dim: Size of output.
+    use_bias: Whether to add bias in projection or not.
+  """
+  input_dim: int = 0
+  output_dim: int = 0
+  use_bias: bool = True
+  einsum_tpl: LayerTpl = template_field(base_ops.EinsumOp)
+
+  def setup(self) -> None:
+    wp = self.weight_split_dims_mapping
+    if self.mesh_shape is not None:
+      assert wp.wt is not None, ('Must provide sharding annotations for the '
+                                 'weights if mesh shape is provided')
+    wt = wp.wt
+    pc_shape = [self.input_dim, self.output_dim]
+    pc = WeightHParams(
+        shape=pc_shape, mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt
+    )
+    self.create_variable('w', pc)
+    if self.use_bias:
+      if self.mesh_shape is not None:
+        bias_split_dims_mapping = [wp.wt[1]]
+      else:
+        bias_split_dims_mapping = None
+      pc_bias = WeightHParams(
+          shape=[self.output_dim],
+          init=WeightInit.Constant(0.0),
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=bias_split_dims_mapping,
+      )
+      self.create_variable('b', pc_bias)
+    self.create_child('einsum', self.einsum_tpl.clone())
+
+  def __call__(self, inputs: JTensor) -> JTensor:
+    """Computes the multi headed projection for inputs.
+
+    Args:
+      inputs: A JTensor of shape [..., p.input_dim].
+
+    Returns:
+      The projected JTensor with shape [..., p.output_dim].
+    """
+    theta = self.theta
+
+    shape = inputs.shape
+    inputs = self._cast_to_fprop_dtype(inputs)
+    w = theta.w
+
+    assert (
+        shape[-1] == self.input_dim
+    ), f'Expecting shape[-1] == p.input_dim, {shape[-1]} != {self.input_dim}'
+    eqn = '...D,DH->...H'
+    ret = self.einsum(eqn, inputs, w)
+    if self.use_bias:
+      ret += theta.b
+    return ret
 
 class CombinedQKVProjectionLayer(base_layer.BaseLayer):
   """Layer that computes QKV projection with a combined weight.
@@ -1659,6 +1746,7 @@ class DotProductAttention(base_layer.BaseLayer):
   input_dim: Union[int, Dict[str, int]] = 0
   hidden_dim: int = 0
   num_heads: int = 1
+  num_kv_heads: int = None  # XD
   num_groups: int = 0  # XD
 
   # XD: talking-heads attention related
@@ -1687,6 +1775,7 @@ class DotProductAttention(base_layer.BaseLayer):
   dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
   atten_dropout_prob: float = 0.0
   proj_tpl: LayerTpl = template_field(AttentionProjection)
+  headless_proj_tpl: LayerTpl = template_field(OneHeadedAttentionProjection)  # XD: from mqa.py
   dconv_qkv: bool = False
   dconv_kernel_size: int = 3
   internal_gshard_gaussian_init: bool = False
@@ -1778,6 +1867,9 @@ class DotProductAttention(base_layer.BaseLayer):
     self.create_child(name, pos_emb_p)  # XD: 'rotary_position_emb' -> name
 
   def setup(self) -> None:
+    assert not self.combine_qkv
+    if self.num_kv_heads is not None: assert self.num_kv_heads == 1
+
     self.shared_dim = max(self.shared_qk_dim, self.shared_ov_dim)
     if self.float32_probs: assert self.float32_logits
     
@@ -1807,6 +1899,13 @@ class DotProductAttention(base_layer.BaseLayer):
       if gaussian_std:
         proj_p.params_init = WeightInit.Gaussian(gaussian_std)
       proj_p.weight_split_dims_mapping.wt = wp.proj
+      return proj_p
+
+    def project_input_no_heads(input_dim):  # XD: from mqa.py
+      proj_p = self.headless_proj_tpl.clone().set(
+          input_dim=input_dim, output_dim=dim_per_head, use_bias=self.use_bias
+      )
+      proj_p.weight_split_dims_mapping.wt = [wp.proj[0], wp.proj[2]] # wp.proj_headless
       return proj_p
 
     def combined_qkv_project_input(input_dim, num_heads, dim_per_head):  # XD: add num_heads and dim_per_head
@@ -1848,9 +1947,13 @@ class DotProductAttention(base_layer.BaseLayer):
           'combined_qkv', combined_qkv_project_input(query_input_dim)
       )
     else:
-      self.create_child('key', project_input(key_input_dim, dim_per_head, key_std))  # XD: add dim_per_head
       self.create_child('query', project_input(query_input_dim, dim_per_head, query_std))  # XD: add dim_per_head
-      self.create_child('value', project_input(value_input_dim, dim_per_head_v, value_std))  # XD: add dim_per_head
+      if self.num_kv_heads is None:
+        self.create_child('key', project_input(key_input_dim, dim_per_head, key_std))  # XD: add dim_per_head
+        self.create_child('value', project_input(value_input_dim, dim_per_head_v, value_std))  # XD: add dim_per_head
+      elif self.num_kv_heads == 1:
+        self.create_child('key', project_input_no_heads(key_input_dim))
+        self.create_child('value', project_input_no_heads(value_input_dim))
       if self.value_gate_activation_cls:  # XD
         self.create_child('value_gate', project_input(value_input_dim, dim_per_head_v, value_std))
         self.create_child('value_gate_activation',  pax_fiddle.Config(self.value_gate_activation_cls).clone())
@@ -2025,6 +2128,16 @@ class DotProductAttention(base_layer.BaseLayer):
     """Adds sharding annotations to tensors of shape [b, l, n, h]."""
     ap = self.activation_split_dims_mapping
     return base_layer.maybe_shard(x, ap.blnh, self.mesh_axis_names)
+  
+  def _shard_blh(self, x: JTensor) -> JTensor:  # XD: from mqa.py
+    """Adds sharding annotations to tensors of shape [b, l, h]."""
+    ap = self.activation_split_dims_mapping
+    shard = None
+    if getattr(ap, 'blh', None) is not None:
+      shard = ap.blh
+    elif ap.blnh is not None:
+      shard = [ap.blnh[0], ap.blnh[1], ap.blnh[3]]
+    return base_layer.maybe_shard(x, shard, self.mesh_axis_names)
 
   def _shard_bld(self, x: JTensor) -> JTensor:
     """Adds sharding annotations to tensors of shape [b, l, d]."""
@@ -2095,8 +2208,9 @@ class DotProductAttention(base_layer.BaseLayer):
 
   def _atten_logits(self, query: JTensor, key: JTensor) -> JTensor:
     """Compute logits from query and key."""
-    logits = self.qk_einsum('BTNH,BSNH->BNTS', query, key) \
-      if not self.transpose_logits else self.qk_einsum('BTNH,BSNH->BTSN', query, key) # XD
+    N = 'N' if self.num_kv_heads is None else ''
+    logits = self.qk_einsum(f'BTNH,BS{N}H->BNTS', query, key) \
+      if not self.transpose_logits else self.qk_einsum(f'BTNH,BS{N}H->BTSN', query, key) # XD
     return logits
 
   def _cross_head_proj(self, bnts, proj_name, query_vec=None, key_vec=None):  # XD: bnts is attn logits or weights
@@ -2131,13 +2245,17 @@ class DotProductAttention(base_layer.BaseLayer):
       atten_probs: JTensor of shape [B, N, T, S].
     """
     query = self._shard_blnh(query)
-    key = self._shard_blnh(key)
-    value = self._shard_blnh(value)
+    if self.num_kv_heads is None:
+      key = self._shard_blnh(key)
+      value = self._shard_blnh(value)
+    elif self.num_kv_heads == 1:
+      key = self._shard_blh(key)
+      value = self._shard_blh(value)
 
-    b, s, n, h = key.shape
-    base_layer.assert_has_shape(value, [b, s, n, -1])  # XD: h -> -1
-    base_layer.assert_has_shape(query, [b, -1, n, h])
-    t = query.shape[1]
+    b, t, n, h = query.shape
+    s = key.shape[1]
+    # base_layer.assert_has_shape(value, [b, s, n, -1])  # XD: h -> -1
+    # base_layer.assert_has_shape(query, [b, -1, n, h])
     # If only padding bias is supplied, then atten_mask can be [B, 1, 1, S]
     # since each target token is prohibited from attending to the same set of
     # source tokens. In this case tiling is inefficient and unnecessary.
@@ -2200,7 +2318,8 @@ class DotProductAttention(base_layer.BaseLayer):
     probs = self.atten_dropout(probs)
     # Compute the attention context.
     if self.transpose_logits: probs = jnp.transpose(probs, (0, 3, 1, 2)) # XD: BTSN -> BNTS
-    encoded = self.pv_einsum('BNTS,BSNH->BTNH', probs, value) #\
+    N = 'N' if self.num_kv_heads is None else ''
+    encoded = self.pv_einsum(f'BNTS,BS{N}H->BTNH', probs, value) #\
       # if not self.transpose_logits else self.pv_einsum('BTSN,BSNH->BTNH', probs, value)  # XD
 
     if self.zero_fully_masked:
@@ -2368,7 +2487,11 @@ class DotProductAttention(base_layer.BaseLayer):
     # Paper: https://arxiv.org/abs/2104.09864.
     if self.use_rotary_position_emb:
       query_proj = self.rotary_position_emb(query_proj, query_segment_pos)
+      if self.num_kv_heads == 1:
+        key_shape = key_proj.shape
+        key_proj = jnp.expand_dims(key_proj, axis=-2)  # [B, S, H] -> [B, S, N(1), H]
       key_proj = self.rotary_position_emb(key_proj, key_segment_pos)
+      if self.num_kv_heads == 1: key_proj = jnp.reshape(key_proj, key_shape)
       # query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)  # XD
       self._fprop_update_decode_state('key_post_rotary_pos_emb', key_proj)
     

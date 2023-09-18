@@ -1294,10 +1294,11 @@ class Transformer(base_layer.BaseLayer):
       atten_probs: A NestedMap with keys `self_atten` <float>[B, N, T, T].
     """
 
-    inputs_stats = stats.compute_stats(inputs, jnp.expand_dims(paddings, -1))
-    self.add_summary('xformer_input_mean', inputs_stats.mean_v, verbosity=3)
-    self.add_summary('xformer_input_std', inputs_stats.std_v, verbosity=3)
-    self.add_summary('xformer_input_abs_max', inputs_stats.max_v, verbosity=3)
+    # XD remove
+    # inputs_stats = stats.compute_stats(inputs, jnp.expand_dims(paddings, -1))
+    # self.add_summary('xformer_input_mean', inputs_stats.mean_v, verbosity=3)
+    # self.add_summary('xformer_input_std', inputs_stats.std_v, verbosity=3)
+    # self.add_summary('xformer_input_abs_max', inputs_stats.max_v, verbosity=3)
 
     self.add_summary('attention_input_rms', _rms(inputs), verbosity=4)
 

@@ -724,11 +724,11 @@ class TransformerLm(base_layer.BaseLayer):
 
     paddings_float32 = paddings.astype(jnp.float32)
     num_unpadded_tokens = jnp.sum(1.0 - paddings_float32)
-    self.add_summary('num_unpadded_tokens', num_unpadded_tokens)
+    # self.add_summary('num_unpadded_tokens', num_unpadded_tokens)  # XD
     if inputs.size != 0:
       num_tokens = jnp.array(inputs.size, jnp.float32)
       ratio_unpadded_tokens = num_unpadded_tokens / num_tokens
-      self.add_summary('ratio_unpadded_tokens', ratio_unpadded_tokens)
+      # self.add_summary('ratio_unpadded_tokens', ratio_unpadded_tokens)  # XD
 
     if segment_ids is None:
       assert segment_pos is None
