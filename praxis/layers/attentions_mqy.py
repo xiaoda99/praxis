@@ -825,7 +825,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
         ret = jnp.einsum(exp, ret, theta.w2) if not self.left_mul else jnp.einsum(exp, theta.w2, ret)
       self.add_summaries('out', ret)
 
-    elif self.dynamic_w_init is not None:
+    if self.dynamic_w_init is not None:
       if self.dynamic_w_hidden_dim:
         dw_hidden = jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1)
         if self.use_dw_hidden_bias: dw_hidden += theta.dwhb

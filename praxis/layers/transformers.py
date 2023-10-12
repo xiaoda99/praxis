@@ -1382,6 +1382,7 @@ class Transformer(base_layer.BaseLayer):
 
     # Apply FFN layer
     output = self.ff_layer(atten_output, paddings=paddings)
+    # output = atten_output + self.ff_layer(inputs, paddings=paddings)  # XD debug
     return output, atten_probs  # pytype: disable=bad-return-type  # jax-ndarray
 
   def extend_step(self,
