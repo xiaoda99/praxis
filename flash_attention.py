@@ -26,46 +26,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
-def _atten_context_chunked_attn_seq_split(
-    self,
-    query: JTensor,
-    key: JTensor,
-    value: JTensor,
-    atten_mask: JTensor,
-) -> Tuple[JTensor, JTensor]:
-    b, t, n, _ = query.shape
-    _, s, h = value.shape
-    w = s // self.chunked_attn_num_seq_split
-    query = query.transpose(0, 2, 1, 3)
-    full_encoded = jnp.zeros((b, n, t, h), dtype=value.dtype)
-    for i in range(self.chunked_attn_num_seq_split):
-        logits = jnp.einsum(
-            'BNTH,BSH->BNTS',
-            query[:, :, i * w : (i + 1) * w, :],  # current query chunk
-            key[:, : (i + 1) * w, :],  # keys context up to current chunk
-        )
-        logits = self._cap_logits(logits)
-        # Attention softmax is always carried out in fp32.
-        logits = logits.astype(jnp.float32)
-        mask_slice = atten_mask[:, :, i * w : (i + 1) * w, : (i + 1) * w]
-        # Consider supporting a boolean attention mask a la
-        # attention_mask_use_where
-        padded_logits = logits + mask_slice.astype(jnp.float32)
-        probs = jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
-        # Apply attention dropout.
-        probs = self.atten_dropout(probs)
-        # Compute the attention context slice.
-        encoded = jnp.einsum(
-            'BNTS,BSH->BNTH',
-            probs,
-            value[:, : (i + 1) * w, :],
-        )
-        full_encoded = full_encoded.at[:, :, i * w : (i + 1) * w, :].set(encoded)
-    full_encoded = full_encoded.transpose(0, 2, 1, 3)
-    full_encoded = self._shard_blnh(full_encoded)
-    full_probs = None
-    return full_encoded, full_probs  # pytype: disable=bad-return-type  # jax-ndarray
-
 @dataclasses.dataclass(frozen=True)
 class BlockSizes:
   """Tile sizes parameterizing FlashAttention kernels.

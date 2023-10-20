@@ -258,6 +258,7 @@ class TransformerLm(base_layer.BaseLayer):
   stacked_transformer_tpl: LayerTpl = template_field(
       transformers.StackedTransformer
   )
+  early_stacked_transformer_tpl: LayerTpl = None  # XD
   softmax_tpl: LayerTpl = template_field(
       embedding_softmax.SharedEmbeddingSoftmax
   )
@@ -465,6 +466,9 @@ class TransformerLm(base_layer.BaseLayer):
       lm_p.stacked_transformer_tpl = _set_transformer_sharding(
           lm_p.stacked_transformer_tpl
       )
+    if lm_p.early_stacked_transformer_tpl is not None:  # XD
+      lm_p.early_stacked_transformer_tpl = _set_transformer_sharding(
+        lm_p.early_stacked_transformer_tpl)
 
     if lm_p.separate_embedding_tpl is not None:
       lm_p.separate_embedding_tpl = (
@@ -499,34 +503,38 @@ class TransformerLm(base_layer.BaseLayer):
       self.create_child('ngrammer', self.ngrammer_tpl)
 
     # Transformer layers.
-    stacked_xformer_params = self.stacked_transformer_tpl.clone()
-    xformer_params = stacked_xformer_params
-    if xformer_params.cls == transformers.PipelinedTransformer:
-      xformer_params = xformer_params.pipeline_stage
-    if issubclass(xformer_params.cls, transformers.StackedTransformerRepeated):
-      xformer_params = xformer_params.block
-    if not issubclass(xformer_params.cls, transformers.StackedTransformer):
-      assert False, f'{xformer_params.cls} not supported.'
-    assert (
-        xformer_params.model_dims == 0
-        or xformer_params.model_dims == self.model_dims
-    )
-    xformer_params.model_dims = self.model_dims
-    # TODO(pax): we shouldn't override mask_self_attention here.
-    if self.model_type == LanguageModelType.CAUSAL:
-      xformer_params.mask_self_attention = True
-    else:
-      xformer_params.mask_self_attention = False
-    xformer_params.packed_input = self.packed_input
-    xformer_params.fold_padding_with_segment_mask = True
-    if self.post_attention_ngrammer_tpls is not None:
-      if len(self.post_attention_ngrammer_tpls) != xformer_params.num_layers:
-        raise ValueError(
-            'The length of post_attention_ngrammer_tpls must match'
-            'the number of attention layers.'
-        )
-      xformer_params.ngrammer_tpls = self.post_attention_ngrammer_tpls
-    self.create_child('transformer', stacked_xformer_params)
+    for prefix in ['early_', '']:  # XD
+      tpl = getattr(self, prefix + 'stacked_transformer_tpl', None)
+      if tpl is None: continue
+      stacked_xformer_params = tpl.clone()
+      # stacked_xformer_params = self.stacked_transformer_tpl.clone()
+      xformer_params = stacked_xformer_params
+      if xformer_params.cls == transformers.PipelinedTransformer:
+        xformer_params = xformer_params.pipeline_stage
+      if issubclass(xformer_params.cls, transformers.StackedTransformerRepeated):
+        xformer_params = xformer_params.block
+      if not issubclass(xformer_params.cls, transformers.StackedTransformer):
+        assert False, f'{xformer_params.cls} not supported.'
+      assert (
+          xformer_params.model_dims == 0
+          or xformer_params.model_dims == self.model_dims
+      )
+      xformer_params.model_dims = self.model_dims
+      # TODO(pax): we shouldn't override mask_self_attention here.
+      if self.model_type == LanguageModelType.CAUSAL:
+        xformer_params.mask_self_attention = True
+      else:
+        xformer_params.mask_self_attention = False
+      xformer_params.packed_input = self.packed_input
+      xformer_params.fold_padding_with_segment_mask = True
+      if self.post_attention_ngrammer_tpls is not None:
+        if len(self.post_attention_ngrammer_tpls) != xformer_params.num_layers:
+          raise ValueError(
+              'The length of post_attention_ngrammer_tpls must match'
+              'the number of attention layers.'
+          )
+        xformer_params.ngrammer_tpls = self.post_attention_ngrammer_tpls
+      self.create_child(prefix + 'transformer', stacked_xformer_params)  # XD add prefix +
 
     # Final layer norm.
     if self.final_ln_tpl is not None:
@@ -767,6 +775,9 @@ class TransformerLm(base_layer.BaseLayer):
         )
 
     self.update_decode_state('time_step', start_time_step)  # pytype: disable=wrong-arg-types  # jax-ndarray
+    if hasattr(self, 'early_transformer'):  # XD
+      inputs = self.early_transformer(
+        inputs, paddings, segment_mask=segment_mask, segment_pos=segment_pos)
     output = self.transformer(
         inputs, paddings, segment_mask=segment_mask, segment_pos=segment_pos
     )

@@ -1637,6 +1637,23 @@ class StackedTransformer(base_layer.BaseLayer):
           p_i.hidden_dims = moe_p.hidden_dims
         p_i.tr_fflayer_tpl = moe_p
 
+      atten_tpl = p_i.tr_atten_tpl
+      # assert atten_tpl.project_logits
+      # assert atten_tpl.project_probs
+      # if i == 1:
+      #   logging.warning('In StackedTransformer.setup: disable cross_head_proj for layer 1')  # XD debug
+      #   atten_tpl.project_probs = atten_tpl.project_logits = False
+      if hasattr(atten_tpl, 'cross_head_pre_proj_tpl'):
+        cross_head_proj_tpls = [atten_tpl.cross_head_pre_proj_tpl, atten_tpl.cross_head_post_proj_tpl]
+      if hasattr(atten_tpl, 'dynamic_w_pre_proj_tpl'):
+        cross_head_proj_tpls += [atten_tpl.dynamic_w_pre_proj_tpl, atten_tpl.dynamic_w_post_proj_tpl]
+      for p in cross_head_proj_tpls:
+        for name in ['use_static_w', 'dynamic_w_init', 'dynamic_d_init']:
+          if hasattr(p, name):
+            val = getattr(p, name)
+            # if i > 0: assert isinstance(val, list), f'{p}.{name} = {val}'
+            if isinstance(val, list): setattr(p, name, val[i])
+
       if self.ngrammer_tpls is not None:
         if self.ngrammer_tpls[i] is not None:
           p_i.ngrammer_tpl = self.ngrammer_tpls[i]
