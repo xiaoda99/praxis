@@ -205,6 +205,7 @@ class FullSoftmax(base_layer.BaseLayer):
   z_loss_weight: float = 0.0
   bias_init: Optional[float] = 0.0
   feed_forward_tpl: LayerTpl = template_field(linears.FeedForward)
+  chunk_size: int = None  # XD
 
   def setup(self) -> None:
     if self.feed_forward_tpl is not None:
@@ -246,6 +247,39 @@ class FullSoftmax(base_layer.BaseLayer):
     """Converts logits to log probability scores."""
     return jax.nn.log_softmax(logits)
 
+  def _compute_logits_and_loss(self, inputs, class_weights,
+                              class_ids=None, class_probabilities=None):  # XD
+    # Compute logits
+    logits = self.get_logits(inputs)
+    # We perform softmax in float32 to improve stability.
+    logits = logits.astype(jnp.float32)
+    log_probs = jax.nn.log_softmax(logits)
+
+    if class_probabilities is None:
+      class_probabilities = jax.lax.stop_gradient(jax.nn.one_hot(
+          jnp.squeeze(class_ids, axis=-1), self.num_classes, dtype=jnp.float32))
+
+    if self.bi_tempered_loss_tpl is None:
+      per_example_xent = -jnp.sum(
+        log_probs * class_probabilities, axis=-1, dtype=jnp.float32)
+    else:
+      per_example_xent = self.bi_tempered_loss(logits, class_probabilities)
+    per_example_argmax = jax.lax.stop_gradient(
+        jnp.argmax(logits.astype(jnp.float32), axis=-1))
+
+    # Compute total softmax cross-entropy loss for the output tensor.
+    total_xent = jnp.sum(
+        jnp.expand_dims(per_example_xent, axis=-1) * class_weights, dtype=jnp.float32)
+    total_weight = jnp.sum(class_weights, dtype=jnp.float32)
+
+    z_loss = None
+    if self.z_loss_weight > 0.0:
+      z_loss = (jnp.sum(_compute_z_loss(logits) * class_weights, dtype=jnp.float32)
+          / total_weight) * self.z_loss_weight
+      # self.add_summary('aux_z_loss', z_loss)
+      # self.add_aux_loss('aux_z_loss', z_loss)
+    return logits, log_probs, per_example_xent, per_example_argmax, total_xent, total_weight, z_loss
+
   def __call__(
       self,
       inputs: JTensor,
@@ -282,7 +316,43 @@ class FullSoftmax(base_layer.BaseLayer):
     # Assert one of class_ids or class_probabilities is not None
     if class_ids is None and class_probabilities is None:
       raise ValueError('One of class_ids or class_probabilities must be given.')
+    inputs_dtype = inputs.dtype
 
+    if self.chunk_size is not None:
+      w = self.chunk_size; t = inputs.shape[-2]
+      assert t % w == 0, f'{t} % {w} != 0'
+      per_example_xent, per_example_argmax = [], []
+      logits, log_probs = None, None
+      total_xent, total_weight, z_loss = None, None, None
+      for i in range(t // w):
+        start, stop = i * w, (i + 1) * w
+        _, _, _per_example_xent, _per_example_argmax, _total_xent, _total_weight, _z_loss = \
+          self._compute_logits_and_loss(inputs[..., start : stop, :],
+            class_weights[..., start : stop, :], class_ids[..., start : stop, :])
+        per_example_xent.append(_per_example_xent)
+        per_example_argmax.append(_per_example_argmax)
+        total_xent = _total_xent if total_xent is None else total_xent + _total_xent
+        total_weight = _total_weight if total_weight is None else total_weight + _total_weight
+        z_loss = _z_loss if z_loss is None else z_loss + _z_loss
+      per_example_xent = jnp.concatenate(per_example_xent, axis=-1)
+      per_example_argmax = jnp.concatenate(per_example_argmax, axis=-1)
+    else:
+      logits, log_probs, per_example_xent, per_example_argmax, total_xent, total_weight, z_loss = \
+        self._compute_logits_and_loss(inputs, class_weights, class_ids)
+       
+    output_nmap = NestedMap(
+        logits=logits.astype(inputs_dtype) if logits is not None else None,
+        log_probs=log_probs.astype(inputs_dtype) if log_probs is not None else None,
+        per_example_argmax=per_example_argmax,
+        per_example_xent=per_example_xent.astype(jnp.float32),
+        total_xent=total_xent,
+        total_weight=total_weight,
+        avg_xent=(total_xent / (total_weight + 1e-6)).astype(jnp.float32),
+    )
+    if self.z_loss_weight > 0.0:
+      output_nmap['z_loss'] = z_loss
+    return output_nmap
+       
     # Compute logits
     inputs_dtype = inputs.dtype
     logits = self.get_logits(inputs)

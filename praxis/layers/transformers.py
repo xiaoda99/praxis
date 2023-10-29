@@ -81,6 +81,7 @@ def compute_attention_masks_for_fprop(
     cross_paddings: Optional[JTensor] = None,
     cross_segment_mask: Optional[JTensor] = None,
     fold_padding_with_segment_mask: Optional[bool] = False,
+    # window_size: Optional[Sequence[int]] = (),  # XD
 ) -> Tuple[JTensor, Union[JTensor, None]]:
   """Computes attention mask from paddings, segment masks etc for fprop.
 
@@ -298,6 +299,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
   residual_droppath_prob: float = 0.0
   norm_policy: str = 'pre'
   internal_gshard_variance_scaling_fan_in_init: bool = False
+  chunk_size: int = None
 
   class WeightSharding(base_layer.BaseLayer.WeightSharding):
     """Represents how layer's learned parameters are partitioned across a mesh.
@@ -356,20 +358,27 @@ class TransformerFeedForward(base_layer.BaseLayer):
       activation = self.activation_tpl.clone()
       gate_activation = None
 
+    # XD
+    hidden_dims = self.hidden_dims
+    if self.chunk_size is not None:
+      assert self.hidden_dims % self.chunk_size == 0, f'{self.hidden_dims} % {self.chunk_size} != 0'
+      self.n_chunks = self.hidden_dims // self.chunk_size
+      hidden_dims = self.chunk_size
+
     # Create the first Feedforward layer mapping to hidden dims
     ffn1_p = self.fflayer_tpl.clone()
     ffn1_p.name = 'ffn_layer1'
     ffn1_p.input_dims = self.input_dims
     ffn1_p.has_bias = self.has_bias
     ffn1_p.activation_tpl = activation
-    ffn1_p.output_dims = self.hidden_dims
+    ffn1_p.output_dims = hidden_dims  # XD
     ffn1_p.weight_split_dims_mapping.wt = wp.ffn0
     ffn1_p.activation_split_dims_mapping.out = ap.ffn0
     if self.internal_gshard_variance_scaling_fan_in_init:
       scale = (1.0 / self.input_dims) ** 0.5 * (3.0**0.5)
       ffn1_p.linear_tpl.params_init = WeightInit.Uniform(scale)
-    self.create_child('ffn_layer1', ffn1_p)
-
+    if self.chunk_size is None: self.create_child('ffn_layer1', ffn1_p)
+    else: self.create_children('ffn_layer1', [ffn1_p.clone() for _ in range(self.n_chunks)]) # XD
     if self._is_ffn1_gated:
       # This is a gated ffw network, corresponding to gshard_builder's wi0
       gate_p = self.fflayer_tpl.clone()
@@ -377,13 +386,14 @@ class TransformerFeedForward(base_layer.BaseLayer):
       gate_p.input_dims = self.input_dims
       gate_p.has_bias = self.has_bias
       gate_p.activation_tpl = gate_activation
-      gate_p.output_dims = self.hidden_dims
+      gate_p.output_dims = hidden_dims  # XD
       gate_p.weight_split_dims_mapping.wt = wp.ffn0
       gate_p.activation_split_dims_mapping.out = ap.ffn0
       if self.internal_gshard_variance_scaling_fan_in_init:
         scale = (1.0 / self.input_dims) ** 0.5 * (3.0**0.5)
         gate_p.linear_tpl.params_init = WeightInit.Uniform(scale)
-      self.create_child('ffn_layer1_gate', gate_p)
+      if self.chunk_size is None: self.create_child('ffn_layer1_gate', gate_p)
+      else: self.create_children('ffn_layer1_gate', [gate_p.clone() for _ in range(self.n_chunks)]) # XD
 
     # Create RELU dropout layer
     relu_dropout_p = self.relu_dropout_tpl.clone()
@@ -393,16 +403,17 @@ class TransformerFeedForward(base_layer.BaseLayer):
     # Create the second Feedforward layer mapping to input dims
     ffn2_p = self.fflayer_tpl.clone()
     ffn2_p.name = 'ffn_layer2'
-    ffn2_p.input_dims = self.hidden_dims
+    ffn2_p.input_dims = hidden_dims  # XD
     ffn2_p.has_bias = self.has_bias
     ffn2_p.activation_tpl = pax_fiddle.Config(activations_lib.Identity)
     ffn2_p.output_dims = output_dims
     ffn2_p.weight_split_dims_mapping.wt = wp.ffn1
     ffn2_p.activation_split_dims_mapping.out = ap.ffn1
     if self.internal_gshard_variance_scaling_fan_in_init:
-      scale = (1.0 / self.hidden_dims) ** 0.5 * (3.0**0.5)
+      scale = (1.0 / hidden_dims) ** 0.5 * (3.0**0.5)  # XD
       ffn2_p.linear_tpl.params_init = WeightInit.Uniform(scale)
-    self.create_child('ffn_layer2', ffn2_p)
+    if self.chunk_size is None: self.create_child('ffn_layer2', ffn2_p)
+    else: self.create_children('ffn_layer2', [ffn2_p.clone() for _ in range(self.n_chunks)]) # XD
 
     # Create residual dropout layer
     residual_dropout_p = self.residual_dropout_tpl.clone()
@@ -440,27 +451,44 @@ class TransformerFeedForward(base_layer.BaseLayer):
     if self.norm_policy in ('primer_hybrid', 'pre'):
       self.add_summary('input_norm_rms', _rms(inputs), verbosity=4)
 
-    # Apply first FFN layer
-    if self._is_ffn1_gated:
-      # theta.ffn_layer1_gate corresponds to gshard_builder's wi0
-      gate_value = self.ffn_layer1_gate(inputs)
-      # theta.ffn_layer1 corresponds to gshard_builder's wi1
-      activations = gate_value * self.ffn_layer1(inputs)
+    if self.chunk_size is None:
+      # Apply first FFN layer
+      if self._is_ffn1_gated:
+        # theta.ffn_layer1_gate corresponds to gshard_builder's wi0
+        gate_value = self.ffn_layer1_gate(inputs)
+        # theta.ffn_layer1 corresponds to gshard_builder's wi1
+        activations = gate_value * self.ffn_layer1(inputs)
+      else:
+        activations = self.ffn_layer1(inputs)
+        activations = checkpoint_name(activations, 'ffn1')
+
+      # Apply paddings if not None
+      if not self.apply_padding_first and paddings is not None:
+        activations *= (1.0 - paddings)
+
+      self.add_summary('activation_rms', _rms(activations), verbosity=4)
+
+      # Apply RELU dropout
+      activations = self.relu_dropout(activations)
+
+      # Apply second FFN layer
+      outputs = self.ffn_layer2(activations)
     else:
-      activations = self.ffn_layer1(inputs)
-      activations = checkpoint_name(activations, 'ffn1')
+      outputs = None
+      for i in range(self.n_chunks):
+        if self._is_ffn1_gated:
+          gate_value = self.ffn_layer1_gate[i](inputs)
+          activations = gate_value * self.ffn_layer1[i](inputs)
+        else:
+          activations = self.ffn_layer1[i](inputs)
 
-    # Apply paddings if not None
-    if not self.apply_padding_first and paddings is not None:
-      activations *= (1.0 - paddings)
+        if not self.apply_padding_first and paddings is not None:
+          activations *= (1.0 - paddings)
 
-    self.add_summary('activation_rms', _rms(activations), verbosity=4)
+        activations = self.relu_dropout(activations)
+        _outputs = self.ffn_layer2[i](activations)
+        outputs = _outputs if outputs is None else outputs + _outputs
 
-    # Apply RELU dropout
-    activations = self.relu_dropout(activations)
-
-    # Apply second FFN layer
-    outputs = self.ffn_layer2(activations)
     outputs = checkpoint_name(outputs, 'ffn2')
 
     # Apply paddings if not None
@@ -1652,7 +1680,15 @@ class StackedTransformer(base_layer.BaseLayer):
           if hasattr(p, name):
             val = getattr(p, name)
             # if i > 0: assert isinstance(val, list), f'{p}.{name} = {val}'
-            if isinstance(val, list): setattr(p, name, val[i])
+            if isinstance(val, list):
+              assert len(val) == self.num_layers, f'{len(val)} != {self.num_layers}'
+              setattr(p, name, val[i])
+      for name in ['window_size']:
+        if hasattr(atten_tpl, name):
+          val = getattr(atten_tpl, name)
+          if isinstance(val, list):
+            assert len(val) == self.num_layers, f'{len(val)} != {self.num_layers}'
+            setattr(atten_tpl, name, val[i])
 
       if self.ngrammer_tpls is not None:
         if self.ngrammer_tpls[i] is not None:

@@ -603,6 +603,7 @@ class DynamicWeightProjection(base_layer.BaseLayer):
   dynamic_w_init: WeightInit = None
   dynamic_d_init: WeightInit = None
   dynamic_squeeze_ratio: int = None  # mqy
+  decompose_dynamic_w: bool = True
   # use_dw_bias: bool = False
   dw_activation_cls: activations_lib.BaseActivation = None
   dw_activation_weights: list = None
@@ -655,12 +656,13 @@ class DynamicWeightProjection(base_layer.BaseLayer):
             self.create_variable('dwhb', pc_bias)
           self.create_child('dw_hidden_activation', pax_fiddle.Config(self.dw_hidden_activation_cls).clone())
 
+        G, K, M = self.num_groups, self.dynamic_w_hidden_dim, self.num_heads_per_group
         if self.merge_dynamic_w_hidden: w_names = ['dw2_w1', 'dw2_w2', 'dw2_d']
         else: w_names = ['qw', 'kw'] + (['qd', 'kd'] if self.dynamic_d_hidden_dim else [])
         for w_name in w_names:
-          G, K, M = self.num_groups, self.dynamic_w_hidden_dim, self.num_heads_per_group
           if w_name not in ['dw2_d', 'qd', 'kd']:
             I = dynamic_hidden_dim * (1 if self.merge_dynamic_w_hidden else 2)
+            if not self.decompose_dynamic_w: I = M
             shape = [G, K, M, I]
           else:
             K = self.dynamic_d_hidden_dim
@@ -671,6 +673,8 @@ class DynamicWeightProjection(base_layer.BaseLayer):
           self.create_variable(w_name, pc)
       else:
         out_shape = [self.num_groups, self.num_heads_per_group, dynamic_hidden_dim * 4] # GM(4I)
+        if not self.decompose_dynamic_w:
+          out_shape = [self.num_groups, self.num_heads_per_group, self.num_heads_per_group * 2]
         pc = WeightHParams(
           shape=[self.query_input_dim] + out_shape,
           mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt + [None],  # ['data', 'mdl', None, None]
@@ -717,6 +721,7 @@ class DynamicWeightProjection(base_layer.BaseLayer):
           self.create_variable(f'{k}cb', pc_bias)
 
   def add_summaries(self, name, tensor, stat_keys=['std'], verbosity=None):
+    if tensor is None: return
     stats = compute_stats(tensor, stat_keys=stat_keys)
     for stat_key in stat_keys:
       self.add_summary(f'{name}.{stat_key}', getattr(stats, stat_key),
@@ -743,8 +748,12 @@ class DynamicWeightProjection(base_layer.BaseLayer):
           if self.use_dw_hidden_bias: dw_hidden += theta.dwhb
           dw_hidden = self.dw_hidden_activation(dw_hidden)
         q_hidden, k_hidden = jnp.split(dw_hidden, 2, axis=-1)
-        qw1, qw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', q_hidden, theta.qw), 2, axis=-1)
-        kw1, kw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', k_hidden, theta.kw), 2, axis=-1)
+        if self.decompose_dynamic_w:
+          qw1, qw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', q_hidden, theta.qw), 2, axis=-1)
+          kw1, kw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', k_hidden, theta.kw), 2, axis=-1)
+        else:
+          qw1, qw2 = jnp.einsum('BTGK,GKMN->BTGMN', q_hidden, theta.qw), None
+          kw1, kw2 = jnp.einsum('BTGK,GKMN->BTGMN', k_hidden, theta.kw), None
       else:
         dw = jnp.einsum('BTD,DGMI->BTGMI', query_vec, theta.dw)
         if self.dw_activation_cls is not None and self.dw_activation_weights is None:
@@ -752,7 +761,11 @@ class DynamicWeightProjection(base_layer.BaseLayer):
         if self.dw_gate_activation_cls is not None:
           dwg = self.dw_gate_activation(jnp.einsum('BTD,DGMI->BTGMI', query_vec, theta.dwg))
           if self.dw_gate_weights is None: dw = dw * dwg
-        qw1, qw2, kw1, kw2 = jnp.split(dw, 4, axis=-1)
+        if self.decompose_dynamic_w:
+          qw1, qw2, kw1, kw2 = jnp.split(dw, 4, axis=-1)
+        else:
+          qw1, kw1 = jnp.split(dw, 2, axis=-1)  # BTGMN
+          qw2, kw2 = None, None
       for k, v in zip(['qw2', 'kw2'], [qw2, kw2]): self.add_summaries(k, v, stat_keys=['mean', 'std'])
       if self.dw1_norm_cls is not None:
         qw1, kw1 = self.dw1_norm(qw1), self.dw1_norm(kw1)
@@ -823,6 +836,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
   dynamic_w_init: WeightInit = None
   dynamic_d_init: WeightInit = None
   dynamic_squeeze_ratio: int = None  # mqy
+  decompose_dynamic_w: bool = True
   loop_over_dynamic_hd: bool = True
   use_dw_bias: bool = False
   dw_activation_cls: activations_lib.BaseActivation = None
@@ -1192,8 +1206,11 @@ class CrossHeadProjection(base_layer.BaseLayer):
               ret = ret + out
           else:
             hidden = jnp.einsum(eqn1, inputs, w1)
-            out = jnp.einsum(eqn2, hidden, w2)
-            ret = ret + out
+            if self.decompose_dynamic_w:
+              out = jnp.einsum(eqn2, hidden, w2)
+              ret = ret + out
+            else:
+              ret = ret + hidden
 
       # if self.tgt_dependent:
       #   # hidden = jnp.einsum('BGMTS,BTGM->BGTS', inputs, qw1[..., 0])
@@ -1974,6 +1991,7 @@ class DotProductAttention(base_layer.BaseLayer):
   cross_head_pre_proj_tpl: LayerTpl = template_field(CrossHeadProjection)
   cross_head_post_proj_tpl: LayerTpl = template_field(CrossHeadProjection)
   query_chunk_size: int = None
+  window_size: int = None
   dynamic_w_pre_proj_tpl: LayerTpl = template_field(DynamicWeightProjection)
   dynamic_w_post_proj_tpl: LayerTpl = template_field(DynamicWeightProjection)
   transpose_logits: bool = False
@@ -2487,7 +2505,7 @@ class DotProductAttention(base_layer.BaseLayer):
     probs = self._cross_head_proj(probs, 'post_proj', *post_proj_dw_args,
       query_vec=query_vec, key_vec=key_vec)
     if self.float32_probs: probs = probs.astype(value.dtype)
-    if getattr(self, 'post_proj', None) is not None:
+    if False and getattr(self, 'post_proj', None) is not None:
       # mask probs similar to py_utils.apply_mask_to_logits
       min_value = py_utils.get_large_negative_number(probs.dtype)
       probs = jnp.where((atten_mask >= min_value * 0.5), probs, 0.)
@@ -2568,21 +2586,28 @@ class DotProductAttention(base_layer.BaseLayer):
         post_proj_dw_args = self.dyn_w_post_proj(query_vec, key_vec)
         # post_proj_dw_args = transpose_dw_args(post_proj_dw_args)
       encoded = jnp.zeros((b, n, t, h), dtype=value.dtype)
+      if self.window_size is not None:  # adapted from limited_context_mask
+        large_negative_number = py_utils.get_large_negative_number(atten_mask.dtype)
+        col_idx = jnp.tile(jnp.arange(t)[jnp.newaxis, :], [t, 1])
+        row_idx = jnp.tile(jnp.arange(t)[:, jnp.newaxis], [1, t])
+        window_mask = (col_idx + self.window_size <= row_idx).astype(atten_mask.dtype) * large_negative_number
+        atten_mask = jnp.minimum(atten_mask, window_mask)
       for i in range(t // w):
         start, stop = i * w, (i + 1) * w
+        kv_start = max(0, stop - w - self.window_size) if self.window_size is not None else 0
         _query = query[:, :, start : stop, :]
-        _key, _value = key[:, :, : stop, :], value[:, :, : stop, :]
-        _atten_mask = atten_mask[:, :, start : stop, : stop]
+        _key, _value = key[:, :, kv_start : stop, :], value[:, :, kv_start : stop, :]
+        _atten_mask = atten_mask[:, :, start : stop, kv_start : stop]
         # _query = query[:, start : stop, :, :]
         # _key, _value = key[:, : stop, :, :], value[:, : stop, :, :]
         # _atten_mask = atten_mask[:, start : stop, :, : stop]
         def slice_dw(qw1, qw2, kw1, kw2, qdd, kdd):
           return (qw1[:, start : stop] if qw1 is not None else None,
             qw2[:, start : stop] if qw2 is not None else None,
-            kw1[:, : stop] if kw1 is not None else None,
-            kw2[:, : stop] if kw2 is not None else None,
+            kw1[:, kv_start : stop] if kw1 is not None else None,
+            kw2[:, kv_start : stop] if kw2 is not None else None,
             qdd[:, start : stop] if qdd is not None else None,
-            kdd[:, : stop] if kdd is not None else None)
+            kdd[:, kv_start : stop] if kdd is not None else None)
         _pre_proj_dw_args = slice_dw(*pre_proj_dw_args) if hasattr(self, 'dyn_w_pre_proj') else ()
         _post_proj_dw_args = slice_dw(*post_proj_dw_args) if hasattr(self, 'dyn_w_post_proj') else ()
         # _pre_proj_dw_args = (1, 1, 1, 1, 1, 1)
