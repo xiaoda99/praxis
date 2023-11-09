@@ -115,6 +115,7 @@ class Bias(base_layer.BaseLayer):
     bias_init: Init scale (constant) of bias terms.
   """
   dims: int = 0
+  skip_bias_decay: bool = False  # XD
   bias_init: Optional[float] = 0.0
 
   def setup(self) -> None:
@@ -126,6 +127,8 @@ class Bias(base_layer.BaseLayer):
             init=WeightInit.Constant(self.bias_init),
             mesh_shape=self.mesh_shape,
             tensor_split_dims_mapping=wp.wt,
+            collections=None if not self.skip_bias_decay else [
+                base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
         ),
     )
 
@@ -179,8 +182,8 @@ class FeedForward(base_layer.BaseLayer):
     self.create_child('linear', linear_layer_p)
     if self.has_bias:
       bias_layer_p = self.bias_tpl.clone()
-      bias_layer_p.set(dims=self.output_dims, bias_init=self.bias_init
-                       )
+      bias_layer_p.set(dims=self.output_dims, bias_init=self.bias_init,
+                       skip_bias_decay=True)  # XD
       if self.mesh_shape is not None and ap.out is not None:
         wp_bias = [ap.out[-1]]
         bias_layer_p.weight_split_dims_mapping.wt = wp_bias

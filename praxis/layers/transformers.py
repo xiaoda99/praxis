@@ -300,6 +300,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
   norm_policy: str = 'pre'
   internal_gshard_variance_scaling_fan_in_init: bool = False
   chunk_size: int = None
+  output_layer_std: float = None  # XD
 
   class WeightSharding(base_layer.BaseLayer.WeightSharding):
     """Represents how layer's learned parameters are partitioned across a mesh.
@@ -412,6 +413,8 @@ class TransformerFeedForward(base_layer.BaseLayer):
     if self.internal_gshard_variance_scaling_fan_in_init:
       scale = (1.0 / hidden_dims) ** 0.5 * (3.0**0.5)  # XD
       ffn2_p.linear_tpl.params_init = WeightInit.Uniform(scale)
+    elif self.output_layer_std is not None:  # XD
+      ffn2_p.linear_tpl.params_init = WeightInit.Gaussian(self.output_layer_std)
     if self.chunk_size is None: self.create_child('ffn_layer2', ffn2_p)
     else: self.create_children('ffn_layer2', [ffn2_p.clone() for _ in range(self.n_chunks)]) # XD
 
@@ -1185,6 +1188,7 @@ class Transformer(base_layer.BaseLayer):
   tr_atten_tpl: LayerTpl = template_field(attentions.DotProductAttention)
   packed_input: bool = False
   tr_fflayer_tpl: LayerTpl = template_field(TransformerFeedForward)
+  gpt_j_residual: bool = False  # XD
   ngrammer_tpl: Optional[LayerTpl] = template_field(None)
 
   # This function can be overridden by subclasses.
@@ -1270,6 +1274,7 @@ class Transformer(base_layer.BaseLayer):
       params.residual_dropout_prob = self.residual_dropout_prob
       params.residual_droppath_prob = self.residual_droppath_prob
       params.norm_policy = self.norm_policy
+      params.add_skip_connection = not self.gpt_j_residual  # XD
       self.create_child('ff_layer', params)
 
   def init_states(self, target_batch_size: int, target_max_length: int) -> None:
@@ -1409,8 +1414,8 @@ class Transformer(base_layer.BaseLayer):
         atten_output = self.cross_layer_norm(atten_output)
 
     # Apply FFN layer
-    output = self.ff_layer(atten_output, paddings=paddings)
-    # output = atten_output + self.ff_layer(inputs, paddings=paddings)  # XD debug
+    output = self.ff_layer(atten_output, paddings=paddings) \
+      if not self.gpt_j_residual else atten_output + self.ff_layer(inputs, paddings=paddings)  # XD
     return output, atten_probs  # pytype: disable=bad-return-type  # jax-ndarray
 
   def extend_step(self,

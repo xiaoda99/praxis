@@ -595,6 +595,9 @@ def compute_stats(inputs, stat_keys=['mean', 'std', 'rms']):
   rms = jnp.sqrt(jnp.mean(jnp.square((inputs)))) if 'rms' in stat_keys else None
   return NestedMap(mean=mean, std=std, rms=rms)
 
+def unbind(ary, n, axis=0):
+  return [jnp.squeeze(a, axis=axis) for a in jnp.split(ary, n, axis=axis)]
+
 class DynamicWeightProjection(base_layer.BaseLayer):
   num_heads: int = 0
   num_groups: int = 0
@@ -625,20 +628,25 @@ class DynamicWeightProjection(base_layer.BaseLayer):
   dw_hidden_activation_cls: activations_lib.BaseActivation = None  # mqy
   use_dw_hidden_bias: bool = True
   dw_hidden_gate_act_cls: activations_lib.BaseActivation = None
+  merge_projection: bool = True
   summary_verbosity: int = 9
   
   def setup(self) -> None:
     self.num_heads_per_group = self.num_heads // self.num_groups
-    wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
+    # wt = [None, 'mdl', None]  # ['data', 'mdl', None]  # do not use zero3 to trade memory for speed
+    wt = ['data', None, None]
     if self.dynamic_w_init is not None:
       dynamic_hidden_dim = self.num_heads_per_group // self.dynamic_squeeze_ratio \
         if self.dynamic_squeeze_ratio is not None else 1
       if self.dynamic_w_hidden_dim:
-        for name, hidden_dim in [('dw1', self.dynamic_w_hidden_dim * 2)] + \
-            ([('dd1', self.dynamic_d_hidden_dim * 2)] if self.dynamic_d_hidden_dim else []):
-          pc = WeightHParams(shape=[self.query_input_dim, self.num_groups, hidden_dim],
-            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
-            init=WeightInit.Gaussian(math.sqrt(2.0 / (self.query_input_dim + hidden_dim))))
+        for name, hidden_dim in [('dw1', self.dynamic_w_hidden_dim)] + \
+            ([('dd1', self.dynamic_d_hidden_dim)] if self.dynamic_d_hidden_dim else []):
+          shape, mapping = ([self.query_input_dim, self.num_groups, 4, hidden_dim], wt + [None]) \
+            if self.merge_projection else ([self.query_input_dim, self.num_groups, 2 * hidden_dim], wt)
+          pc = WeightHParams(shape=shape,
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=mapping,
+            init=WeightInit.Gaussian(math.sqrt(2.0 / (self.query_input_dim + shape[-1]))))
+            # TODO: Use 2 * hidden_dim to be compatible with old models. 1 * hidden_dim makes more sense
           self.create_variable(name, pc)
 
           if self.dw_hidden_gate_act_cls is not None:
@@ -658,12 +666,13 @@ class DynamicWeightProjection(base_layer.BaseLayer):
 
         G, K, M = self.num_groups, self.dynamic_w_hidden_dim, self.num_heads_per_group
         if self.merge_dynamic_w_hidden: w_names = ['dw2_w1', 'dw2_w2', 'dw2_d']
+        elif self.merge_projection: w_names = ['qkw'] + (['qkd'] if self.dynamic_d_hidden_dim else [])
         else: w_names = ['qw', 'kw'] + (['qd', 'kd'] if self.dynamic_d_hidden_dim else [])
         for w_name in w_names:
-          if w_name not in ['dw2_d', 'qd', 'kd']:
+          if w_name not in ['dw2_d', 'qd', 'kd', 'qkd']:
             I = dynamic_hidden_dim * (1 if self.merge_dynamic_w_hidden else 2)
             if not self.decompose_dynamic_w: I = M
-            shape = [G, K, M, I]
+            shape = [G, 4, K, I, M] if w_name == 'qkw' else [G, K, M, I]
           else:
             K = self.dynamic_d_hidden_dim
             shape = [G, K, M]
@@ -693,7 +702,7 @@ class DynamicWeightProjection(base_layer.BaseLayer):
   
     if self.dynamic_d_init is not None:
       pc = WeightHParams(
-        shape=[self.query_input_dim, self.num_groups, self.num_heads_per_group * 2],  # DG(2M)
+        shape=[self.query_input_dim, self.num_groups, self.num_heads_per_group * (4 if self.merge_projection else 2)],  # DG(2M)
         mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wt,  # ['data', 'mdl', None]
         init=self.dynamic_d_init # or self.dynamic_w_init,
       )
@@ -738,22 +747,37 @@ class DynamicWeightProjection(base_layer.BaseLayer):
       key_vec: JTensor = None,
     ) -> JTensor:  
     theta = self.theta
-    qw1, qw2, kw1, kw2, qdd, kdd = None, None, None, None, None, None
+    if self.merge_projection:
+      pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd = None, None, None, None, None, None
+      post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd = None, None, None, None, None, None
+    else:
+      qw1, qw2, kw1, kw2, qdd, kdd = None, None, None, None, None, None
     if self.dynamic_w_init is not None:
       if self.dynamic_w_hidden_dim and not self.merge_dynamic_w_hidden:
-        dw_hidden = jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1)
-        if self.dw_hidden_gate_act_cls is not None:
-          dw_hidden = dw_hidden * self.dw_hidden_gate_activation(jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1g))
-        else:
-          if self.use_dw_hidden_bias: dw_hidden += theta.dwhb
+        if self.merge_projection:
+          dw_hidden = jnp.einsum('BTD,DGCK->BTGCK', query_vec, theta.dw1)  # C=4 [pre,post]*[query,key]
           dw_hidden = self.dw_hidden_activation(dw_hidden)
-        q_hidden, k_hidden = jnp.split(dw_hidden, 2, axis=-1)
-        if self.decompose_dynamic_w:
-          qw1, qw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', q_hidden, theta.qw), 2, axis=-1)
-          kw1, kw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', k_hidden, theta.kw), 2, axis=-1)
+          w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, theta.qkw), 2, axis=-2)
+          # w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKMI->BTGCMI', dw_hidden, theta.qkw), 2, axis=-1)
+          if self.dw1_norm_cls is not None: w1 = self.dw1_norm(w1)
+          pre_qw1, pre_kw1, post_qw1, post_kw1 = unbind(w1, 4, axis=3) # BT4GIM->[BTGIM]*4
+          pre_qw2, pre_kw2, post_qw2, post_kw2 = unbind(w2, 4, axis=3)
         else:
-          qw1, qw2 = jnp.einsum('BTGK,GKMN->BTGMN', q_hidden, theta.qw), None
-          kw1, kw2 = jnp.einsum('BTGK,GKMN->BTGMN', k_hidden, theta.kw), None
+          dw_hidden = jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1)
+          if self.dw_hidden_gate_act_cls is not None:
+            dw_hidden = dw_hidden * self.dw_hidden_gate_activation(jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1g))
+          else:
+            if self.use_dw_hidden_bias: dw_hidden += theta.dwhb
+            dw_hidden = self.dw_hidden_activation(dw_hidden)
+          q_hidden, k_hidden = jnp.split(dw_hidden, 2, axis=-1)
+          if self.decompose_dynamic_w:
+            qw1, qw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', q_hidden, theta.qw), 2, axis=-1)
+            kw1, kw2 = jnp.split(jnp.einsum('BTGK,GKMI->BTGMI', k_hidden, theta.kw), 2, axis=-1)
+            # qw1, qw2 = jnp.split(jnp.einsum('BTGK,GKIM->BTGIM', q_hidden, theta.qw), 2, axis=-2)
+            # kw1, kw2 = jnp.split(jnp.einsum('BTGK,GKIM->BTGIM', k_hidden, theta.kw), 2, axis=-2)
+          else:
+            qw1, qw2 = jnp.einsum('BTGK,GKMN->BTGMN', q_hidden, theta.qw), None
+            kw1, kw2 = jnp.einsum('BTGK,GKMN->BTGMN', k_hidden, theta.kw), None
       else:
         dw = jnp.einsum('BTD,DGMI->BTGMI', query_vec, theta.dw)
         if self.dw_activation_cls is not None and self.dw_activation_weights is None:
@@ -766,8 +790,8 @@ class DynamicWeightProjection(base_layer.BaseLayer):
         else:
           qw1, kw1 = jnp.split(dw, 2, axis=-1)  # BTGMN
           qw2, kw2 = None, None
-      for k, v in zip(['qw2', 'kw2'], [qw2, kw2]): self.add_summaries(k, v, stat_keys=['mean', 'std'])
-      if self.dw1_norm_cls is not None:
+      # for k, v in zip(['qw2', 'kw2'], [qw2, kw2]): self.add_summaries(k, v, stat_keys=['mean', 'std'])
+      if self.dw1_norm_cls is not None and not self.merge_projection:
         qw1, kw1 = self.dw1_norm(qw1), self.dw1_norm(kw1)
       if self.dw_gate_activation_cls is not None and self.dw_gate_weights is not None:
         assert set(self.dw_gate_weights) == set(['qw1', 'kw1']), f'{self.dw_gate_weights}'
@@ -800,14 +824,17 @@ class DynamicWeightProjection(base_layer.BaseLayer):
         if self.dd_gate_activation_cls is not None:
           ddg = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.ddg)
           dd = dd * self.dd_gate_activation(ddg)
-        qdd, kdd = jnp.split(dd, 2, axis=-1)
-      for k, v in zip(['qdd', 'kdd'], [qdd, kdd]): self.add_summaries(k, v, stat_keys=['mean', 'std'])
+        if not self.merge_projection: qdd, kdd = jnp.split(dd, 2, axis=-1)
+        else: pre_qdd, pre_kdd, post_qdd, post_kdd = jnp.split(dd, 4, axis=-1)
+      # for k, v in zip(['qdd', 'kdd'], [qdd, kdd]): self.add_summaries(k, v, stat_keys=['mean', 'std'])
       if self.dw_cap is not None or self.learned_dw_cap is not None:
         qdd = self._cap(qdd, 'qdd'); kdd = self._cap(kdd, 'kdd')
         if self.learned_dw_cap is not None:
           for k, v in zip(['qdout', 'kdout'], [theta.qddc, theta.kddc]):  # reuse to save summary entries
             self.add_summaries(k, v, stat_keys=['mean'])
-    return qw1, qw2, kw1, kw2, qdd, kdd
+    return (qw1, qw2, kw1, kw2, qdd, kdd) if not self.merge_projection else \
+      ((pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd),
+      (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd))
 
 class CrossHeadProjection(base_layer.BaseLayer):
   num_heads: int = 0
@@ -881,7 +908,8 @@ class CrossHeadProjection(base_layer.BaseLayer):
       return
 
     # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
-    wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
+    # wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
+    wt = [None, None, None]
     def init_fn(out_dim, in_dim=None):
       if self.init is not None: return self.init
       if in_dim is None: in_dim = self.num_heads_per_group
@@ -1192,17 +1220,23 @@ class CrossHeadProjection(base_layer.BaseLayer):
           if 'kw2' in self.learned_dw_cap: self.add_summaries('kout', theta.kw2c, stat_keys=['mean'])
       # qw2, kw2 = rearrange(qw2, 'B T G M I -> B T G I M'), rearrange(kw2, 'B T G M I -> B T G I M')
     if qw1 is not None:
-      hidden_label = inputs_label.replace('M', 'I')
+      hidden_sym = 'I'; hidden_label = inputs_label.replace('M', 'I')
       for sym, (w1, w2) in zip(['T', 'S'], [(qw1, qw2), (kw1, kw2)]):
-        hidden_sym = 'I'; dw_label = f'B{sym}GM{hidden_sym}'; # dw2_label = f'B{sym}G{hidden_sym}M'
-        dynamic_hidden_dim = w1.shape[-1]
+        dw_label = f'B{sym}G{hidden_sym}M' if w1.shape[-1] == self.num_heads_per_group \
+          else f'B{sym}GM{hidden_sym}'  # w1.shape[-2] == self.num_heads_per_group
+        dynamic_hidden_dim = w1.shape[dw_label.index(hidden_sym)]
         eqn1 = f'{inputs_label},{dw_label}->{hidden_label}' # 'BGMTS,BTGMI->BGITS'
         eqn2 = f'{hidden_label},{dw_label}->{inputs_label}' # 'BGITS,BTGMI->BGMTS'
         if sym == 'T' and self.tgt_dependent or sym == 'S' and self.src_dependent:
           if self.loop_over_dynamic_hd and dynamic_hidden_dim <= 2:
             for i in range(dynamic_hidden_dim):
-              hidden = jnp.einsum(eqn1.replace(hidden_sym, ''), inputs, w1[..., i])
-              out = jnp.einsum(eqn2.replace(hidden_sym, ''), hidden, w2[..., i])  
+              if dw_label[-1] == hidden_sym:
+                hidden = jnp.einsum(eqn1.replace(hidden_sym, ''), inputs, w1[..., i])
+                out = jnp.einsum(eqn2.replace(hidden_sym, ''), hidden, w2[..., i])
+              else:
+                assert dw_label[-2] == hidden_sym, dw_label
+                hidden = jnp.einsum(eqn1.replace(hidden_sym, ''), inputs, w1[..., i, :])
+                out = jnp.einsum(eqn2.replace(hidden_sym, ''), hidden, w2[..., i, :])
               ret = ret + out
           else:
             hidden = jnp.einsum(eqn1, inputs, w1)
@@ -1998,6 +2032,7 @@ class DotProductAttention(base_layer.BaseLayer):
   left_mul: bool = False
   logits_absorb_residual: bool = False
   probs_absorb_residual: bool = False
+  merge_dw_proj: bool = True
 
   dim_per_head: Optional[int] = None
   # XD: gated attention related
@@ -2036,6 +2071,7 @@ class DotProductAttention(base_layer.BaseLayer):
   float32_value: bool = False  # XD
   qk_norm: bool = False  # XD
   qk_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)  # XD
+  output_layer_std: float = None  # XD
   # TODO(pax-dev): merge use_rotary_position_emb and rotary_position_emb_tpl
   # by initializing rotary_position_emb_tpl = None.
   use_rotary_position_emb: bool = False
@@ -2172,6 +2208,7 @@ class DotProductAttention(base_layer.BaseLayer):
       key_std = None
       value_std = None
       post_std = None
+    if self.output_layer_std is not None: post_std = self.output_layer_std  # XD
 
     if self.combine_qkv:
       assert key_input_dim == value_input_dim
@@ -2216,10 +2253,11 @@ class DotProductAttention(base_layer.BaseLayer):
       proj_p.weight_split_dims_mapping.wt = wp.proj
       return proj_p
       
-    def project_dynamic_w(proj_tpl):  # XD
+    def project_dynamic_w(proj_tpl, merge_projection=False):  # XD
       proj_p = proj_tpl.clone().set(
         num_heads=self.num_heads, num_groups=self.num_groups,
-        query_input_dim=query_input_dim, key_input_dim=key_input_dim)
+        query_input_dim=query_input_dim, key_input_dim=key_input_dim,
+        merge_projection=merge_projection)
       proj_p.weight_split_dims_mapping.wt = wp.proj
       return proj_p
 
@@ -2269,7 +2307,7 @@ class DotProductAttention(base_layer.BaseLayer):
         squeeze_activation_cls=self.logits_squeeze_activation_cls,
         output_activation_cls=self.logits_output_activation_cls,
         residual=self.logits_residual, absorb_residual=self.logits_absorb_residual))
-      if self.query_chunk_size is not None:
+      if self.query_chunk_size is not None and not self.merge_dw_proj:
         self.create_child('dyn_w_pre_proj', project_dynamic_w(self.dynamic_w_pre_proj_tpl))
     if self.project_probs:  # XD
       self.create_child('post_proj', project_logits_or_probs(
@@ -2278,8 +2316,12 @@ class DotProductAttention(base_layer.BaseLayer):
         squeeze_activation_cls=self.probs_squeeze_activation_cls,
         output_activation_cls=self.probs_output_activation_cls,
         residual=self.probs_residual, absorb_residual=self.probs_absorb_residual))
-      if self.query_chunk_size is not None:
+      if self.query_chunk_size is not None and not self.merge_dw_proj:
         self.create_child('dyn_w_post_proj', project_dynamic_w(self.dynamic_w_post_proj_tpl))
+    if self.project_logits and self.project_probs and \
+      self.query_chunk_size is not None and self.merge_dw_proj:
+      self.create_child('dyn_w_proj', project_dynamic_w(
+        self.dynamic_w_post_proj_tpl, merge_projection=True))
 
     if self.relative_bias_tpl is not None:
       relative_bias_p = self.relative_bias_tpl.clone()
@@ -2579,12 +2621,14 @@ class DotProductAttention(base_layer.BaseLayer):
       def transpose_dw_args(dw_args):
         return tuple([rearrange(a, 'B T X Y Z -> B X Y Z T' if i < 4 else 'B T X Y -> B X Y T')
                       for i, a in enumerate(dw_args)])
-      if hasattr(self, 'dyn_w_pre_proj'):
-        pre_proj_dw_args = self.dyn_w_pre_proj(query_vec, key_vec)
-        # pre_proj_dw_args = transpose_dw_args(pre_proj_dw_args)
-      if hasattr(self, 'dyn_w_post_proj'):
-        post_proj_dw_args = self.dyn_w_post_proj(query_vec, key_vec)
-        # post_proj_dw_args = transpose_dw_args(post_proj_dw_args)
+      pre_proj_dw_args, post_proj_dw_args = None, None
+      if hasattr(self, 'dyn_w_proj'):
+        pre_proj_dw_args, post_proj_dw_args = self.dyn_w_proj(query_vec, key_vec)
+      else:
+        if hasattr(self, 'dyn_w_pre_proj'):
+          pre_proj_dw_args = self.dyn_w_pre_proj(query_vec, key_vec)
+        if hasattr(self, 'dyn_w_post_proj'):
+          post_proj_dw_args = self.dyn_w_post_proj(query_vec, key_vec)
       encoded = jnp.zeros((b, n, t, h), dtype=value.dtype)
       if self.window_size is not None:  # adapted from limited_context_mask
         large_negative_number = py_utils.get_large_negative_number(atten_mask.dtype)
@@ -2608,10 +2652,8 @@ class DotProductAttention(base_layer.BaseLayer):
             kw2[:, kv_start : stop] if kw2 is not None else None,
             qdd[:, start : stop] if qdd is not None else None,
             kdd[:, kv_start : stop] if kdd is not None else None)
-        _pre_proj_dw_args = slice_dw(*pre_proj_dw_args) if hasattr(self, 'dyn_w_pre_proj') else ()
-        _post_proj_dw_args = slice_dw(*post_proj_dw_args) if hasattr(self, 'dyn_w_post_proj') else ()
-        # _pre_proj_dw_args = (1, 1, 1, 1, 1, 1)
-        # _post_proj_dw_args = (1, 1, 1, 1, 1, 1)
+        _pre_proj_dw_args = slice_dw(*pre_proj_dw_args) if pre_proj_dw_args is not None else ()
+        _post_proj_dw_args = slice_dw(*post_proj_dw_args) if post_proj_dw_args is not None else ()
         _encoded, _ = self._atten_context(_query, _key, _value, _atten_mask,
           _pre_proj_dw_args, _post_proj_dw_args)
         encoded = encoded.at[:, :, start : stop, :].set(_encoded)
