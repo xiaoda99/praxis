@@ -1149,6 +1149,80 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
       output = jnp.squeeze(output, axis=1)
     return output
 
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return jnp.concatenate((-x2, x1), axis=x1.ndim - 1)
+
+def apply_rotary_pos_emb(inputs, cos, sin, offset: int = 0):
+    # cos, sin = (
+    #     cos[offset : inputs.shape[0] + offset, ...],
+    #     sin[offset : inputs.shape[0] + offset, ...],
+    # )
+    return (inputs * cos) + (rotate_half(inputs) * sin)
+
+class PythiaRotaryPositionalEmbedding(PositionalEmbedding):
+    cast_as_fprop_dtype: bool = True
+    rotary_pct: float = 0.25
+
+    def setup(self) -> None:
+        if self.embedding_dims % 2:
+            raise ValueError("Embedding dim for rotary position embedding must be a multiple of 2.")
+        super().setup()
+        
+    def __call__(
+        self,  # pytype: disable=signature-mismatch  # overriding-parameter-count-checks
+        inputs: JTensor,
+        position: Optional[JTensor] = None,
+        offset: int = 0,
+        name: str = '',
+    ) -> JTensor:
+        if len(inputs.shape) != 4:
+            raise ValueError(
+                "Input is assumed to be a rank 4 tensor of shape[batch, sequence, heads, dims]."
+            )
+        if self.embedding_dims != inputs.shape[3]:
+            raise ValueError(
+                "The embedding dims of the rotary position embedding"
+                "must match the hidden dimension of the inputs."
+            )
+        
+        rotary_ndims = int(self.embedding_dims * self.rotary_pct)
+        fraction = jnp.arange(0, rotary_ndims, 2).astype(jnp.float32) / rotary_ndims
+        timescale = self.min_timescale * (self.max_timescale / self.min_timescale) ** fraction
+        
+        if position is None:
+            seq_length = inputs.shape[1]
+            # 调换了length维度顺序
+            position = jnp.arange(seq_length, dtype=jnp.float32)[:, jnp.newaxis]
+        else:
+            if len(position.shape) == 2:
+                assert position.shape[1] == inputs.shape[1]
+                position = position[0]
+            position = position[jnp.newaxis, :].astype(jnp.float32)
+
+        position = position[:, :, jnp.newaxis, jnp.newaxis]
+        timescale = timescale[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+        sinusoid_inp = position / timescale
+        sinusoid_inp = jnp.concatenate([sinusoid_inp, sinusoid_inp], axis=-1)
+        
+        if self.fprop_dtype == jnp.bfloat16:
+            sinusoid_inp = sinusoid_inp.astype(jnp.float32)
+            
+        sin = jnp.sin(sinusoid_inp)
+        cos = jnp.cos(sinusoid_inp)
+        # self.add_summary("[lsp]cos", cos, verbosity=self.user_summary_level)
+        # self.add_summary("[lsp]sin", sin, verbosity=self.user_summary_level)
+        # self.add_summary(f"[lsp]rotary_inputs_{name}", inputs, verbosity=self.user_summary_level)
+        inputs_rot, inputs_pass = (inputs[..., :rotary_ndims], inputs[..., rotary_ndims :], )
+        # self.add_summary(f"[lsp]inputs_rot_{name}", inputs_rot, verbosity=self.user_summary_level)
+        inputs_layer = apply_rotary_pos_emb(inputs_rot, cos, sin, offset=offset)
+        inputs_layer = jnp.concatenate((inputs_layer, inputs_pass), axis=-1)
+
+        if self.cast_as_fprop_dtype:
+            inputs_layer = inputs_layer.astype(self.fprop_dtype)
+
+        # self.add_summary(f"[lsp]rotary_inputs_layer_{name}", inputs_layer, verbosity=self.user_summary_level)
+        return inputs_layer
 
 class TrainablePositionalEmbedding(PositionalEmbedding):
   """Generates trainable position embedding for a given 1-d sequence.
