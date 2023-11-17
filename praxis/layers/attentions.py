@@ -715,7 +715,8 @@ class DynamicWeightProjection(base_layer.BaseLayer):
       self.create_child('dw_activation', pax_fiddle.Config(self.dw_activation_cls).clone())
     if self.dw1_norm_cls is not None:
       self.create_child('dw1_norm', pax_fiddle.Config(self.dw1_norm_cls).clone().set(
-        axis=-2, epsilon=1e-6 + self.dw1_norm_bias_const))
+        axis=-1 if self.merge_projection else -2,  # merge_projection: BTG4IM[-1] = M; otherwise: BTGMI[-2] = M
+        epsilon=1e-6 + self.dw1_norm_bias_const))
 
     # if self.learned_dw_cap is not None:
     #   for k, v in self.learned_dw_cap.items():
@@ -1139,12 +1140,16 @@ class CrossHeadProjection(base_layer.BaseLayer):
       return jnp.reshape(ret, shape)
     if self.transpose:
       inputs = rearrange(inputs, 'B (G M) T S -> B T S G M', G=self.num_groups)
-      exp = 'BTSGM,GMN->BTSGN'; exp_gate = 'BTSGI,BTGI->BTSGI'; exp2 = 'BTSGM,GM->BTSGM'
+      exp = 'BTSGM,GMN->BTSGN'
     else:
-      inputs = rearrange(inputs, 'B (G M) T S -> B G M T S', G=self.num_groups); inputs_label = 'BGMTS'
-      # inputs = rearrange(inputs, 'B T (G M) S -> B T G M S', G=self.num_groups); inputs_label = 'BTGMS'
+      if inputs.shape[-1] == self.num_heads:  # transpose_logits
+        inputs = rearrange(inputs, 'B T S (G M) -> B T S G M', G=self.num_groups); inputs_label = 'BTSGM'
+      else:
+        assert inputs.shape[1] == self.num_heads
+        inputs = rearrange(inputs, 'B (G M) T S -> B G M T S', G=self.num_groups); inputs_label = 'BGMTS'
+        # inputs = rearrange(inputs, 'B T (G M) S -> B T G M S', G=self.num_groups); inputs_label = 'BTGMS'
       out_label = inputs_label.replace('M', 'N')
-      exp = f'{inputs_label},GMN->{out_label}'; exp2 = 'BGMTS,GM->BGMTS'  # for ffn, N=I=hidden_dim
+      exp = f'{inputs_label},GMN->{out_label}' # for ffn, N=I=hidden_dim
 
     self.add_summaries('inp', inputs)
     assert not self.absorb_residual
@@ -2075,7 +2080,7 @@ class DotProductAttention(base_layer.BaseLayer):
   # TODO(pax-dev): merge use_rotary_position_emb and rotary_position_emb_tpl
   # by initializing rotary_position_emb_tpl = None.
   use_rotary_position_emb: bool = False
-  pythia_rotary = False
+  pythia_rotary: bool = False
   rotary_position_emb_tpl: Optional[LayerTpl] = template_field(
       embedding_softmax.RotaryPositionalEmbedding
   )
@@ -2536,8 +2541,8 @@ class DotProductAttention(base_layer.BaseLayer):
     logits = self._cross_head_proj(logits, 'pre_proj', *pre_proj_dw_args,
       query_vec=query_vec, key_vec=key_vec)  # XD
 
-    if self.transpose_logits:
-      atten_mask = jnp.transpose(atten_mask, (0, 2, 3, 1))  # XD: BNTS->BTSN
+    # if self.transpose_logits:
+    #   atten_mask = jnp.transpose(atten_mask, (0, 2, 3, 1))  # XD: BNTS->BTSN
     logits = self._cap_logits(logits)
     logits = logits.astype(jnp.float32)
     padded_logits = py_utils.apply_mask_to_logits(logits, atten_mask)
@@ -2557,10 +2562,11 @@ class DotProductAttention(base_layer.BaseLayer):
       probs = jnp.where((atten_mask >= min_value * 0.5), probs, 0.)
 
     probs = self.atten_dropout(probs)
-    if self.transpose_logits: probs = jnp.transpose(probs, (0, 3, 1, 2)) # XD: BTSN -> BNTS
+    # if self.transpose_logits: probs = jnp.transpose(probs, (0, 3, 1, 2)) # XD: BTSN -> BNTS
     N = 'N' if self.num_kv_heads is None else ''
-    encoded = self.pv_einsum(f'BNTS,B{N}SH->BNTH', probs, value)
-    # encoded = self.pv_einsum(f'BTNS,BS{N}H->BTNH', probs, value)
+    value_exp = logits_exp.replace('S', '') + 'H'
+    encoded = self.pv_einsum(f'{logits_exp},B{N}SH->{value_exp}', probs, value)
+    # encoded = self.pv_einsum(f'BNTS,B{N}SH->BNTH', probs, value)
     return encoded, probs
     
   def _dot_atten(
@@ -2633,19 +2639,24 @@ class DotProductAttention(base_layer.BaseLayer):
           pre_proj_dw_args = self.dyn_w_pre_proj(query_vec, key_vec)
         if hasattr(self, 'dyn_w_post_proj'):
           post_proj_dw_args = self.dyn_w_post_proj(query_vec, key_vec)
-      encoded = jnp.zeros((b, n, t, h), dtype=value.dtype)
       if self.window_size is not None:  # adapted from limited_context_mask
         large_negative_number = py_utils.get_large_negative_number(atten_mask.dtype)
         col_idx = jnp.tile(jnp.arange(t)[jnp.newaxis, :], [t, 1])
         row_idx = jnp.tile(jnp.arange(t)[:, jnp.newaxis], [1, t])
         window_mask = (col_idx + self.window_size <= row_idx).astype(atten_mask.dtype) * large_negative_number
         atten_mask = jnp.minimum(atten_mask, window_mask)
+      if self.transpose_logits:
+        atten_mask = jnp.transpose(atten_mask, (0, 2, 3, 1))  # XD: BNTS->BTSN
+        encoded = jnp.zeros((b, t, n, h), dtype=value.dtype)
+      else:
+        encoded = jnp.zeros((b, n, t, h), dtype=value.dtype)
       for i in range(t // w):
         start, stop = i * w, (i + 1) * w
         kv_start = max(0, stop - w - self.window_size) if self.window_size is not None else 0
         _query = query[:, :, start : stop, :]
         _key, _value = key[:, :, kv_start : stop, :], value[:, :, kv_start : stop, :]
-        _atten_mask = atten_mask[:, :, start : stop, kv_start : stop]
+        _atten_mask = atten_mask[:, :, start : stop, kv_start : stop] \
+          if not self.transpose_logits else atten_mask[:, start : stop, kv_start : stop, :]
         # _query = query[:, start : stop, :, :]
         # _key, _value = key[:, : stop, :, :], value[:, : stop, :, :]
         # _atten_mask = atten_mask[:, start : stop, :, : stop]
@@ -2660,8 +2671,9 @@ class DotProductAttention(base_layer.BaseLayer):
         _post_proj_dw_args = slice_dw(*post_proj_dw_args) if post_proj_dw_args is not None else ()
         _encoded, _ = self._atten_context(_query, _key, _value, _atten_mask,
           _pre_proj_dw_args, _post_proj_dw_args)
-        encoded = encoded.at[:, :, start : stop, :].set(_encoded)
-    encoded = encoded.transpose(0, 2, 1, 3)  # bnth->btnh
+        encoded = encoded.at[:, :, start : stop, :].set(_encoded) \
+          if not self.transpose_logits else encoded.at[:, start : stop, :, :].set(_encoded)
+    if not self.transpose_logits: encoded = encoded.transpose(0, 2, 1, 3)  # bnth->btnh
 
     # logits = self._atten_logits(query, key)
     # if relative_bias is not None:
