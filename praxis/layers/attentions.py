@@ -618,6 +618,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
   query_input_dim: int = None  # 2048
   key_input_dim: int = None  # 2048
   use_static_w: bool = True
+  finetune_flag: bool = True
   dynamic_w_init: WeightInit = None
   dynamic_d_init: WeightInit = None
   dynamic_squeeze_ratio: int = None  # 8 mqy
