@@ -671,7 +671,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
       if not self.residual or in_dim == self.num_heads_per_group and in_dim > out_dim: # ffn.w1
         relative_scale = 1.0
       elif in_dim in [self.query_input_dim, self.key_input_dim] and \
-        self.dynamic_w_hidden_dim and out_dim in [self.dynamic_w_hidden_dim, self.dynamic_w_hidden_dim * 2]:
+        self.dynamic_w_hidden_dim and out_dim in [self.dynamic_w_hidden_dim, self.dynamic_w_hidden_dim * 2, self.dynamic_d_hidden_dim * 2]:
         # TODO: should add self.dynamic_d_hidden_dim * 2 if it is not None
         relative_scale = 1.  # for dynamic_w1
       elif out_dim == self.num_heads_per_group and in_dim <= out_dim:  # ffn.w2 or w
@@ -931,8 +931,8 @@ class CrossHeadProjection(base_layer.BaseLayer):
       ret = ret + (jnp.einsum(exp2, inputs, theta.d) \
         if self.learnable_diag and self.dynamic_w_init is None else inputs)
     # self.add_summaries('fout', ret)
-    if self.output_activation_cls is not None:
-      ret = self.output_activation(ret)  # for post_proj, relu here has no effect on performance
+    #if self.output_activation_cls is not None:
+    #  ret = self.output_activation(ret)  # for post_proj, relu here has no effect on performance
     if self.transpose: ret = jnp.transpose(ret, (0, 3, 4, 1, 2))  # BTSGM->BGMTS
     # inputs = inputs + jnp.repeat(inputs[:, :, 0:1, :, :], self.num_heads_per_group, axis=2)  # jnp.roll(inputs, 1, axis=2) #
     return jnp.reshape(ret, shape)  # BGMTS->BNTS
