@@ -671,7 +671,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
       if not self.residual or in_dim == self.num_heads_per_group and in_dim > out_dim: # ffn.w1
         relative_scale = 1.0
       elif in_dim in [self.query_input_dim, self.key_input_dim] and \
-        self.dynamic_w_hidden_dim and out_dim in [self.dynamic_w_hidden_dim, self.dynamic_w_hidden_dim * 2, self.dynamic_d_hidden_dim * 2]:
+        self.dynamic_w_hidden_dim and out_dim in [self.dynamic_w_hidden_dim, self.dynamic_w_hidden_dim * 2]:
         # TODO: should add self.dynamic_d_hidden_dim * 2 if it is not None
         relative_scale = 1.  # for dynamic_w1
       elif out_dim == self.num_heads_per_group and in_dim <= out_dim:  # ffn.w2 or w
