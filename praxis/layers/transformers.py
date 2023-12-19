@@ -1626,8 +1626,9 @@ class StackedTransformer(base_layer.BaseLayer):
 
     assert self.num_layers > 0
     assert self.model_dims > 0
-    assert self.hidden_dims > 0
-    assert self.num_heads > 0
+    # from collections.abc import Iterable
+    # assert self.hidden_dims > 0 or isinstance(self.hidden_dims, Iterable)
+    # assert self.num_heads > 0
     assert 0.0 <= self.dropout_prob < 1.0
     assert 0.0 <= self.input_dropout_prob < 1.0
 
@@ -1688,12 +1689,18 @@ class StackedTransformer(base_layer.BaseLayer):
             if isinstance(val, list):
               assert len(val) == self.num_layers, f'{len(val)} != {self.num_layers}'
               setattr(p, name, val[i])
-      for name in ['window_size']:
-        if hasattr(atten_tpl, name):
-          val = getattr(atten_tpl, name)
-          if isinstance(val, list):
-            assert len(val) == self.num_layers, f'{len(val)} != {self.num_layers}'
-            setattr(atten_tpl, name, val[i])
+      # Several attributes of atten_tpl (inc. window_size) have already beens set, but
+      # num_heads and dim_per_head haven't, which are to be set in Transformer._setup_attention
+      for tpl, tpl_name, names in [(p_i, 'p_i', ['hidden_dims', 'num_heads', 'dim_per_head']),  # tuple
+                        (atten_tpl, 'atten_tpl', ['window_size'])]:  # list
+        for name in names:
+          if hasattr(tpl, name):
+            val = getattr(tpl, name)
+            if isinstance(val, (list, tuple)):  # TODO: When do type(hidden_dims/p_i.num_heads/dim_per_head)
+                                                # turn from list to tuple? During repeat?
+              logging.info(f'In StackedTransformer.setup._layer_params: {tpl_name}.{name} = {val} {type(val)}')
+              assert len(val) == self.num_layers, f'{len(val)} != {self.num_layers}'
+              setattr(tpl, name, val[i])
 
       if self.ngrammer_tpls is not None:
         if self.ngrammer_tpls[i] is not None:

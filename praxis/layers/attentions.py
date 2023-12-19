@@ -633,8 +633,9 @@ class DynamicWeightProjection(base_layer.BaseLayer):
   
   def setup(self) -> None:
     self.num_heads_per_group = self.num_heads // self.num_groups
-    # wt = [None, 'mdl', None]  # ['data', 'mdl', None]  # do not use zero3 to trade memory for speed
-    wt = ['data', None, None]
+    # wt = [None, 'mdl', None]
+    wt = ['data', 'mdl', None]  # do not use zero3 to trade memory for speed
+    # wt = ['data', None, None]
     if self.dynamic_w_init is not None:
       dynamic_hidden_dim = self.num_heads_per_group // self.dynamic_squeeze_ratio \
         if self.dynamic_squeeze_ratio is not None else 1
@@ -909,8 +910,8 @@ class CrossHeadProjection(base_layer.BaseLayer):
       return
 
     # wp.wt == w_dnh defined in transformer_models.TransformerLm.set_sharding_params_v1
-    # wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
-    wt = [None, None, None]
+    wt = ['mdl', None, None] # wp.wt[1:] + [None]  # [data_axis, mdl_axis, None] -> [mdl_axis, None, None]
+    # wt = [None, None, None]
     def init_fn(out_dim, in_dim=None):
       if self.init is not None: return self.init
       if in_dim is None: in_dim = self.num_heads_per_group
@@ -2043,6 +2044,7 @@ class DotProductAttention(base_layer.BaseLayer):
   # XD: gated attention related
   dim_per_head_v: Optional[int] = None
   value_gate_activation_cls: activations_lib.BaseActivation = None
+  o_gate_activation_cls: activations_lib.BaseActivation = None
 
   dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
   atten_dropout_prob: float = 0.0
@@ -2237,6 +2239,9 @@ class DotProductAttention(base_layer.BaseLayer):
       if self.value_gate_activation_cls:  # XD
         self.create_child('value_gate', project_input(value_input_dim, dim_per_head_v, value_std))
         self.create_child('value_gate_activation',  pax_fiddle.Config(self.value_gate_activation_cls).clone())
+      if self.o_gate_activation_cls:  # XD
+        self.create_child('o_gate', project_input(value_input_dim, dim_per_head_v, value_std))
+        self.create_child('o_gate_activation',  pax_fiddle.Config(self.o_gate_activation_cls).clone())
     if self.qk_norm:  # XD
       for name in ['q_norm', 'k_norm']:
         params = self.qk_norm_tpl.clone()
@@ -2527,7 +2532,7 @@ class DotProductAttention(base_layer.BaseLayer):
   ) -> Tuple[JTensor, JTensor]:
     # logits = self._atten_logits(query, key)
     N = 'N' if self.num_kv_heads is None else ''
-    logits_exp = 'BNTS' if not self.transpose_logits else 'BTSN'
+    logits_exp = 'BNTS' if not self.transpose_logits else 'BTSN' # 'BTNS'
     logits = self.qk_einsum(f"BNTH,B{N}SH->{logits_exp}", query, key)  # XD
     # logits_exp = 'BTNS' if not self.transpose_logits else 'BTSN'
     # logits = self.qk_einsum(f"BTNH,BS{N}H->{logits_exp}", query, key)  # XD
@@ -2548,7 +2553,7 @@ class DotProductAttention(base_layer.BaseLayer):
     padded_logits = py_utils.apply_mask_to_logits(logits, atten_mask)
     if self.attention_extra_logit is None:
       # XD: -1 -> -2; key -> value: key may have already been turned to fp32 by float32_logits
-      probs = jax.nn.softmax(padded_logits, axis=-1 - int(self.transpose_logits))#.astype(value.dtype)
+      probs = jax.nn.softmax(padded_logits, axis=logits_exp.index('S'))#.astype(value.dtype)
     else:
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits))#.astype(value.dtype)
     # XD
@@ -2647,6 +2652,7 @@ class DotProductAttention(base_layer.BaseLayer):
         atten_mask = jnp.minimum(atten_mask, window_mask)
       if self.transpose_logits:
         atten_mask = jnp.transpose(atten_mask, (0, 2, 3, 1))  # XD: BNTS->BTSN
+        # atten_mask = jnp.transpose(atten_mask, (0, 2, 1, 3))  # XD: BNTS->BTNS
         encoded = jnp.zeros((b, t, n, h), dtype=value.dtype)
       else:
         encoded = jnp.zeros((b, n, t, h), dtype=value.dtype)
@@ -2656,7 +2662,7 @@ class DotProductAttention(base_layer.BaseLayer):
         _query = query[:, :, start : stop, :]
         _key, _value = key[:, :, kv_start : stop, :], value[:, :, kv_start : stop, :]
         _atten_mask = atten_mask[:, :, start : stop, kv_start : stop] \
-          if not self.transpose_logits else atten_mask[:, start : stop, kv_start : stop, :]
+          if not self.transpose_logits else atten_mask[:, start : stop, kv_start : stop, :] # [:, start : stop, :, kv_start : stop]
         # _query = query[:, start : stop, :, :]
         # _key, _value = key[:, : stop, :, :], value[:, : stop, :, :]
         # _atten_mask = atten_mask[:, start : stop, :, : stop]
@@ -2874,6 +2880,10 @@ class DotProductAttention(base_layer.BaseLayer):
       query_proj = self.query(query_vec)
       key_proj = self.key(key_vec)
       value_proj = self.value(value_vec)
+      if self.value_gate_activation_cls:  # XD
+        value_gate_proj = self.value_gate(value_vec)
+        value_gate_proj = self._shard_blnh(value_gate_proj)
+        value_proj = value_proj * self.value_gate_activation(value_gate_proj)
 
     self._fprop_update_decode_state('key_state', key_proj)
     self._fprop_update_decode_state('value_state', value_proj)
@@ -2932,10 +2942,10 @@ class DotProductAttention(base_layer.BaseLayer):
         query_proj, key_proj, value_proj, atten_mask, relative_bias,
         query_vec=query_vec, key_vec=key_vec,  # xd
     )
-    if self.value_gate_activation_cls:  # XD
-      value_gate_proj = self.value_gate(value_vec)
-      value_gate_proj = self._shard_blnh(value_gate_proj)
-      encoded = encoded * self.value_gate_activation(value_gate_proj)
+    if self.o_gate_activation_cls:  # XD
+      o_gate_proj = self.o_gate(query_vec)
+      o_gate_proj = self._shard_blnh(o_gate_proj)
+      encoded = encoded * self.o_gate_activation(o_gate_proj)
 
     # Apply NGrammer to the output of the attention layer.
     # Paper: https://openreview.net/forum?id=GxjCYmQAody.

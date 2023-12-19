@@ -67,6 +67,63 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
     return acc, l_i, m_i
 
+@triton.jit
+def _bmm(q,   # (H, BLOCK_M, BLOCK_DMODEL)
+         k,   # (H, BLOCK_DMODEL, BLOCK_N)
+         BLOCK_M, BLOCK_N, BLOCK_DMODEL, H):
+    qk = tl.zeros([H, BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for h in range(H):
+        qk[h] += tl.dot(q[h], k[h])
+    return
+
+@triton.jit
+def _dc_attn_fwd_inner(acc, l_i, m_i, q,  #
+                    K_block_ptr, V_block_ptr,  #
+                    start_m, qk_scale,  #
+                    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,  #
+                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
+                    N_CTX: tl.constexpr, H: tl.constexpr):
+    # range of values handled by this stage
+    if STAGE == 1:
+        lo, hi = 0, start_m * BLOCK_M
+    elif STAGE == 2:
+        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo = tl.multiple_of(lo, BLOCK_M)
+    # causal = False
+    else:
+        lo, hi = 0, N_CTX
+    K_block_ptr = tl.advance(K_block_ptr, (0, 0, lo))
+    V_block_ptr = tl.advance(V_block_ptr, (0, lo, 0))
+    # loop over k, v and update accumulator
+    for start_n in range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- compute qk ----
+        k = tl.load(K_block_ptr)
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, k)
+        if STAGE == 2:
+            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk -= m_ij[:, None]
+        else:
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        # -- update m_i and l_i
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        # -- update output accumulator --
+        acc = acc * alpha[:, None]
+        # update acc
+        v = tl.load(V_block_ptr)
+        acc += tl.dot(p.to(tl.float16), v)
+        # update m_i and l_i
+        m_i = m_ij
+        V_block_ptr = tl.advance(V_block_ptr, (0, BLOCK_N, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, 0, BLOCK_N))
+    return acc, l_i, m_i
 
 # We don't run auto-tuning everytime to keep the tutorial fast. Uncommenting
 # the code below and commenting out the equivalent parameters is convenient for
@@ -199,50 +256,50 @@ def _dc_attn_fwd(Q, K, V, sm_scale, M, Out,  #
               ):
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
-    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    off_z = off_hz #// H
+    # off_h = off_hz % H
+    qvk_offset = off_z.to(tl.int64) * stride_qz #+ off_h.to(tl.int64) * stride_qh
 
     # block pointers
     Q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_qm, stride_qk),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
-        order=(1, 0),
+        shape=(H, N_CTX, BLOCK_DMODEL),
+        strides=(stride_qh, stride_qm, stride_qk),
+        offsets=(0, start_m * BLOCK_M, 0),
+        block_shape=(H, BLOCK_M, BLOCK_DMODEL),
+        order=(2, 1, 0),
     )
     V_block_ptr = tl.make_block_ptr(
         base=V + qvk_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_vk, stride_vn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, BLOCK_DMODEL),
-        order=(1, 0),
+        shape=(H, N_CTX, BLOCK_DMODEL),
+        strides=(stride_qh, stride_vk, stride_vn),
+        offsets=(0, 0, 0),
+        block_shape=(H, BLOCK_N, BLOCK_DMODEL),
+        order=(2, 1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
         base=K + qvk_offset,
-        shape=(BLOCK_DMODEL, N_CTX),
-        strides=(stride_kk, stride_kn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_DMODEL, BLOCK_N),
-        order=(0, 1),
+        shape=(H, BLOCK_DMODEL, N_CTX),
+        strides=(stride_qh, stride_kk, stride_kn),
+        offsets=(0, 0, 0),
+        block_shape=(H, BLOCK_DMODEL, BLOCK_N),
+        order=(2, 0, 1),
     )
     O_block_ptr = tl.make_block_ptr(
         base=Out + qvk_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_om, stride_on),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
-        order=(1, 0),
+        shape=(H, N_CTX, BLOCK_DMODEL),
+        strides=(stride_qh, stride_om, stride_on),
+        offsets=(0, start_m * BLOCK_M, 0),
+        block_shape=(H, BLOCK_M, BLOCK_DMODEL),
+        order=(2, 1, 0),
     )
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    m_i = tl.zeros([H, BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([H, BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([H, BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
     # load scales
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
@@ -255,7 +312,7 @@ def _dc_attn_fwd(Q, K, V, sm_scale, M, Out,  #
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
                                         start_m, qk_scale,  #
                                         BLOCK_M, BLOCK_DMODEL, BLOCK_N,  #
-                                        4 - STAGE, offs_m, offs_n, N_CTX  #
+                                        4 - STAGE, offs_m, offs_n, N_CTX, H  #
                                         )
     # stage 2: on-band
     if STAGE & 2:
@@ -265,7 +322,7 @@ def _dc_attn_fwd(Q, K, V, sm_scale, M, Out,  #
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
                                         start_m, qk_scale,  #
                                         BLOCK_M, BLOCK_DMODEL, BLOCK_N,  #
-                                        2, offs_m, offs_n, N_CTX  #
+                                        2, offs_m, offs_n, N_CTX, H  #
                                         )
     # epilogue
     m_i += tl.math.log2(l_i)
