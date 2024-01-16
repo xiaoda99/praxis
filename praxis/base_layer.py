@@ -1502,6 +1502,8 @@ class BaseLayer(nn.Module):
   activation_split_dims_mapping: pax_fiddle.Config[
       BaseLayer.ActivationSharding
   ] = template_field(ActivationSharding)
+  data_full_shard: Optional[bool] = True
+
 
   @property
   def mesh_shape(self):
