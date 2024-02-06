@@ -24,6 +24,7 @@ from flax import linen as nn
 import jax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+from einops import rearrange, repeat  # XD
 import numpy as np
 from praxis import base_layer
 from praxis import gshard_utils
@@ -299,8 +300,11 @@ class TransformerFeedForward(base_layer.BaseLayer):
   residual_droppath_prob: float = 0.0
   norm_policy: str = 'pre'
   internal_gshard_variance_scaling_fan_in_init: bool = False
+  # XD
+  segment_size: int = None
+  residual_cross_act_proj: bool = False
   chunk_size: int = None
-  output_layer_std: float = None  # XD
+  output_layer_std: float = None
 
   class WeightSharding(base_layer.BaseLayer.WeightSharding):
     """Represents how layer's learned parameters are partitioned across a mesh.
@@ -395,6 +399,16 @@ class TransformerFeedForward(base_layer.BaseLayer):
         gate_p.linear_tpl.params_init = WeightInit.Uniform(scale)
       if self.chunk_size is None: self.create_child('ffn_layer1_gate', gate_p)
       else: self.create_children('ffn_layer1_gate', [gate_p.clone() for _ in range(self.n_chunks)]) # XD
+    if self.segment_size is not None:  # XD
+      assert self.hidden_dims % self.segment_size == 0
+      self.num_segments = self.hidden_dims // self.segment_size
+      pc = WeightHParams(
+          shape=[self.num_segments, self.segment_size, self.segment_size], 
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=wp.ffn0[1:] + [None, None],  # == ['mdl', None, None]. wp.ffn0 = ['data', 'mdl']
+          init=WeightInit.Gaussian(self.segment_size**-0.5 * (0.01 if self.residual_cross_act_proj else 1.)),
+      )
+      self.create_variable('cross_act_proj', pc)
+
 
     # Create RELU dropout layer
     relu_dropout_p = self.relu_dropout_tpl.clone()
@@ -464,6 +478,12 @@ class TransformerFeedForward(base_layer.BaseLayer):
       else:
         activations = self.ffn_layer1(inputs)
         activations = checkpoint_name(activations, 'ffn1')
+      if self.segment_size is not None:
+        activations0 = activations
+        activations = rearrange(activations, 'B T (S N) -> B T S N', N=self.segment_size)
+        activations = jnp.einsum('BTSN,SNM->BTSM', activations, self.theta.cross_act_proj)
+        activations = rearrange(activations, 'B T S M -> B T (S M)')  # == BTF
+        if self.residual_cross_act_proj: activations = activations + activations0
 
       # Apply paddings if not None
       if not self.apply_padding_first and paddings is not None:
@@ -1698,7 +1718,7 @@ class StackedTransformer(base_layer.BaseLayer):
             val = getattr(tpl, name)
             if isinstance(val, (list, tuple)):  # TODO: When do type(hidden_dims/p_i.num_heads/dim_per_head)
                                                 # turn from list to tuple? During repeat?
-              logging.info(f'In StackedTransformer.setup._layer_params: {tpl_name}.{name} = {val} {type(val)}')
+              # logging.info(f'In StackedTransformer.setup._layer_params: {tpl_name}.{name} = {val} {type(val)}')
               assert len(val) == self.num_layers, f'{len(val)} != {self.num_layers}'
               setattr(tpl, name, val[i])
 
