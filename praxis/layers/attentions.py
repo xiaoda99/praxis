@@ -36,6 +36,7 @@ from praxis.layers import base_ops
 from praxis.layers import embedding_softmax
 from praxis.layers import stochastics
 from praxis.layers import normalizations  # XD
+from praxis.layers import linears
 
 NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
@@ -609,10 +610,12 @@ class DynamicWeightProjection(base_layer.BaseLayer):
   decompose_dynamic_w: bool = True
   # use_dw_bias: bool = False
   dw_activation_cls: activations_lib.BaseActivation = None
+  tanh2silu: bool = False #mqy 
   dw_activation_weights: list = None
   dw_cap: dict = None
   learned_dw_cap: dict = None
   use_dw_cap_bias: bool = False
+  generate_dwg_param: bool = False # mqy, dwg params used to apply logits/probs directly. Do not be confused with the gate in generating dw 
   dw_gate_activation_cls: activations_lib.BaseActivation = None  # not effective
   dw_gate_weights: list = None
   dd_gate_activation_cls: activations_lib.BaseActivation = None
@@ -622,6 +625,8 @@ class DynamicWeightProjection(base_layer.BaseLayer):
   dw1_norm_bias_init: float = None  # TODO: remove
   dw1_norm_bias_const: float = 0.  # TODO: remove
   # square_dw1_norm_bias: bool = False
+  softmax_dw1: bool = False # mqy
+  softmax_dw2: bool = False
   dynamic_w_hidden_dim: int = None  # mqy
   dynamic_d_hidden_dim: int = None
   merge_dynamic_w_hidden: bool = False
@@ -671,7 +676,7 @@ class DynamicWeightProjection(base_layer.BaseLayer):
         else: w_names = ['qw', 'kw'] + (['qd', 'kd'] if self.dynamic_d_hidden_dim else [])
         for w_name in w_names:
           if w_name not in ['dw2_d', 'qd', 'kd', 'qkd']:
-            I = dynamic_hidden_dim * (1 if self.merge_dynamic_w_hidden else 2)
+            I = dynamic_hidden_dim * (1 if self.merge_dynamic_w_hidden else (2 if not self.generate_dwg_param else 3)) # mqy
             if not self.decompose_dynamic_w: I = M
             shape = [G, 4, K, I, M] if w_name == 'qkw' else [G, K, I, M] # [G, K, M, I]
           # else:
@@ -741,17 +746,27 @@ class DynamicWeightProjection(base_layer.BaseLayer):
       pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd = None, None, None, None, None, None
       post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd = None, None, None, None, None, None
     else:
-      qw1, qw2, kw1, kw2, qdd, kdd = None, None, None, None, None, None
+      qw1, qw2, kw1, kw2, qdd, kdd, qwg, kwg = None, None, None, None, None, None, None, None
     if self.dynamic_w_init is not None:
       if self.dynamic_w_hidden_dim and not self.merge_dynamic_w_hidden:
         if self.merge_projection:
           dw_hidden = jnp.einsum('BTD,DGCK->BTGCK', query_vec, theta.dw1)  # C=4 [pre,post]*[query,key]
           dw_hidden = self.dw_hidden_activation(dw_hidden)
-          w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, theta.qkw), 2, axis=-2)
+          if self.generate_dwg_param:
+            w1, wg, w2 = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, theta.qkw), 3, axis=-2)
+          else:
+            w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, theta.qkw), 2, axis=-2)
+            wg = None
+          if self.softmax_dw1: w1 = jax.nn.softmax(w1.astype(jnp.float32), axis=-1).astype(query_vec.dtype) # mqy
+          if self.softmax_dw2: w2 = jax.nn.softmax(w2.astype(jnp.float32), axis=-1).astype(query_vec.dtype)
           # w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKMI->BTGCMI', dw_hidden, theta.qkw), 2, axis=-1)
           if self.dw1_norm_cls is not None: w1 = self.dw1_norm(w1)
           pre_qw1, pre_kw1, post_qw1, post_kw1 = unbind(w1, 4, axis=3) # BT4GIM->[BTGIM]*4
           pre_qw2, pre_kw2, post_qw2, post_kw2 = unbind(w2, 4, axis=3)
+          if self.generate_dwg_param:
+            pre_qwg, pre_kwg, post_qwg, post_kwg = unbind(wg, 4, axis=3)
+          else:
+            pre_qwg, pre_kwg, post_qwg, post_kwg = None, None, None, None
         else:
           dw_hidden = jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1)
           if self.dw_hidden_gate_act_cls is not None:
@@ -786,16 +801,20 @@ class DynamicWeightProjection(base_layer.BaseLayer):
 
     if self.dynamic_d_init is not None:
       dd = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.dd)
-      if self.dw_activation_cls is not None: dd = self.dw_activation(dd)
+      if self.dw_activation_cls is not None:
+        if self.tanh2silu: # mqy
+          dd = self.dw_activation(dd) - 1 
+        else:
+          dd = self.dw_activation(dd)
       # if self.dd_gate_activation_cls is not None:
       #   ddg = jnp.einsum('BTD,DGM->BTGM', query_vec, theta.ddg)
       #   dd = dd * self.dd_gate_activation(ddg)
       if not self.merge_projection: qdd, kdd = jnp.split(dd, 2, axis=-1)
       else: pre_qdd, pre_kdd, post_qdd, post_kdd = jnp.split(dd, 4, axis=-1)
       # for k, v in zip(['qdd', 'kdd'], [qdd, kdd]): self.add_summaries(k, v, stat_keys=['mean', 'std'])
-    return (qw1, qw2, kw1, kw2, qdd, kdd) if not self.merge_projection else \
-      ((pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd),
-      (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd))
+    return (qw1, qw2, kw1, kw2, qdd, kdd, qwg, kwg) if not self.merge_projection else \
+      ((pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd, pre_qwg, pre_kwg), 
+      (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd, post_qwg, post_kwg)) 
 
 class DynamicWeightMerger(base_layer.BaseLayer):
   n: int = None
@@ -850,10 +869,12 @@ class CrossHeadProjection(base_layer.BaseLayer):
   loop_over_dynamic_hd: bool = True
   use_dw_bias: bool = False
   dw_activation_cls: activations_lib.BaseActivation = None
+  tanh2silu: bool = False #mqy 
   dw_activation_weights: list = None
   dw_cap: dict = None
   learned_dw_cap: dict = None
   use_dw_cap_bias: bool = False
+  generate_dwg_param: bool = False # mqy
   dw_gate_activation_cls: activations_lib.BaseActivation = None  # not effective
   dw_gate_weights: list = None
   dd_gate_activation_cls: activations_lib.BaseActivation = None
@@ -862,6 +883,8 @@ class CrossHeadProjection(base_layer.BaseLayer):
   dw1_norm_dbias_init: WeightInit = None
   dw1_norm_bias_init: float = None  # a little effective
   dw1_norm_bias_const: float = 0.
+  softmax_dw1: bool = False # mqy
+  softmax_dw2: bool = False
   square_dw1_norm_bias: bool = False
   skip_bias: bool = False  # to exactly reproduce the bug of squeeze_bias and dw1_norm_bias not being used
   dynamic_w_hidden_dim: int = None  # mqy
@@ -989,6 +1012,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
       qw1: JTensor = None, qw2: JTensor = None,
       kw1: JTensor = None, kw2: JTensor = None,
       qdd: JTensor = None, kdd: JTensor = None,
+      qwg: JTensor = None, kwg: JTensor = None,
       query_vec: JTensor = None, key_vec: JTensor = None,
     ) -> JTensor:
     if not self.use_static_w and self.dynamic_w_init is None and qw1 is None and \
@@ -1047,7 +1071,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
 
     if qw1 is not None:
       hidden_sym = 'I'; hidden_label = inputs_label.replace('M', 'I')
-      for sym, (w1, w2) in zip(['T', 'S'], [(qw1, qw2), (kw1, kw2)]):
+      for sym, (w1, wg, w2) in zip(['T', 'S'], [(qw1, qwg, qw2), (kw1, kwg, kw2)]):
         dw_label = f'B{sym}G{hidden_sym}M' if w1.shape[-1] == self.num_heads_per_group \
           else f'B{sym}GM{hidden_sym}'  # w1.shape[-2] == self.num_heads_per_group
         dynamic_hidden_dim = w1.shape[dw_label.index(hidden_sym)]
@@ -1059,15 +1083,18 @@ class CrossHeadProjection(base_layer.BaseLayer):
               if i == 1 and self.merge_dw_op is not None: continue
               if dw_label[-1] == hidden_sym:
                 hidden = jnp.einsum(eqn1.replace(hidden_sym, ''), inputs, w1[..., i])
+                if wg is not None: hidden = hidden * jax.nn.silu(jnp.einsum(eqn1.replace(hidden_sym, ''), inputs, wg[..., i]))
                 out = jnp.einsum(eqn2.replace(hidden_sym, ''), hidden, w2[..., i])
               else:
                 assert dw_label[-2] == hidden_sym, dw_label
                 hidden = jnp.einsum(eqn1.replace(hidden_sym, ''), inputs, w1[..., i, :])
+                if wg is not None: hidden = hidden * jax.nn.silu(jnp.einsum(eqn1.replace(hidden_sym, ''), inputs, wg[..., i, :]))
                 out = jnp.einsum(eqn2.replace(hidden_sym, ''), hidden, w2[..., i, :])
               ret = ret + out
           else:
             hidden = jnp.einsum(eqn1, inputs, w1)
             if self.decompose_dynamic_w:
+              if wg is not None: hidden = hidden * jax.nn.silu(jnp.einsum(eqn1, inputs, wg))
               out = jnp.einsum(eqn2, hidden, w2)
               ret = ret + out
             else:
@@ -1700,6 +1727,222 @@ class CausalDepthwiseConv1D(base_layer.BaseLayer):
       outputs += prev_slice * getattr(self.theta, f'dconv_{i}')
     return jnp.squeeze(outputs, axis)
 
+
+class NGramHeadAttn(base_layer.BaseLayer):
+  '''
+  N-grammer attention head adapted from https://arxiv.org/abs/2401.12973.
+  y = gate(x) * (A(n) @ x)
+  '''
+  dconv_kernel_size: int = 3 # ngram
+  causal_depthwise_conv1d_tpl: LayerTpl = template_field(CausalDepthwiseConv1D)
+  
+  model_dim: int = 1024
+  linear_tpl: LayerTpl = template_field(linears.FeedForward)
+  gate_tpl: LayerTpl = template_field(linears.FeedForward)
+  activation_tpl: pax_fiddle.Config[activations_lib.BaseActivation] = template_field(activations_lib.SiLU)
+  rmsnorm_tpl: LayerTpl = template_field(normalizations.RmsNorm)
+
+  #qk norm
+  use_qk_norm: bool = False 
+  qk_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)
+
+  shift_key: bool = True
+  cast_rotary_position_emb: bool = True
+  use_rotary_position_emb: bool = False
+  rotary_position_emb_tpl: Optional[LayerTpl] = template_field(
+      embedding_softmax.RotaryPositionalEmbedding
+  )
+
+  multiply_gate: bool = True
+  use_gate_activation: bool = True
+  use_logit_scale: bool = False
+  use_relu2_attn: bool = False
+  relu_bias_init: float = 0.5 # 0.5 * sqrt(model_dim) = 16 for LlamaMedium
+  relu_tpl: pax_fiddle.Config[activations_lib.BaseActivation] = template_field(activations_lib.ReLU)
+
+  # FFN
+  use_ffn: bool = False
+  ffn1_tpl: LayerTpl = template_field(linears.FeedForward)
+  ffn2_tpl: LayerTpl = template_field(linears.FeedForward)
+  ffn_activation_tpl: pax_fiddle.Config[activations_lib.BaseActivation] = template_field(activations_lib.SiLU)
+  ffn_rmsnorm_tpl: LayerTpl = template_field(normalizations.RmsNorm)
+
+  class WeightSharding(base_layer.BaseLayer.WeightSharding):
+    """Represents how layer's learned parameters are partitioned across a mesh.
+
+    Attributes:
+      proj: How the projection weights should be sharded. All projection matrix
+        share the same sharding.
+      dconv: How the dconv weights should be sharded. All dconv weights share
+        the same sharding.
+    """
+
+    proj: SplitDimsMapping = None
+    dconv: SplitDimsMapping = None
+
+  class ActivationSharding(base_layer.BaseLayer.ActivationSharding):
+    """Represents how intermediate values should be partitioned across a mesh.
+
+    Attributes:
+      out: Mesh split for output after activation with the shape of
+        [batch_size, seq_len, model_dim].
+    """
+
+    out: SplitDimsMapping = None
+
+  def setup(self) -> None:
+    # layernorm
+    params = self.rmsnorm_tpl.clone()
+    params.name = 'ngh_rmsnorm'
+    params.dim = self.model_dim
+    self.create_child('rmsnorm', params)
+
+    wp = self.weight_split_dims_mapping
+    ap = self.activation_split_dims_mapping
+
+    # dconv 
+    causal_dconv_p = self.causal_depthwise_conv1d_tpl.clone().set(
+        kernel_size=self.dconv_kernel_size,
+        hidden_dims=self.model_dim,
+    )
+    causal_dconv_p.weight_split_dims_mapping.wt = ['data'] # wp.dconv
+    self.create_child('dconv', causal_dconv_p)
+
+    # rope
+    if self.use_rotary_position_emb:
+      pos_emb_p = self.rotary_position_emb_tpl.clone()
+      pos_emb_p.embedding_dims = self.model_dim
+      pos_emb_p.cast_as_fprop_dtype = self.cast_rotary_position_emb
+      self.create_child('rotary_position_emb', pos_emb_p)
+    
+    # qk_norm
+    if self.use_qk_norm: 
+      for name in ['q_norm', 'k_norm']:
+        params = self.qk_norm_tpl.clone()
+        params.name = name
+        params.dim = self.model_dim
+        self.create_child(name, params)
+
+    # relu2 attn 
+    if self.use_relu2_attn:
+      self.create_child('relu', self.relu_tpl.clone())
+      relu_bias = WeightHParams(shape=[1], init=WeightInit.Constant(self.relu_bias_init),
+              mesh_shape=self.mesh_shape, tensor_split_dims_mapping=None,
+              collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+          )
+      self.create_variable('relu_bias', relu_bias)  
+
+    # gate projection and activation 
+    gate_p = self.gate_tpl.clone()
+    gate_p.name = 'ngh_gate'
+    gate_p.input_dims = self.model_dim
+    gate_p.has_bias = False
+    if self.use_gate_activation:
+      gate_p.activation_tpl = self.activation_tpl
+    else:
+      gate_p.activation_tpl = pax_fiddle.Config(activations_lib.Identity)
+    gate_p.output_dims = self.model_dim  
+    gate_p.weight_split_dims_mapping.wt = ['data', 'mdl'] # w_df = [data_axis, mdl_axis] in set_sharding_params_v1
+    gate_p.activation_split_dims_mapping.out = [('replica', 'data'), None, 'mdl'] # a_blf = [batch_axes, None, mdl_axis] in set_sharding_params_v1
+    self.create_child('gate', gate_p)
+
+    # linear/o
+    linear_p = self.linear_tpl.clone()
+    linear_p.name = 'ngh_linear'
+    linear_p.input_dims = self.model_dim
+    linear_p.has_bias = False
+    linear_p.activation_tpl = pax_fiddle.Config(activations_lib.Identity)
+    linear_p.output_dims = self.model_dim  
+    linear_p.weight_split_dims_mapping.wt = ['mdl', 'data'] # reversed w_df
+    linear_p.activation_split_dims_mapping.out = [('replica', 'data'), None, 'mdl'] # bld = [batch_axes, None, mdl_axis] in set_sharding_params_v1
+    self.create_child('linear', linear_p)
+
+    #ffn
+    if self.use_ffn:
+      params = self.ffn_rmsnorm_tpl.clone()
+      params.name = 'ngh_ffn_rmsnorm'
+      params.dim = self.model_dim
+      self.create_child('ffn_rmsnorm', params)
+
+      ffn1_p = self.ffn1_tpl.clone()
+      ffn1_p.name = 'ngh_ffn1'
+      ffn1_p.input_dims = self.model_dim
+      ffn1_p.has_bias = False
+      ffn1_p.activation_tpl = self.ffn_activation_tpl
+      ffn1_p.output_dims = self.model_dim  
+      ffn1_p.weight_split_dims_mapping.wt = ['data', 'mdl'] # w_df = [data_axis, mdl_axis] in set_sharding_params_v1
+      ffn1_p.activation_split_dims_mapping.out = [('replica', 'data'), None, 'mdl'] # a_blf = [batch_axes, None, mdl_axis] in set_sharding_params_v1
+      self.create_child('ffn1', ffn1_p)
+
+      ffn2_p = self.ffn2_tpl.clone()
+      ffn2_p.name = 'ngh_ffn2'
+      ffn2_p.input_dims = self.model_dim
+      ffn2_p.has_bias = False
+      ffn2_p.activation_tpl = pax_fiddle.Config(activations_lib.Identity)
+      ffn2_p.output_dims = self.model_dim  
+      ffn2_p.weight_split_dims_mapping.wt = ['mdl', 'data'] # reversed w_df
+      ffn2_p.activation_split_dims_mapping.out = [('replica', 'data'), None, 'mdl'] # bld = [batch_axes, None, mdl_axis] in set_sharding_params_v1
+      self.create_child('ffn2', ffn2_p)
+
+    return 
+  
+  def __call__(self,
+                inputs: JTensor, # BTD
+                atten_mask: JTensor, 
+                segment_pos: JTensor,
+                ) -> JTensor:
+    x = self.rmsnorm(inputs)
+    gate = self.gate(x) # BTD
+    query = self.dconv(x,axis=1) # query
+    if self.shift_key:
+      key = shift_1d(query, offset=1, axis=-2) #BTD
+    else:
+      key = query 
+
+    if self.use_qk_norm:
+      query = self.q_norm(query)
+      key = self.k_norm(key)
+
+    if self.use_rotary_position_emb:
+      key_shape = key.shape
+      key = jnp.expand_dims(key, axis=-2)  # [B, S, H] -> [B, S, N(1), H]
+      key = self.rotary_position_emb(key, segment_pos)
+      key = jnp.reshape(key, key_shape)
+      query_shape = query.shape
+      query = jnp.expand_dims(query, axis=-2)  # [B, S, H] -> [B, S, N(1), H]
+      query = self.rotary_position_emb(query, segment_pos)
+      query = jnp.reshape(query, query_shape)
+
+    query = query.astype(jnp.float32)
+    key = key.astype(jnp.float32)
+    logits = jnp.einsum('BTD,BSD->BTS', query, key)
+    if self.use_logit_scale:
+      logits = logits * (self.model_dim ** -0.5)
+    if self.use_relu2_attn:
+      self.add_summary('ngh_logits_max', jnp.max(logits), verbosity=2)
+      self.add_summary('ngh_logits_mean', jnp.mean(logits), verbosity=2)
+      self.add_summary('ngh_logits_var', jnp.var(logits), verbosity=2)
+      probs = self.relu(logits - self.theta.relu_bias) ** 2
+      probs = jnp.where((atten_mask[:,0] >= 0), probs, 0) # only zero and largest_negative_number in atten_mask
+      # probs = probs / jnp.sum(probs, axis=-1, keepdims=True)
+    else:
+      # casual mask
+      logits = logits.astype(jnp.float32)
+      logits = py_utils.apply_mask_to_logits(logits, atten_mask[:,0])
+      probs = jax.nn.softmax(logits, axis=-1)
+    probs = probs.astype(x.dtype) 
+    logging.warning(f'probs.shape = {probs.shape}, x.shape = {x.shape}')
+    # assert False, f'query, key, logits shapes = {query.shape}, {key.shape}, {logits.shape}, probs.shape = {probs.shape}, x.shape = {x.shape}, atten_mask.shape={atten_mask.shape}'
+    value = jnp.einsum('BTS,BSD->BTD', probs, x)
+    if self.multiply_gate:
+      o = self.linear(value*gate)
+    else:
+      o = self.linear(value) + gate
+    out = inputs + o
+
+    if self.use_ffn:
+      out = out + self.ffn2(self.ffn1(self.ffn_rmsnorm(inputs)))
+    return out, probs
 
 class DotProductAttention(base_layer.BaseLayer):
   """Dot-product attention with multiple attention heads.
@@ -2448,13 +2691,15 @@ class DotProductAttention(base_layer.BaseLayer):
         # _query = query[:, start : stop, :, :]
         # _key, _value = key[:, : stop, :, :], value[:, : stop, :, :]
         # _atten_mask = atten_mask[:, start : stop, :, : stop]
-        def slice_dw(qw1, qw2, kw1, kw2, qdd, kdd):
+        def slice_dw(qw1, qw2, kw1, kw2, qdd, kdd, qwg, kwg):
           return (qw1[:, start : stop] if qw1 is not None else None,
             qw2[:, start : stop] if qw2 is not None else None,
             kw1[:, kv_start : stop] if kw1 is not None else None,
             kw2[:, kv_start : stop] if kw2 is not None else None,
             qdd[:, start : stop] if qdd is not None else None,
-            kdd[:, kv_start : stop] if kdd is not None else None)
+            kdd[:, kv_start : stop] if kdd is not None else None,
+            qwg[:, start : stop] if qwg is not None else None,
+            kwg[:, kv_start : stop] if kwg is not None else None)
         _pre_proj_dw_args = slice_dw(*pre_proj_dw_args) if pre_proj_dw_args is not None and self.project_logits else ()  # debug
         _post_proj_dw_args = slice_dw(*post_proj_dw_args) if post_proj_dw_args is not None and self.project_probs else ()  # debug
         _encoded, _ = self._atten_context(_query, _key, _value, _atten_mask,

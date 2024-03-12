@@ -1210,6 +1210,8 @@ class Transformer(base_layer.BaseLayer):
   tr_fflayer_tpl: LayerTpl = template_field(TransformerFeedForward)
   gpt_j_residual: bool = False  # XD
   ngrammer_tpl: Optional[LayerTpl] = template_field(None)
+  use_ngh: bool = False # mqy
+  ngh_tpl: Optional[LayerTpl] = template_field(attentions.NGramHeadAttn)
 
   # This function can be overridden by subclasses.
   def _setup_attention(self, atten_tpl: LayerTpl, name: str)-> None:
@@ -1230,8 +1232,18 @@ class Transformer(base_layer.BaseLayer):
       atten_tpl.ngrammer_tpl = self.ngrammer_tpl
     self.create_child(name, atten_tpl)
 
+  def setup_ngh_attn(self, ngh_tpl: LayerTpl)-> None:
+      ngh_tpl = ngh_tpl.clone()
+      name = 'ngh_attn'
+      ngh_tpl.name = name
+      ngh_tpl.model_dim = self.input_dims
+      self.create_child(name, ngh_tpl)
+
   def setup(self) -> None:
 
+    if self.use_ngh:
+      self.setup_ngh_attn(self.ngh_tpl)
+      return
     # Initialize Layer Norm
     if self.norm_policy == 'primer_hybrid':
       params = self.ln_tpl.clone()
@@ -1352,6 +1364,9 @@ class Transformer(base_layer.BaseLayer):
     # self.add_summary('xformer_input_mean', inputs_stats.mean_v, verbosity=3)
     # self.add_summary('xformer_input_std', inputs_stats.std_v, verbosity=3)
     # self.add_summary('xformer_input_abs_max', inputs_stats.max_v, verbosity=3)
+
+    if self.use_ngh:
+      return self.ngh_attn(inputs, attention_mask, segment_pos)
 
     self.add_summary('attention_input_rms', _rms(inputs), verbosity=4)
 
@@ -1711,7 +1726,7 @@ class StackedTransformer(base_layer.BaseLayer):
               setattr(p, name, val[i])
       # Several attributes of atten_tpl (inc. window_size) have already beens set, but
       # num_heads and dim_per_head haven't, which are to be set in Transformer._setup_attention
-      for tpl, tpl_name, names in [(p_i, 'p_i', ['hidden_dims', 'num_heads', 'dim_per_head']),  # tuple
+      for tpl, tpl_name, names in [(p_i, 'p_i', ['hidden_dims', 'num_heads', 'dim_per_head', 'use_ngh']),  # tuple
                         (atten_tpl, 'atten_tpl', ['window_size'])]:  # list
         for name in names:
           if hasattr(tpl, name):
