@@ -1948,13 +1948,15 @@ class DotProductAttention(base_layer.BaseLayer):
       assert self.weight_split_dims_mapping is not None
       assert self.activation_split_dims_mapping is not None
 
-    def project_input(input_dim, dim_per_head, num_heads, use_bias=None, gaussian_std=None):  # XD: add dim_per_head
+    def project_input(name, input_dim, dim_per_head, num_heads, use_bias=None, gaussian_std=None):  # XD: add dim_per_head  
       proj_p = self.proj_tpl.clone().set(
+          name=name, #mqy, add name to seperate qkv proj tpl
           input_dim=input_dim,
           num_heads=num_heads,
           dim_per_head=dim_per_head,
           use_bias=use_bias or self.use_bias,
       )
+      if proj_p.shared_weight_layer_id is not None: proj_p.shared_weight_layer_id = proj_p.shared_weight_layer_id + f'_{name}'
       if gaussian_std:
         proj_p.params_init = WeightInit.Gaussian(gaussian_std)
       proj_p.weight_split_dims_mapping.wt = wp.proj
@@ -2008,19 +2010,19 @@ class DotProductAttention(base_layer.BaseLayer):
       )
     else:
       use_qk_bias = self.use_qk_bias or self.use_bias
-      self.create_child('query', project_input(query_input_dim, dim_per_head, self.num_heads, use_bias=use_qk_bias, gaussian_std=query_std))  # XD: add dim_per_head
+      self.create_child('query', project_input('query', query_input_dim, dim_per_head, self.num_heads, use_bias=use_qk_bias, gaussian_std=query_std))  # XD: add dim_per_head
       if self.num_kv_heads is None or self.num_kv_heads > 1:
         num_heads = self.num_kv_heads or self.num_heads
-        self.create_child('key', project_input(key_input_dim, dim_per_head, num_heads, use_bias=use_qk_bias, gaussian_std=key_std))  # XD: add dim_per_head
-        self.create_child('value', project_input(value_input_dim, dim_per_head_v, num_heads, gaussian_std=value_std))  # XD: add dim_per_head
+        self.create_child('key', project_input('key', key_input_dim, dim_per_head, num_heads, use_bias=use_qk_bias, gaussian_std=key_std))  # XD: add dim_per_head
+        self.create_child('value', project_input('value', value_input_dim, dim_per_head_v, num_heads, gaussian_std=value_std))  # XD: add dim_per_head
       elif self.num_kv_heads == 1:
         self.create_child('key', project_input_no_heads(key_input_dim, use_bias=use_qk_bias))
         self.create_child('value', project_input_no_heads(value_input_dim))
       if self.value_gate_activation_cls:  # XD
-        self.create_child('value_gate', project_input(value_input_dim, dim_per_head_v, gaussian_std=value_std))
+        self.create_child('value_gate', project_input('value_gate', value_input_dim, dim_per_head_v, gaussian_std=value_std))
         self.create_child('value_gate_activation',  pax_fiddle.Config(self.value_gate_activation_cls).clone())
       if self.o_gate_activation_cls:  # XD
-        self.create_child('o_gate', project_input(value_input_dim, dim_per_head_v, gaussian_std=value_std))
+        self.create_child('o_gate', project_input('o_gate',value_input_dim, dim_per_head_v, gaussian_std=value_std))
         self.create_child('o_gate_activation',  pax_fiddle.Config(self.o_gate_activation_cls).clone())
     if self.qk_norm:  # XD
       for name in ['q_norm', 'k_norm']:
@@ -2181,7 +2183,9 @@ class DotProductAttention(base_layer.BaseLayer):
       ]
     else:
       post_proj_p.weight_split_dims_mapping.wt = wp.proj
-
+     
+    post_proj_p.name = 'post' # mqy
+    if post_proj_p.shared_weight_layer_id is not None: post_proj_p.shared_weight_layer_id = post_proj_p.shared_weight_layer_id + f'_{post_proj_p.name}'
     self.create_child('post', post_proj_p)
     self.create_child('qk_einsum', self.qk_einsum_tpl.clone())
     self.create_child('pv_einsum', self.pv_einsum_tpl.clone())

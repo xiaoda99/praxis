@@ -1637,6 +1637,14 @@ class StackedTransformer(base_layer.BaseLayer):
   checkpoint_policy: AutodiffCheckpointType = (
       AutodiffCheckpointType.SAVE_DOT_EXCEPT_LOGITS_FFN1
   )
+  share_interval: Optional[int] = None # 2 for interleave sharing, 1 for sharing all layers
+  share_interval_idxs: Optional[list] = None
+  share_mode : str = 'interleave' # interleave or immediate 
+  share_attn_only: bool = False
+  share_qknorm: bool = True
+  share_qkov: bool = True
+  share_dynamic_proj: bool = True
+  share_except_layers: Optional[list] = None
 
   def _clone_layer_params(self, layer_tpl: LayerTpl) -> LayerTpl:
     """Useful to let sublasses switch the class (e.g. Streaming version)."""
@@ -1661,6 +1669,40 @@ class StackedTransformer(base_layer.BaseLayer):
       else:
         p_i = self._clone_layer_params(self.transformer_layer_params_tpl)
       p_i.name = f'layer_{i}'
+      share_except_layers = self.share_except_layers if self.share_except_layers is not None else []
+      if self.share_interval is not None and i not in share_except_layers:
+        assert self.share_mode in ['immediate', 'interleave']
+        if self.share_mode == 'interleave':
+          ii = i % self.share_interval
+        elif self.share_mode == 'immediate':
+          ii = i // self.share_interval
+        
+        if self.share_interval_idxs is None: 
+          if self.share_mode == 'interleave':
+            ii_max = self.share_interval 
+          elif self.share_mode == 'immediate':
+            ii_max = self.num_layers // self.share_interval
+          share_interval_idxs = list(range(ii_max))
+        else:
+          share_interval_idxs = self.share_interval_idxs
+
+        if ii in share_interval_idxs:  # specify shared idxs in the block
+          if self.share_attn_only:
+            if self.share_qknorm and self.share_qkov and self.share_dynamic_proj:
+              p_i.tr_atten_tpl.shared_weight_layer_id = f'shared_attn_{ii}'
+            else: #TOOD(mqy):add other tpls for sharing 
+              shared_tpls = []
+              #shared_tpls = ['cross_head_pre_proj_tpl', 'cross_head_post_proj_tpl', 'dynamic_w_pre_proj_tpl', 'dynamic_w_post_proj_tpl','proj_tpl', 'qk_norm_tpl']
+              if self.share_qknorm: shared_tpls += ['qk_norm_tpl']
+              if self.share_dynamic_proj: shared_tpls += ['cross_head_pre_proj_tpl', 'cross_head_post_proj_tpl', 'dynamic_w_pre_proj_tpl', 'dynamic_w_post_proj_tpl']
+              if self.share_qkov: shared_tpls += ['proj_tpl']
+              for name in shared_tpls:
+                shared_name = 'shared_' + name.replace('_tpl', '') + f'_{ii}'
+                setattr(getattr(p_i.tr_atten_tpl,name), 'shared_weight_layer_id', shared_name)
+                logging.info(f'sid-{name}: {shared_name}')
+          else:
+            p_i.shared_weight_layer_id = f'shared_layer_{ii}'
+
       p_i.use_cross_attention = self.use_cross_attention
       p_i.num_heads = self.num_heads
       p_i.dim_per_head = self.dim_per_head
