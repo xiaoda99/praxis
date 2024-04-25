@@ -624,7 +624,8 @@ def init_var(
   assert var_p is not None and var_p.init is not None
   method = var_p.init.method
   scale = var_p.init.scale
-  assert isinstance(scale, (int, float))
+  if method != 'constant':
+    assert isinstance(scale, (int, float))
   shape = var_p.shape
   init_dtype = var_p.dtype
   fan_in_axes = var_p.fan_in_axes
@@ -707,7 +708,7 @@ def init_var(
     return scale * jrandom.truncated_normal(
         prng_key, lower=-2.0, upper=2.0, shape=shape, dtype=init_dtype)
   elif method in ['constant']:
-    return scale + jnp.zeros(shape=shape, dtype=init_dtype)
+    return jnp.array(scale) + jnp.zeros(shape=shape, dtype=init_dtype)
   elif method in ['xavier']:
     fan_in, fan_out = get_fan_in_fan_out(shape, fan_in_axes, fan_out_axes)
     limit = scale * math.sqrt(6. / (fan_in + fan_out))
@@ -1240,6 +1241,7 @@ def instantiate_layer(layer_p: pax_fiddle.Config, scope: Any) -> BaseLayer:
     assert jax_context is not None
     pre_created = jax_context.lookup_shared_layer(
         scope, layer_p.shared_weight_layer_id)
+    #logging.info(f"{layer_p.name}: pre_created is_None {pre_created is None};sid:{layer_p.shared_weight_layer_id}; scope:{list(scope._variables.keys())}{scope._variables['params'].keys()};context keys:{list(jax_context._root_scope_to_shared_layers_map[scope].keys())};scopes:{jax_context._root_scope_to_shared_layers_map.keys()}")
     if pre_created is not None:
       assert compatible_hparams(
           pre_created.hparams,

@@ -1318,3 +1318,34 @@ class TrainablePositionalEmbedding(PositionalEmbedding):
         embs, ap.emb_out_split_dims_mapping, self.mesh_axis_names
     )
     return embs
+
+
+class LinearRelativePosEmbedding(base_layer.BaseLayer): # mqy https://huggingface.co/OpenNLPLab/TransNormerLLM-7B/blob/main/modeling_transnormer.py#L91-L118
+
+  num_heads: int = 16
+  embed_dim: int = 64
+  # seq_len: int = 1024
+
+  def setup(self) -> None:
+    super().setup()
+    d = self.num_heads * self.embed_dim
+    init_theta = 10000**(-2 / d * np.arange(d)).reshape(self.num_heads, 1, self.embed_dim) # head, t, d
+    self.create_variable(
+        'theta_v',
+        WeightHParams(
+            shape=[self.num_heads, 1, self.embed_dim],
+            init=base_layer.WeightInit.Constant(init_theta.tolist()),
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=['mdl', None, None],
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+        ),
+    )
+
+  def __call__(self, x: JTensor, offset: int =0) -> JTensor:
+    # x: b, t, n, d; shape in original code: b, h, n,d
+    seq_len = x.shape[1]
+    index = jnp.arange(seq_len)[None,:,None] + offset
+    theta_v = self.theta.theta_v * index # n, t, d
+    theta_v = jnp.transpose(theta_v, axes=[1,0,2]) # n,t,d -> t, n, d
+    x = jnp.concatenate([x * jnp.cos(theta_v), x * jnp.sin(theta_v)], axis=-1)
+    return x

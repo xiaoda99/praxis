@@ -106,6 +106,14 @@ def causal_mask(input_t: JTensor) -> JTensor:
   return mask[jnp.newaxis, jnp.newaxis, :, :]
 
 
+def cal_probs_entropy(probs, atten_mask): # BNTS
+  ent = probs * jnp.log(probs + 1e-9)
+  min_value = py_utils.get_large_negative_number(atten_mask.dtype)
+  ent = jnp.where((atten_mask >= min_value * 0.5), ent, 0)
+  assert ent.shape[2] == ent.shape[3]
+  ent = ent.sum(axis=(0,2,3)) / (ent.shape[0] * ent.shape[2] * (ent.shape[2]+1)) * 2   # B*T*(T+1)/2; BNTS->N
+  return ent 
+
 def segment_mask(
     segment_ids: JTensor,
     source_segment_ids: Optional[JTensor] = None,
@@ -604,6 +612,7 @@ class DynamicWeightProjection(base_layer.BaseLayer):
   query_input_dim: int = None
   key_input_dim: int = None
   dynamic_w_init: WeightInit = None
+  dynamic_w2_init: WeightInit = None
   dynamic_d_init: WeightInit = None
   dynamic_squeeze_ratio: int = None  # mqy
   decompose_dynamic_w: bool = True
@@ -677,7 +686,11 @@ class DynamicWeightProjection(base_layer.BaseLayer):
           # else:
           #   K = self.dynamic_d_hidden_dim
           #   shape = [G, K, M]
-          pc = WeightHParams(shape=shape, init=self.dynamic_w_init,
+          # if w_name in ['qkw'] and self.dynamic_w2_init is not None: #mqy
+          #   init_method = self.dynamic_w2_init
+          # else:
+          init_method = self.dynamic_w_init 
+          pc = WeightHParams(shape=shape, init=init_method,
             mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl'] + [None]*(len(shape)-1),
           )
           self.create_variable(w_name, pc)
@@ -844,6 +857,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
   use_static_w: bool = True
   has_dynamic_w_params: bool = False
   dynamic_w_init: WeightInit = None
+  dynamic_w2_init: WeightInit = None
   dynamic_d_init: WeightInit = None
   dynamic_squeeze_ratio: int = None  # mqy
   decompose_dynamic_w: bool = True
@@ -1824,6 +1838,11 @@ class DotProductAttention(base_layer.BaseLayer):
   dim_per_head_v: Optional[int] = None
   value_gate_activation_cls: activations_lib.BaseActivation = None
   o_gate_activation_cls: activations_lib.BaseActivation = None
+  o_gate_rank: Optional[int] = None # 128
+  o_norm: bool = False # mqy
+  o_groupnorm: bool = True # mqy
+  o_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
+  scale_v: bool= False # mqy 
 
   dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
   atten_dropout_prob: float = 0.0
@@ -1857,6 +1876,8 @@ class DotProductAttention(base_layer.BaseLayer):
   float32_value: bool = False  # XD
   qk_norm: bool = False  # XD
   qk_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)  # XD
+  qk_activation_cls: activations_lib.BaseActivation = None # mqy
+
   output_layer_std: float = None  # XD
   # TODO(pax-dev): merge use_rotary_position_emb and rotary_position_emb_tpl
   # by initializing rotary_position_emb_tpl = None.
@@ -1870,6 +1891,9 @@ class DotProductAttention(base_layer.BaseLayer):
   )
   cast_rotary_position_emb: bool = True
   relative_bias_tpl: Optional[LayerTpl] = template_field(None)
+  slope_rate: Optional[JTensor] = None #mqy in TransNormer
+  use_lrpe: bool = False # mqy
+  linear_rel_position_emb_tpl: Optional[LayerTpl] = template_field(embedding_softmax.LinearRelativePosEmbedding)  # mqy
   attention_extra_logit: Optional[float] = None
   ngrammer_tpl: Optional[LayerTpl] = template_field(None)
   decode_cache: bool = True
@@ -1879,6 +1903,8 @@ class DotProductAttention(base_layer.BaseLayer):
   pv_einsum_tpl: LayerTpl = template_field(base_ops.EinsumOp)
   per_dim_scale_tpl: LayerTpl = template_field(PerDimScale)
   causal_depthwise_conv1d_tpl: LayerTpl = template_field(CausalDepthwiseConv1D)
+  relu2_bias: bool = False #mqy
+  linear_attn: bool = False #mqy
 
   # SPMD partition related params.
   #
@@ -2022,7 +2048,17 @@ class DotProductAttention(base_layer.BaseLayer):
         self.create_child('value_gate', project_input('value_gate', value_input_dim, dim_per_head_v, gaussian_std=value_std))
         self.create_child('value_gate_activation',  pax_fiddle.Config(self.value_gate_activation_cls).clone())
       if self.o_gate_activation_cls:  # XD
-        self.create_child('o_gate', project_input('o_gate',value_input_dim, dim_per_head_v, gaussian_std=value_std))
+        if self.o_gate_rank is not None:
+          og1 = WeightHParams(shape=[self.hidden_dim, self.o_gate_rank], # 1024, 128
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None],
+            init=WeightInit.Gaussian(math.sqrt(2.0 / (self.hidden_dim + self.o_gate_rank))))
+          og2 = WeightHParams(shape=[self.o_gate_rank, self.hidden_dim], # 128, 1024
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None],
+            init=WeightInit.Gaussian(math.sqrt(2.0 / (self.hidden_dim + self.o_gate_rank))))
+          self.create_variable('o_gate1', og1)
+          self.create_variable('o_gate2', og2)
+        else:
+          self.create_child('o_gate', project_input('o_gate',value_input_dim, dim_per_head_v, self.num_heads, gaussian_std=value_std))
         self.create_child('o_gate_activation',  pax_fiddle.Config(self.o_gate_activation_cls).clone())
     if self.qk_norm:  # XD
       for name in ['q_norm', 'k_norm']:
@@ -2030,10 +2066,18 @@ class DotProductAttention(base_layer.BaseLayer):
         params.name = name
         params.dim = dim_per_head
         self.create_child(name, params)
+    if self.qk_activation_cls: #mqy
+      self.create_child('qk_activation', pax_fiddle.Config(self.qk_activation_cls).clone())
+    if self.o_norm: # mqy
+      self.create_child('out_norm', self.o_norm_tpl.clone()) # epsilon=1e-6, axis=-1 
     if self.use_rotary_position_emb:
       self._create_rotary_position_emb(
           self.rotary_position_emb_tpl if not self.pythia_rotary else self.pythia_rotary_position_emb_tpl, dim_per_head
       )
+    if self.use_lrpe: # mqy
+      self.create_child('lrpe', self.linear_rel_position_emb_tpl.clone().set(
+        num_heads=self.num_heads,embed_dim=self.dim_per_head,
+        )) # TODO: pass seq_length in lrpe
 
     def project_logits_or_probs(proj_tpl, squeeze_ratio=None, squeeze_activation_cls=None,
         output_activation_cls=None, residual=True, absorb_residual=False, gaussian_std=None):  # XD
@@ -2123,6 +2167,32 @@ class DotProductAttention(base_layer.BaseLayer):
       relative_bias_p = self.relative_bias_tpl.clone()
       relative_bias_p.num_heads = self.num_heads
       self.create_child('relative_bias', relative_bias_p)
+
+    if self.relu2_bias:
+        #  if self.use_dw_hidden_bias:
+        #     pc_bias = WeightHParams(
+        #       shape=shape, init=WeightInit.Constant(0.0),
+        #       mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None],
+        #       collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION])
+        #     self.create_variable('dwhb', pc_bias)
+      relu2_bias = WeightHParams(
+          shape=[self.num_heads],
+          init=WeightInit.Constant(0.0),
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=[None],
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+      )
+      self.create_variable('relu2_b', relu2_bias)
+    
+    if self.scale_v:
+      v_scale = WeightHParams(
+          shape=[self.num_heads, dim_per_head],
+          init=WeightInit.Constant(1.0),
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=['mdl', None],
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+      )
+      self.create_variable('v_scale', v_scale)
 
     if self.dconv_qkv:
       causal_dconv_p = self.causal_depthwise_conv1d_tpl.clone().set(
@@ -2313,6 +2383,7 @@ class DotProductAttention(base_layer.BaseLayer):
       post_proj_dw_args: tuple = (),
       query_vec: Optional[JTensor] = None,
       key_vec: Optional[JTensor] = None,
+      rel_bias_mask: Optional[JTensor] = None,
   ) -> Tuple[JTensor, JTensor]:
     # logits = self._atten_logits(query, key)
     N = 'N' if self.num_kv_heads != 1 else ''
@@ -2338,7 +2409,23 @@ class DotProductAttention(base_layer.BaseLayer):
     padded_logits = py_utils.apply_mask_to_logits(logits, atten_mask)
     if self.attention_extra_logit is None:
       # XD: -1 -> -2; key -> value: key may have already been turned to fp32 by float32_logits
-      probs = jax.nn.softmax(padded_logits, axis=logits_exp.index('S'))#.astype(value.dtype)
+      if self.relu2_bias:
+        min_value = py_utils.get_large_negative_number(padded_logits.dtype)
+        masked_logits = jnp.where((atten_mask >= min_value * 0.5), padded_logits + jnp.expand_dims(self.theta.relu2_b, (1,2)), 0)
+        probs = jax.nn.relu(masked_logits) ** 2
+      elif self.linear_attn: #mqy
+        # if self.slope_rate is not None:
+        #   n = padded_logits.shape[-2]
+        #   rel_pos_mask = jnp.tril(jnp.arange(n)[None,:] - jnp.arange(n)[:,None]) + jnp.triu(jnp.zeros((n,n)) + float("-inf"), k=1)
+        #   rel_bias_mask = jnp.exp(self.slope_rate[:,None,None] * rel_pos_mask[None,:,:])
+        #   padded_logits = padded_logits * rel_bias_mask
+          # self.add_summary('transnormer_logits_max', jnp.max(padded_logits), verbosity=2)
+        # if rel_bias_mask is not None: padded_logits = padded_logits * rel_bias_mask # BN(query_chunk)S, BN(query_chunk)S-> BN(query_chunk)S B: batch, N: num_heads, T: len_query, S; len_key
+        if rel_bias_mask is not None: padded_logits = padded_logits * jnp.exp(self.slope_rate[:,None,None] * rel_bias_mask[None,:,:])[None, :] # BN(query_chunk)S, 1N(query_chunk)S -> BN(query_chunk)S
+        min_value = py_utils.get_large_negative_number(padded_logits.dtype) # 1N11, 11TS -> 1NTS
+        probs = jnp.where((atten_mask >= min_value * 0.5), padded_logits, 0)
+      else: 
+        probs = jax.nn.softmax(padded_logits, axis=logits_exp.index('S'))#.astype(value.dtype)
     else:
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits))#.astype(value.dtype)
     # XD
@@ -2413,9 +2500,24 @@ class DotProductAttention(base_layer.BaseLayer):
 
     query, key, value = [tensor.transpose(0, 2, 1, 3) for tensor in [query, key, value]] # btnh->bnth
     # atten_mask = jnp.transpose(atten_mask, (0, 2, 1, 3))  # XD: BNTS->BTNS
+    if self.slope_rate is not None:
+      rel_bias_mask = jnp.tril(jnp.arange(t)[None,:] - jnp.arange(t)[:,None]) + jnp.triu(jnp.zeros((t,t)) + float("-inf"), k=1) #TS
+      # rel_bias_mask = jnp.exp(self.slope_rate[:,None,None] * rel_pos_mask[None,:,:])[None,:] # 1N11,11TS -> 1NTS
+      # rel_bias_mask = base_layer.maybe_shard(rel_bias_mask, [None,'data', None, None], self.mesh_axis_names)
+    else: 
+      rel_bias_mask = None
+    
+    # if self.o_gate_activation_cls: 
+    #   o_gate_proj = self.o_gate(query_vec) # BTD->BTND
+    #   o_gate_proj = self._shard_blnh(o_gate_proj)
+    #   o_gate_proj = self.o_gate_activation(o_gate_proj)
+    #   if not self.transpose_logits:
+    #     o_gate_proj = jnp.transpose(o_gate_proj, axes=(0,2,1,3)) # BTND->BNTD
+
     if self.query_chunk_size is None:
       encoded, probs = self._atten_context(query, key, value, atten_mask,
-        query_vec=query_vec, key_vec=key_vec)
+        query_vec=query_vec, key_vec=key_vec, rel_bias_mask=rel_bias_mask)
+      # self.add_summary(f'prob_entropy', cal_probs_entropy(probs, atten_mask), verbosity=4)
     else:
       w = self.query_chunk_size
       assert t % w == 0, f'{t} % {w} != 0'
@@ -2447,6 +2549,13 @@ class DotProductAttention(base_layer.BaseLayer):
         kv_start = max(0, stop - w - self.window_size) if self.window_size is not None else 0
         _query = query[:, :, start : stop, :]
         _key, _value = key[:, :, kv_start : stop, :], value[:, :, kv_start : stop, :]
+        if rel_bias_mask is None:
+          _rel_bias_mask = None
+        else:
+          _rel_bias_mask = rel_bias_mask[start : stop, kv_start : stop] \
+            if not self.transpose_logits else rel_bias_mask[start : stop, kv_start : stop] # [:, start : stop, :, kv_start : stop]
+          # _rel_bias_mask = rel_bias_mask[:, :, start : stop, kv_start : stop] \
+          #   if not self.transpose_logits else rel_bias_mask[:, start : stop, kv_start : stop, :] # [:, start : stop, :, kv_start : stop]
         _atten_mask = atten_mask[:, :, start : stop, kv_start : stop] \
           if not self.transpose_logits else atten_mask[:, start : stop, kv_start : stop, :] # [:, start : stop, :, kv_start : stop]
         # _query = query[:, start : stop, :, :]
@@ -2462,7 +2571,8 @@ class DotProductAttention(base_layer.BaseLayer):
         _pre_proj_dw_args = slice_dw(*pre_proj_dw_args) if pre_proj_dw_args is not None and self.project_logits else ()  # debug
         _post_proj_dw_args = slice_dw(*post_proj_dw_args) if post_proj_dw_args is not None and self.project_probs else ()  # debug
         _encoded, _ = self._atten_context(_query, _key, _value, _atten_mask,
-          _pre_proj_dw_args, _post_proj_dw_args)
+          _pre_proj_dw_args, _post_proj_dw_args,rel_bias_mask=_rel_bias_mask)
+      
         encoded = encoded.at[:, :, start : stop, :].set(_encoded) \
           if not self.transpose_logits else encoded.at[:, start : stop, :, :].set(_encoded)
     if not self.transpose_logits: encoded = encoded.transpose(0, 2, 1, 3)  # bnth->btnh
@@ -2638,6 +2748,10 @@ class DotProductAttention(base_layer.BaseLayer):
 
     if self.qk_norm:  # XD
       query_proj, key_proj = self.q_norm(query_proj), self.k_norm(key_proj)
+
+    if self.scale_v:
+      value_proj = value_proj * self.theta.v_scale # BTNH, NH->BTNH
+      
     # Apply rotary position embeddings.
     # Paper: https://arxiv.org/abs/2104.09864.
     if self.use_rotary_position_emb:
@@ -2650,6 +2764,12 @@ class DotProductAttention(base_layer.BaseLayer):
       # query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)  # XD
       self._fprop_update_decode_state('key_post_rotary_pos_emb', key_proj)
     
+    if self.use_lrpe: #mqy
+      query_proj, key_proj = self.lrpe(query_proj),  self.lrpe(key_proj)
+
+    if self.qk_activation_cls: # mqy add qk_act in TransNormer 
+      query_proj, key_proj = self.qk_activation(query_proj), self.qk_activation(key_proj)
+
     if self.float32_logits:  # xd
       query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)
     if self.float32_value: value_proj = value_proj.astype(jnp.float32)
@@ -2678,10 +2798,33 @@ class DotProductAttention(base_layer.BaseLayer):
         query_proj, key_proj, value_proj, atten_mask, relative_bias,
         query_vec=query_vec, key_vec=key_vec,  # xd
     )
+    if self.o_norm: # mqy 
+      if self.o_groupnorm:
+        encoded = self.out_norm(encoded) # BNTd group norm
+      else:
+        if not self.transpose_logits: # BTND
+          num_heads = encoded.shape[2]
+          encoded = rearrange(encoded, 'B T N D -> B T (N D)')
+          assert encoded.shape[-1] == self.hidden_dim 
+          encoded = self.out_norm(encoded) # BTD->BTD
+          encoded = rearrange(encoded, 'B T (N D)-> B T N D', N=num_heads)
+        else: # BNTD
+          num_heads = encoded.shape[1]
+          encoded = rearrange(encoded, 'B N T D -> B T (N D)')
+          assert encoded.shape[-1] == self.hidden_dim
+          encoded = self.out_norm(encoded) # BTD->BTD
+          encoded = rearrange(encoded, 'B T (N D)-> B N T D', N=num_heads)
+      
+
     if self.o_gate_activation_cls:  # XD
-      o_gate_proj = self.o_gate(query_vec)
+      if self.o_gate_rank is None: # mqy
+        o_gate_proj = self.o_gate(query_vec) # BTD, NDd -> BTNd 
+      else:
+        o_gate_proj_inner = jnp.einsum('B T D, D R -> B T R', query_vec, self.theta.o_gate1)
+        o_gate_proj = jnp.einsum('B T R, R D -> B T D', o_gate_proj_inner, self.theta.o_gate2)
+        o_gate_proj = rearrange(o_gate_proj, 'B T (N D)-> B T N D', N=self.num_heads)
       o_gate_proj = self._shard_blnh(o_gate_proj)
-      encoded = encoded * self.o_gate_activation(o_gate_proj)
+      encoded = encoded * self.o_gate_activation(o_gate_proj) # BT(Nd), BT(Nd)
 
     # Apply NGrammer to the output of the attention layer.
     # Paper: https://openreview.net/forum?id=GxjCYmQAody.
@@ -2705,7 +2848,7 @@ class DotProductAttention(base_layer.BaseLayer):
       shared_encoded = self.shared_post(shared_encoded) \
         if self.shared_ov_dim != self.hidden_dim else \
         self.post.project_shared_output(shared_encoded)
-    encoded = self.post(encoded)
+    encoded = self.post(encoded)     # BTNd, NdD -> BTD
     if self.shared_ov_dim > 0:  # XD
       encoded = encoded + shared_encoded
       if self.float32_value: encoded = self._cast_to_fprop_dtype(encoded)
