@@ -678,18 +678,26 @@ class DynamicWeightProjection(base_layer.BaseLayer):
         if self.merge_dynamic_w_hidden: w_names = ['dw2_w1', 'dw2_w2', 'dw2_d']
         elif self.merge_projection: w_names = ['qkw'] + (['qkd'] if self.dynamic_d_hidden_dim else [])
         else: w_names = ['qw', 'kw'] + (['qd', 'kd'] if self.dynamic_d_hidden_dim else [])
+        if self.dynamic_w2_init is not None and 'qkw' in w_names:
+          # w_names.pop('qkw')
+          w_names = w_names + ['qkw1', 'qkw2'] 
         for w_name in w_names:
           if w_name not in ['dw2_d', 'qd', 'kd', 'qkd']:
             I = dynamic_hidden_dim * (1 if self.merge_dynamic_w_hidden else 2)
             if not self.decompose_dynamic_w: I = M
-            shape = [G, 4, K, I, M] if w_name == 'qkw' else [G, K, I, M] # [G, K, M, I]
+            if w_name == 'qkw':
+              shape = [G, 4, K, I, M] 
+            elif w_name in ['qkw1', 'qkw2']:
+              shape = [G, 4, K, I//2, M] 
+            else:
+              shape = [G, K, I, M] # [G, K, M, I]
           # else:
           #   K = self.dynamic_d_hidden_dim
           #   shape = [G, K, M]
-          # if w_name in ['qkw'] and self.dynamic_w2_init is not None: #mqy
-          #   init_method = self.dynamic_w2_init
-          # else:
-          init_method = self.dynamic_w_init 
+          if w_name == 'qkw2' and self.dynamic_w2_init is not None: #mqy
+            init_method = self.dynamic_w2_init
+          else:
+            init_method = self.dynamic_w_init 
           pc = WeightHParams(shape=shape, init=init_method,
             mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl'] + [None]*(len(shape)-1),
           )
@@ -760,7 +768,11 @@ class DynamicWeightProjection(base_layer.BaseLayer):
         if self.merge_projection:
           dw_hidden = jnp.einsum('BTD,DGCK->BTGCK', query_vec, theta.dw1)  # C=4 [pre,post]*[query,key]
           dw_hidden = self.dw_hidden_activation(dw_hidden)
-          w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, theta.qkw), 2, axis=-2)
+          if self.dynamic_w2_init is None:
+            qkw = theta.qkw 
+          else:
+            qkw = jnp.concatenate([theta.qkw1, theta.qkw2], axis=-2)
+          w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, qkw), 2, axis=-2)
           # w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKMI->BTGCMI', dw_hidden, theta.qkw), 2, axis=-1)
           if self.dw1_norm_cls is not None: w1 = self.dw1_norm(w1)
           pre_qw1, pre_kw1, post_qw1, post_kw1 = unbind(w1, 4, axis=3) # BT4GIM->[BTGIM]*4
