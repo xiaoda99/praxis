@@ -842,6 +842,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
   query_input_dim: int = None
   key_input_dim: int = None
   use_static_w: bool = True
+  keep_static_w_in_call: int = 1 # ablate static w in forward (1: keep, 0: ablate)  
   has_dynamic_w_params: bool = False
   dynamic_w_init: WeightInit = None
   dynamic_d_init: WeightInit = None
@@ -1020,8 +1021,8 @@ class CrossHeadProjection(base_layer.BaseLayer):
     ret = inputs
     if self.use_static_w:
       if self.squeeze_ratio is None:
-        w = theta.w + jnp.eye(self.num_heads_per_group) \
-          if self.residual and self.absorb_residual else theta.w
+        w = theta.w * self.keep_static_w_in_call + jnp.eye(self.num_heads_per_group) \
+          if self.residual and self.absorb_residual else theta.w * self.keep_static_w_in_call
         _inputs = inputs
         if self.input_activation_cls is not None:
           if self.use_input_bias: _inputs += theta.ib if self.transpose else jnp.expand_dims(theta.ib, axis=(2, 3))
