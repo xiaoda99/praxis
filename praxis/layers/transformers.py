@@ -41,6 +41,7 @@ from praxis.layers import pipeline
 from praxis.layers import repeats
 from praxis.layers import stats
 from praxis.layers import stochastics
+from praxis.layers import GELU
 
 NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
@@ -1211,6 +1212,15 @@ class Transformer(base_layer.BaseLayer):
   tr_fflayer_tpl: LayerTpl = template_field(TransformerFeedForward)
   gpt_j_residual: bool = False  # XD
   ngrammer_tpl: Optional[LayerTpl] = template_field(None)
+  layer_index: int = 0 
+  dense_conn: bool = False
+  dynamic_dense: bool = False
+  use_dense_norm: bool = False
+  dense_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
+  dynamic_dense_act_cls: activations_lib.BaseActivation = None # mqy
+  comp_dense_diff: bool = False  # mqy; compose difference of hidden state in every layer 
+  dense_bias_init_method: Optional[str] = 'current_only' # emb_only, current_only, uniform
+
 
   # This function can be overridden by subclasses.
   def _setup_attention(self, atten_tpl: LayerTpl, name: str)-> None:
@@ -1297,6 +1307,48 @@ class Transformer(base_layer.BaseLayer):
       params.norm_policy = self.norm_policy
       params.add_skip_connection = not self.gpt_j_residual  # XD
       self.create_child('ff_layer', params)
+    
+    # Intialize dense conn params
+    if self.dense_conn:
+      i = self.layer_index
+      self.create_child('dense_norm', self.dense_norm_tpl.clone())
+      if self.dynamic_dense_act_cls is not None:
+        self.create_child('dense_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
+        # assert isinstance(self.dynamic_dense_act_cls, GELU)
+      # assert self.dense_bias_init_method in ['current_only', 'emb_only', 'uniform']
+      # b_init_method = self.dense_bias_init_method if not self.comp_dense_diff else 'uniform' # use uniform init with comp_dense_diff
+        # if b_init_method == 'uniform':
+        #   init_v = [1] * (i+2) 
+        # elif b_init_method == 'current_only':
+        #   init_v = [0] * (i+1) + [1] 
+        # elif  b_init_method == 'emb_only':
+        #   init_v = [1] + [0] * (i+1) 
+        # dense_w = WeightHParams(
+        #     shape=[len(init_v)],
+        #     init=WeightInit.Constant(init_v), # L
+        #     mesh_shape=self.mesh_shape,
+        #     tensor_split_dims_mapping=[None],
+        #     collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+        # )
+        # self.create_variable(f'dense_conn_{i}', dense_w)
+      if self.dynamic_dense: # BTD, DL-> BTL
+        std = 1/math.sqrt(self.input_dims) 
+        l = i + 2 
+        dyn_dense_proj1 = WeightHParams(
+            shape=[self.input_dims, l], # DL
+            init=WeightInit.Gaussian(std),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=['data', None],
+        )
+        dyn_dense_proj2 = WeightHParams(
+            shape=[l, l], # LL
+            init=WeightInit.Constant(0),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=[None, None],
+        )
+        self.create_variable(f'dynamic_dense_conn1_{i}', dyn_dense_proj1)
+        self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
+
 
   def init_states(self, target_batch_size: int, target_max_length: int) -> None:
     """Initialize the cache for the Transformer layer.
@@ -1322,7 +1374,8 @@ class Transformer(base_layer.BaseLayer):
       cross_inputs: Optional[JTensor] = None,
       cross_attention_mask: Optional[JTensor] = None,
       segment_pos: Optional[JTensor] = None,
-      segment_ids: Optional[JTensor] = None) -> Tuple[JTensor, JTensor]:
+      segment_ids: Optional[JTensor] = None,
+      ) -> Tuple[JTensor, JTensor]:
     """Transformer decoder layer.
 
     Args:
@@ -1438,7 +1491,20 @@ class Transformer(base_layer.BaseLayer):
     output = self.ff_layer(atten_output, paddings=paddings) \
       if not self.gpt_j_residual else atten_output + self.ff_layer(inputs, paddings=paddings)  # XD
     self.add_summary('layer_output_rms', _rms(output-inputs), verbosity=4)
-    return output, atten_probs  # pytype: disable=bad-return-type  # jax-ndarray
+
+    # generate dynamic dense conn weight
+    dyn_dense_w = None
+    if self.dynamic_dense:
+      dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{self.layer_index}'),  getattr(self.theta, f'dynamic_dense_conn2_{self.layer_index}'))
+      dense_proj1, dense_proj2 = dyn_dense_proj
+      x_out_normed = self.dense_norm(output) if self.use_dense_norm else output
+      if self.dynamic_dense_act_cls is None:
+        dense_proj = dense_proj1 @ dense_proj2 # DL,LL->DL # 1024x25 , 25x25 -> 1024x25
+        dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out_normed, dense_proj)
+      else:
+        dense_w_inner = self.dense_activation(jnp.einsum('B T D, D K -> B T K', x_out_normed, dense_proj1))   # GELU activation
+        dyn_dense_w = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
+    return output, atten_probs, dyn_dense_w  # pytype: disable=bad-return-type  # jax-ndarray
 
   def extend_step(self,
                   inputs: JTensor,
@@ -1653,6 +1719,7 @@ class StackedTransformer(base_layer.BaseLayer):
   pre_compute_atten_mask: bool = True
   dense_conn: bool = False
   dynamic_dense: bool = False
+  use_dense_norm: bool = False
   dense_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
   dynamic_dense_act_cls: activations_lib.BaseActivation = None # mqy
   comp_dense_diff: bool = False  # mqy; compose difference of hidden state in every layer 
@@ -1747,6 +1814,14 @@ class StackedTransformer(base_layer.BaseLayer):
         p_i.residual_droppath_prob = (
             self.residual_droppath_prob * i / max(1, self.num_layers)
         )
+      # dense params
+      p_i.layer_index = i
+      p_i.dense_conn = self.dense_conn
+      p_i.dynamic_dense_act_cls = self.dynamic_dense_act_cls
+      p_i.dynamic_dense = self.dynamic_dense
+      p_i.use_dense_norm = self.use_dense_norm
+      p_i.dense_bias_init_method = self.dense_bias_init_method
+      p_i.comp_dense_diff = self.comp_dense_diff
 
       if self.moe_layers and i in self.moe_layers:
         assert self.num_experts > 0
@@ -1806,9 +1881,10 @@ class StackedTransformer(base_layer.BaseLayer):
     self.create_children('x_layers', layer_params)
 
     if self.dense_conn:
-      self.create_child('dense_norm', self.dense_norm_tpl.clone())
-      if self.dynamic_dense_act_cls is not None:
-        self.create_child('dense_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
+      # self.create_child('dense_norm', self.dense_norm_tpl.clone())
+      # if self.dynamic_dense_act_cls is not None:
+      #   self.create_child('dense_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
+        # assert isinstance(self.dynamic_dense_act_cls, GELU)
       assert self.dense_bias_init_method in ['current_only', 'emb_only', 'uniform']
       b_init_method = self.dense_bias_init_method if not self.comp_dense_diff else 'uniform' # use uniform init with comp_dense_diff
       for i in range(self.num_layers):
@@ -1826,23 +1902,23 @@ class StackedTransformer(base_layer.BaseLayer):
             collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
         )
         self.create_variable(f'dense_conn_{i}', dense_w)
-        if self.dynamic_dense: # BTD, DL-> BTL
-          std = 1/math.sqrt(self.model_dims) 
-          l = i + 2 
-          dyn_dense_proj1 = WeightHParams(
-              shape=[self.model_dims, l], # DL
-              init=WeightInit.Gaussian(std),
-              mesh_shape=self.mesh_shape, 
-              tensor_split_dims_mapping=['data', None],
-          )
-          dyn_dense_proj2 = WeightHParams(
-              shape=[l, l], # LL
-              init=WeightInit.Constant(0),
-              mesh_shape=self.mesh_shape, 
-              tensor_split_dims_mapping=[None, None],
-          )
-          self.create_variable(f'dynamic_dense_conn1_{i}', dyn_dense_proj1)
-          self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
+        # if self.dynamic_dense: # BTD, DL-> BTL
+        #   std = 1/math.sqrt(self.model_dims) 
+        #   l = i + 2 
+        #   dyn_dense_proj1 = WeightHParams(
+        #       shape=[self.model_dims, l], # DL
+        #       init=WeightInit.Gaussian(std),
+        #       mesh_shape=self.mesh_shape, 
+        #       tensor_split_dims_mapping=['data', None],
+        #   )
+        #   dyn_dense_proj2 = WeightHParams(
+        #       shape=[l, l], # LL
+        #       init=WeightInit.Constant(0),
+        #       mesh_shape=self.mesh_shape, 
+        #       tensor_split_dims_mapping=[None, None],
+        #   )
+        #   self.create_variable(f'dynamic_dense_conn1_{i}', dyn_dense_proj1)
+        #   self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
 
     if self.input_dropout_prob > 0.0:
       self.create_child(
@@ -1921,9 +1997,8 @@ class StackedTransformer(base_layer.BaseLayer):
         cross_inputs,
         cross_attention_mask,
         segment_pos,
-        dyn_dense_proj=None,
     ):
-      x_out, _ = transformer(
+      x_out, _, dyn_dense_w = transformer(
           x_in,
           paddings,
           attention_mask,
@@ -1931,27 +2006,21 @@ class StackedTransformer(base_layer.BaseLayer):
           cross_attention_mask,
           segment_pos=segment_pos,
       )
-      dyn_dense_w = None
-      if dyn_dense_proj is not None:
-        dense_proj1, dense_proj2 = dyn_dense_proj
-        if self.dynamic_dense_act_cls is None:
-          dense_proj = dense_proj1 @ dense_proj2 # DL,LL->DL # 1024x25 , 25x25 -> 1024x25
-          dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out, dense_proj)
-        else:
-          # dense_w_inner = self.dense_activation(jnp.einsum('B T D, D K -> B T K', x_out, dense_proj1))   # GELU activation
-          dense_w_inner = jax.nn.gelu(jnp.einsum('B T D, D K -> B T K', x_out, dense_proj1))   # GELU activation
-          # dense_w_inner = jnp.einsum('B T D, D K -> B T K', x_out, dense_proj1)
-          # dense_w_inner = base_layer.maybe_shard(dense_w_inner, ['data', None, None], self.mesh_axis_names)
-          dyn_dense_w = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
-          # dyn_dense_w = base_layer.maybe_shard(dyn_dense_w, ['data', None, None], self.mesh_axis_names)
+      # dyn_dense_w = None
+      # if dyn_dense_proj is not None:
+      #   dense_proj1, dense_proj2 = dyn_dense_proj
+      #   # x_out_normed = self.dense_norm(x_out) if self.use_dense_norm else x_out
+      #   if self.dynamic_dense_act_cls is None:
+      #     dense_proj = dense_proj1 @ dense_proj2 # DL,LL->DL # 1024x25 , 25x25 -> 1024x25
+      #     dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out, dense_proj)
+      #   else:
+      #     # dense_w_inner = self.dense_activation(jnp.einsum('B T D, D K -> B T K', x_out, dense_proj1))   # GELU activation
+      #     dense_w_inner = jax.nn.gelu(jnp.einsum('B T D, D K -> B T K', x_out, dense_proj1))   # GELU activation
+      #     dense_w_inner = self.dense_norm(dense_w_inner)
+      #     dyn_dense_w = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
 
-          # dyn_dense_w = jnp.einsum('B T K, K L -> B T L', jnp.einsum('B T D, D K -> B T K', x_out, dense_proj1), dense_proj2)
-          # dense_proj = dense_proj1 @ dense_proj2 # DL,LL->DL # 1024x25 , 25x25 -> 1024x25
-          # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out, dense_proj)
-
-        # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', self.dense_norm(x_out), dyn_dense_proj)
-        # dyn_dense_w = self.dense_norm(dyn_dense_w)
-        # dyn_dense_w = jnp.tanh(dyn_dense_w)
+      #   # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', self.dense_norm(x_out), dyn_dense_proj)
+      #   # dyn_dense_w = self.dense_norm(dyn_dense_w)
       return x_out, dyn_dense_w
 
     fprop = _fprop
@@ -1964,10 +2033,10 @@ class StackedTransformer(base_layer.BaseLayer):
       hids = [x_out]
     for i in range(self.num_layers):
       x_in = x_out
-      if self.dynamic_dense:
-        dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{i}'),  getattr(self.theta, f'dynamic_dense_conn2_{i}'))
-      else:
-        dyn_dense_proj = None 
+      # if self.dynamic_dense:
+      #   dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{i}'),  getattr(self.theta, f'dynamic_dense_conn2_{i}'))
+      # else:
+      #   dyn_dense_proj = None 
       x_out, dyn_dense_w = fprop(
           self.x_layers[i],
           x_in,
@@ -1976,7 +2045,6 @@ class StackedTransformer(base_layer.BaseLayer):
           cross_inputs,
           cross_attention_mask,
           segment_pos,
-          dyn_dense_proj=dyn_dense_proj,
       )
       x_out = checkpoint_name(x_out, 'transformer_layer_out')
       if self.dense_conn:
