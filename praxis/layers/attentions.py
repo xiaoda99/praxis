@@ -2445,7 +2445,7 @@ class DotProductAttention(base_layer.BaseLayer):
     probs = self._cross_head_proj(probs, 'post_proj', *post_proj_dw_args,
       query_vec=query_vec, key_vec=key_vec)
     if self.float32_probs: probs = probs.astype(value.dtype)
-    if False and getattr(self, 'post_proj', None) is not None:
+    if getattr(self, 'post_proj', None) is not None:
       # mask probs similar to py_utils.apply_mask_to_logits
       min_value = py_utils.get_large_negative_number(probs.dtype)
       probs = jnp.where((atten_mask >= min_value * 0.5), probs, 0.)
