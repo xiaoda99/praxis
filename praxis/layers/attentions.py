@@ -1849,6 +1849,7 @@ class DotProductAttention(base_layer.BaseLayer):
   # XD: gated attention related
   dim_per_head_v: Optional[int] = None
   value_gate_activation_cls: activations_lib.BaseActivation = None
+  save_v_out: bool = False 
   o_gate_activation_cls: activations_lib.BaseActivation = None
   o_gate_rank: Optional[int] = None # 128
   o_norm: bool = False # mqy
@@ -2692,6 +2693,7 @@ class DotProductAttention(base_layer.BaseLayer):
       atten_mask: JTensor,
       query_segment_pos: Optional[JTensor] = None,
       key_segment_pos: Optional[JTensor] = None,
+      v_in: Optional[JTensor] = None,
   ) -> Tuple[JTensor, JTensor]:
     """Computes the value vector given the current query output.
 
@@ -2757,6 +2759,12 @@ class DotProductAttention(base_layer.BaseLayer):
       self._fprop_update_decode_state('key_post_dconv', key_proj)
       value_proj = self.dconv_v(value_proj, axis=1, segment_pos=key_segment_pos)
       self._fprop_update_decode_state('value_post_dconv', value_proj)
+
+    if v_in is not None: # 2BSNd
+      query_proj = query_proj + v_in[0] # BSNd
+      key_proj = key_proj + v_in[1] # BSNd
+      if v_in.shape[0] == 3:
+        value_proj = value_proj + v_in[2]
 
     if self.qk_norm:  # XD
       query_proj, key_proj = self.q_norm(query_proj), self.k_norm(key_proj)
@@ -2860,6 +2868,7 @@ class DotProductAttention(base_layer.BaseLayer):
       shared_encoded = self.shared_post(shared_encoded) \
         if self.shared_ov_dim != self.hidden_dim else \
         self.post.project_shared_output(shared_encoded)
+    v_out = encoded if self.save_v_out else None # BTNd
     encoded = self.post(encoded)     # BTNd, NdD -> BTD
     if self.shared_ov_dim > 0:  # XD
       encoded = encoded + shared_encoded
@@ -2867,7 +2876,7 @@ class DotProductAttention(base_layer.BaseLayer):
     encoded = self._shard_bld(encoded)
     encoded = checkpoint_name(encoded, 'out_proj')
 
-    return encoded, atten_probs
+    return encoded, atten_probs, v_out
 
   def init_states(self, target_batch_size: int, target_max_length: int) -> None:
     """Initializes cache for autoregressive cached decoding.
