@@ -1918,6 +1918,8 @@ class DotProductAttention(base_layer.BaseLayer):
   causal_depthwise_conv1d_tpl: LayerTpl = template_field(CausalDepthwiseConv1D)
   relu2_bias: bool = False #mqy
   linear_attn: bool = False #mqy
+  ablate_dynamic_dense_qkv: Optional[str] = None # 'q', 'k', 'v', 'qk' 
+
 
   # SPMD partition related params.
   #
@@ -2723,9 +2725,12 @@ class DotProductAttention(base_layer.BaseLayer):
     else:
       # Project inputs to key, value and query, respectively has shape
       # [B, S, N, H], [B, S, N, H], and [B, T, N, H].
-      query_proj = self.query(query_vec)
-      key_proj = self.key(key_vec)
-      value_proj = self.value(value_vec)
+      query_proj = self.query(v_in) if self.ablate_dynamic_dense_qkv is not None and 'q' in self.ablate_dynamic_dense_qkv else self.query(query_vec)
+      key_proj = self.key(v_in) if self.ablate_dynamic_dense_qkv is not None and 'k' in self.ablate_dynamic_dense_qkv else self.key(key_vec)
+      value_proj = self.value(v_in) if self.ablate_dynamic_dense_qkv is not None and 'v' in self.ablate_dynamic_dense_qkv else self.value(value_vec)
+      # query_proj = self.query(query_vec)
+      # key_proj = self.key(key_vec)
+      # value_proj = self.value(value_vec)
       if self.value_gate_activation_cls:  # XD
         value_gate_proj = self.value_gate(value_vec)
         value_gate_proj = self._shard_blnh(value_gate_proj)
@@ -2760,7 +2765,7 @@ class DotProductAttention(base_layer.BaseLayer):
       value_proj = self.dconv_v(value_proj, axis=1, segment_pos=key_segment_pos)
       self._fprop_update_decode_state('value_post_dconv', value_proj)
 
-    if v_in is not None: # 2BSNd
+    if v_in is not None and self.ablate_dynamic_dense_qkv is None: # 2BSNd
       query_proj = query_proj + v_in[0] # BSNd
       key_proj = key_proj + v_in[1] # BSNd
       if v_in.shape[0] == 3:

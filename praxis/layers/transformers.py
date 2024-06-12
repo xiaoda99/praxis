@@ -1223,6 +1223,8 @@ class Transformer(base_layer.BaseLayer):
   dynamic_head_dense: bool = False
   dynamic_head_rank: int = 2
   dynamic_head_dense_type: str = 'qk'
+  ablate_dynamic_dense_qkv: Optional[str] = None # 'q', 'k', 'v', 'qk'
+
 
 
   # This function can be overridden by subclasses.
@@ -1257,6 +1259,12 @@ class Transformer(base_layer.BaseLayer):
       params.name = 'layer_norm'
       params.dim = self.input_dims
       self.create_child('layer_norm', params)
+      # add layer_norm_extra for normalizing v_in(BTD)
+      if self.ablate_dynamic_dense_qkv is not None:
+        params = self.ln_tpl.clone()
+        params.name = 'layer_norm_extra'
+        params.dim = self.input_dims
+        self.create_child('layer_norm_extra', params) 
     else:
       raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
@@ -1452,7 +1460,9 @@ class Transformer(base_layer.BaseLayer):
       inputs_normalized = self.layer_norm(inputs)
     else:
       inputs_normalized = inputs
-
+ 
+    if self.ablate_dynamic_dense_qkv is not None: # BTD
+      v_in = self.layer_norm_extra(v_in)
     # Compute self-attention, key/value vectors are the input itself
     atten_output, self_atten_probs, v_out = self.self_attention(
         inputs_normalized,
@@ -1775,6 +1785,7 @@ class StackedTransformer(base_layer.BaseLayer):
   dynamic_head_rank: int = 2
   head_dw1_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
   dynamic_head_dense_type: str = 'qk'
+  ablate_dynamic_dense_qkv: Optional[str] = None # 'q', 'k', 'v', 'qk'
 
 
 
@@ -1872,6 +1883,8 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.dynamic_dense = self.dynamic_dense
       p_i.dense_bias_init_method = self.dense_bias_init_method
       p_i.comp_dense_diff = self.comp_dense_diff
+      p_i.ablate_dynamic_dense_qkv = self.ablate_dynamic_dense_qkv
+      p_i.tr_atten_tpl.ablate_dynamic_dense_qkv = self.ablate_dynamic_dense_qkv
 
       # shared hyper-params by dense and head_dense
       p_i.use_dense_norm = self.use_dense_norm
@@ -2098,6 +2111,8 @@ class StackedTransformer(base_layer.BaseLayer):
     v_outs = []
     for i in range(self.num_layers):
       x_in = x_out
+      if self.dense_conn and self.dynamic_dense and self.ablate_dynamic_dense_qkv is not None: # ablate q/k/v roles of dense connection to previous hidden states
+        v_in = hids[-1] # BTD
       # if self.dynamic_dense:
       #   dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{i}'),  getattr(self.theta, f'dynamic_dense_conn2_{i}'))
       # else:
