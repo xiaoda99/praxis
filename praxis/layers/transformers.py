@@ -1786,6 +1786,7 @@ class StackedTransformer(base_layer.BaseLayer):
   head_dw1_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
   dynamic_head_dense_type: str = 'qk'
   ablate_dynamic_dense_qkv: Optional[str] = None # 'q', 'k', 'v', 'qk'
+  dynamic_swap_residual: bool = False
 
 
 
@@ -2113,6 +2114,8 @@ class StackedTransformer(base_layer.BaseLayer):
       x_in = x_out
       if self.dense_conn and self.dynamic_dense and self.ablate_dynamic_dense_qkv is not None: # ablate q/k/v roles of dense connection to previous hidden states
         v_in = hids[-1] # BTD
+        if self.dynamic_swap_residual:
+          x_in, v_in = v_in, x_in # x_in as normal layer output and v_in as dynamically mixed state
       # if self.dynamic_dense:
       #   dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{i}'),  getattr(self.theta, f'dynamic_dense_conn2_{i}'))
       # else:
