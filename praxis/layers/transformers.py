@@ -1223,6 +1223,8 @@ class Transformer(base_layer.BaseLayer):
   dynamic_head_dense: bool = False
   dynamic_head_rank: int = 2
   dynamic_head_dense_type: str = 'qk'
+  # dynamic_qk_proj: bool = False
+  dynamic_head_seperate_param: bool = False
 
 
   # This function can be overridden by subclasses.
@@ -1368,8 +1370,9 @@ class Transformer(base_layer.BaseLayer):
           mesh_shape=self.mesh_shape, 
           tensor_split_dims_mapping=['data', None], 
       )
+      _l = l * C if self.dynamic_head_seperate_param else l
       dyn_head_dense_proj2a = WeightHParams(
-          shape=[K, l, r, n], # K(L+1)RN; BTK, KLRN->LBTRN
+          shape=[K, _l, r, n], # K(L+1)CRN; BTK, K(LC)RN->(LC)BTRN
           # init=WeightInit.Constant(0),
           init=WeightInit.Gaussian(std2),
           mesh_shape=self.mesh_shape, 
@@ -1549,7 +1552,7 @@ class Transformer(base_layer.BaseLayer):
       head_dense_proj2 = jnp.concatenate([head_dense_proj2a, head_dense_proj2b], axis=1) # KLRN, KCRN->K(L+C)RN
       x_out_normed = self.head_dense_norm(output) if self.use_dense_norm else output
       dense_w_inner = self.head_dense_activation(jnp.einsum('BTD,DK->BTK', x_out_normed, head_dense_proj1))   # GELU activation
-      dyn_head_dense_w = jnp.einsum('BTK,KLRN->LBTRN', dense_w_inner, head_dense_proj2) # (L+C)BTRN
+      dyn_head_dense_w = jnp.einsum('BTK,KLRN->LBTRN', dense_w_inner, head_dense_proj2) # (L*C+C)BTRN
 
     return output, atten_probs, dyn_dense_w, dyn_head_dense_w, v_out  # pytype: disable=bad-return-type  # jax-ndarray
 
@@ -1775,6 +1778,8 @@ class StackedTransformer(base_layer.BaseLayer):
   dynamic_head_rank: int = 2
   head_dw1_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
   dynamic_head_dense_type: str = 'qk'
+  dynamic_head_seperate_param: bool = False
+  # dynamic_qk_proj: bool = False
 
 
 
@@ -1881,6 +1886,8 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.dynamic_head_dense = self.dynamic_head_dense
       p_i.dynamic_head_rank = self.dynamic_head_rank
       p_i.dynamic_head_dense_type = self.dynamic_head_dense_type
+      p_i.dynamic_head_seperate_param = self.dynamic_head_seperate_param
+      # p_i.dynamic_qk_proj = self.dynamic_qk_proj
 
       if self.moe_layers and i in self.moe_layers:
         assert self.num_experts > 0
@@ -2133,12 +2140,17 @@ class StackedTransformer(base_layer.BaseLayer):
       if self.dynamic_head_dense:
         v_outs.append(v_out)
         C = len(self.dynamic_head_dense_type) # 2: qk, 3:qkv
-        # dw2, dw1 = jnp.split(dyn_head_dense_w, jnp.array([2], dtype=jnp.int32), axis=0) # (L+1)BSRN -> 2BSRN,LBSRN 
-        dw1, dw2 = dyn_head_dense_w[:-C], dyn_head_dense_w[-C:] #(L*C+C)BSRN
-        # dw2, dw1 = jnp.split(dyn_head_dense_w, [2], axis=0) # (L+1)BSRN -> 2BSRN,LBSRN 
-        inner_v = sum(jnp.einsum('BSND,BSRN->BSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
-        inner_v = self.head_dw1_norm(inner_v) # rmsnorm
-        v_in = jnp.einsum('BSRD,CBSRN->CBSND', inner_v, dw2)
+        # dw2, dw1 = jnp.split(dyn_head_dense_w, jnp.array([2], dtype=jnp.int32), axis=0) # (L+1)BSRN -> 2BSRN,LBSRN
+        dw1, dw2 = dyn_head_dense_w[:-C], dyn_head_dense_w[-C:] #(L*C+C)BSRN 
+        if self.dynamic_head_seperate_param:
+          dw1 = rearrange(dw1, '(L C) B S R N -> L C B S R N',C=C)
+          inner_v = sum(jnp.einsum('BSND,CBSRN->CBSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
+          inner_v = self.head_dw1_norm(inner_v) # rmsnorm
+          v_in = jnp.einsum('CBSRD,CBSRN->CBSND', inner_v, dw2)
+        else:
+          inner_v = sum(jnp.einsum('BSND,BSRN->BSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
+          inner_v = self.head_dw1_norm(inner_v) # rmsnorm
+          v_in = jnp.einsum('BSRD,CBSRN->CBSND', inner_v, dw2)
     return x_out
 
   def extend_step(self,

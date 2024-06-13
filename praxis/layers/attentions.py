@@ -1866,6 +1866,7 @@ class DotProductAttention(base_layer.BaseLayer):
   internal_gshard_gaussian_init: bool = False
   combine_qkv: bool = False
   combined_qkv_proj_tpl: LayerTpl = template_field(CombinedQKVProjectionLayer)
+  dynamic_qk_proj: bool = False
   shared_qk_dim: int = 0 # XD
   shared_ov_dim: int = 0 # XD
   num_shared_heads: int = None  # XD
@@ -2081,6 +2082,17 @@ class DotProductAttention(base_layer.BaseLayer):
         self.create_child(name, params)
     if self.qk_activation_cls: #mqy
       self.create_child('qk_activation', pax_fiddle.Config(self.qk_activation_cls).clone())
+
+    if self.dynamic_qk_proj:
+      dynamic_query = WeightHParams(shape=[dim_per_head, dim_per_head], # d,d
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None],
+            init=WeightInit.Gaussian(math.sqrt(1.0 / dim_per_head)))
+      dynamic_key = WeightHParams(shape=[dim_per_head, dim_per_head], # d,d
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None],
+            init=WeightInit.Gaussian(math.sqrt(1.0 / dim_per_head)))
+      self.create_variable('dynamic_query', dynamic_query)
+      self.create_variable('dynamic_key', dynamic_key)
+
     if self.o_norm: # mqy
       self.create_child('out_norm', self.o_norm_tpl.clone()) # epsilon=1e-6, axis=-1 
     if self.use_rotary_position_emb:
@@ -2761,8 +2773,13 @@ class DotProductAttention(base_layer.BaseLayer):
       self._fprop_update_decode_state('value_post_dconv', value_proj)
 
     if v_in is not None: # 2BSNd
-      query_proj = query_proj + v_in[0] # BSNd
-      key_proj = key_proj + v_in[1] # BSNd
+      if self.dynamic_qk_proj:
+        dyn_q = jnp.einsum('BSND,DE->BSNE', v_in[0], self.theta.dynamic_query)
+        dyn_k = jnp.einsum('BSND,DE->BSNE', v_in[1], self.theta.dynamic_key)
+      else:
+        dyn_q, dyn_k = v_in[0], v_in[1]
+      query_proj = query_proj + dyn_q # BSNd
+      key_proj = key_proj + dyn_k # BSNd
       if v_in.shape[0] == 3:
         value_proj = value_proj + v_in[2]
 
