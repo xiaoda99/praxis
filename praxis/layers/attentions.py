@@ -2772,7 +2772,7 @@ class DotProductAttention(base_layer.BaseLayer):
       value_proj = self.dconv_v(value_proj, axis=1, segment_pos=key_segment_pos)
       self._fprop_update_decode_state('value_post_dconv', value_proj)
 
-    if v_in is not None: # 2BSNd
+    if v_in is not None: # CBSNd
       if self.dynamic_qk_proj:
         dyn_q = jnp.einsum('BSND,DE->BSNE', v_in[0], self.theta.dynamic_query)
         dyn_k = jnp.einsum('BSND,DE->BSNE', v_in[1], self.theta.dynamic_key)
@@ -2780,7 +2780,7 @@ class DotProductAttention(base_layer.BaseLayer):
         dyn_q, dyn_k = v_in[0], v_in[1]
       query_proj = query_proj + dyn_q # BSNd
       key_proj = key_proj + dyn_k # BSNd
-      if v_in.shape[0] == 3:
+      if v_in.shape[0] >= 3:
         value_proj = value_proj + v_in[2]
 
     if self.qk_norm:  # XD
@@ -2835,6 +2835,9 @@ class DotProductAttention(base_layer.BaseLayer):
         query_proj, key_proj, value_proj, atten_mask, relative_bias,
         query_vec=query_vec, key_vec=key_vec,  # xd
     )
+    if v_in is not None and v_in.shape[0]==4:
+       encoded = encoded + v_in[3]
+
     if self.o_norm: # mqy 
       if self.o_groupnorm:
         encoded = self.out_norm(encoded) # BNTd group norm
@@ -2851,7 +2854,7 @@ class DotProductAttention(base_layer.BaseLayer):
           assert encoded.shape[-1] == self.hidden_dim
           encoded = self.out_norm(encoded) # BTD->BTD
           encoded = rearrange(encoded, 'B T (N D)-> B N T D', N=num_heads)
-      
+
 
     if self.o_gate_activation_cls:  # XD
       if self.o_gate_rank is None: # mqy

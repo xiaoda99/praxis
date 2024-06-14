@@ -1225,6 +1225,7 @@ class Transformer(base_layer.BaseLayer):
   dynamic_head_dense_type: str = 'qk'
   # dynamic_qk_proj: bool = False
   dynamic_head_seperate_param: bool = False
+  dynamic_token_shift: int = 0
 
 
   # This function can be overridden by subclasses.
@@ -1387,6 +1388,27 @@ class Transformer(base_layer.BaseLayer):
       self.create_variable(f'dynamic_head_dense_conn1_{i}', dyn_head_dense_proj1)
       self.create_variable(f'dynamic_head_dense_conn2a_{i}', dyn_head_dense_proj2a)
       self.create_variable(f'dynamic_head_dense_conn2b_{i}', dyn_head_dense_proj2b)
+    if self.dynamic_token_shift >= 2:
+      self.create_child('token_shift_norm', self.dense_norm_tpl.clone())
+      if self.dynamic_dense_act_cls is not None:
+        self.create_child('token_shift_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
+      std = 1/math.sqrt(self.input_dims) 
+      tf_proj1 = WeightHParams(
+          shape=[self.input_dims, self.dynamic_token_shift], # Dt
+          init=WeightInit.Gaussian(std),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=['data', None],
+      )
+      std2 = 1/math.sqrt(self.dynamic_token_shift)
+      tf_proj2 = WeightHParams(
+          shape=[self.dynamic_token_shift, self.dynamic_token_shift], # tt
+          init=WeightInit.Gaussian(std2),
+          # init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None, None],
+      )
+      self.create_variable('dynamic_tf1', tf_proj1)
+      self.create_variable('dynamic_tf2', tf_proj2)
 
 
   def init_states(self, target_batch_size: int, target_max_length: int) -> None:
@@ -1553,6 +1575,14 @@ class Transformer(base_layer.BaseLayer):
       x_out_normed = self.head_dense_norm(output) if self.use_dense_norm else output
       dense_w_inner = self.head_dense_activation(jnp.einsum('BTD,DK->BTK', x_out_normed, head_dense_proj1))   # GELU activation
       dyn_head_dense_w = jnp.einsum('BTK,KLRN->LBTRN', dense_w_inner, head_dense_proj2) # (L*C+C)BTRN
+
+    if self.dynamic_token_shift >= 2:
+      x_out_normed = self.token_shift_norm(output)
+      tf_inner = self.token_shift_activation(jnp.einsum('BTD,DK->BTK', x_out_normed, self.theta.dynamic_tf1))   # GELU activation
+      tf_w = jnp.einsum('BTK,KF->BTF', tf_inner, self.theta.dynamic_tf2) # BTF
+      assert self.dynamic_token_shift == 2
+      _output = jnp.zeros(output.shape, dtype=output.dtype)
+      ouput = output + _output.at[:, 1:, :].set(output[:,:-1] * tf_w[:,1:,:1]) + output * tf_w[:,:,1:]
 
     return output, atten_probs, dyn_dense_w, dyn_head_dense_w, v_out  # pytype: disable=bad-return-type  # jax-ndarray
 
