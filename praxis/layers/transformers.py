@@ -1356,7 +1356,10 @@ class Transformer(base_layer.BaseLayer):
         self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
     if self.dynamic_head_dense: # TODO: disentangle config between dynamic_dense and dynamic_head_dense  
       i = self.layer_index
-      self.create_child('head_dense_norm', self.dense_norm_tpl.clone())
+      params = self.dense_norm_tpl.clone()
+      params.name = 'head_dense_norm'
+      if hasattr(params, 'dim'): params.dim = self.input_dims
+      self.create_child('head_dense_norm', params)
       if self.dynamic_dense_act_cls is not None:
         self.create_child('head_dense_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
       std = 1/math.sqrt(self.input_dims) 
@@ -1806,6 +1809,7 @@ class StackedTransformer(base_layer.BaseLayer):
   dense_bias_init_method: Optional[str] = 'current_only' # emb_only, current_only, uniform
   dynamic_head_dense: bool = False
   dynamic_head_rank: int = 2
+  head_dw1_norm_on_activation: bool = True
   head_dw1_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
   dynamic_head_dense_type: str = 'qk'
   dynamic_head_seperate_param: bool = False
@@ -1916,6 +1920,7 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.dynamic_head_dense = self.dynamic_head_dense
       p_i.dynamic_head_rank = self.dynamic_head_rank
       p_i.dynamic_head_dense_type = self.dynamic_head_dense_type
+      p_i.tr_atten_tpl.dynamic_head_dense_type = self.dynamic_head_dense_type
       p_i.dynamic_head_seperate_param = self.dynamic_head_seperate_param
       # p_i.dynamic_qk_proj = self.dynamic_qk_proj
 
@@ -2174,12 +2179,15 @@ class StackedTransformer(base_layer.BaseLayer):
         dw1, dw2 = dyn_head_dense_w[:-C], dyn_head_dense_w[-C:] #(L*C+C)BSRN 
         if self.dynamic_head_seperate_param:
           dw1 = rearrange(dw1, '(L C) B S R N -> L C B S R N',C=C)
+          if not self.head_dw1_norm_on_activation: dw1 = self.head_dw1_norm(dw1)
           inner_v = sum(jnp.einsum('BSND,CBSRN->CBSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
-          inner_v = self.head_dw1_norm(inner_v) # rmsnorm
+          if self.head_dw1_norm_on_activation: inner_v = self.head_dw1_norm(inner_v) # rmsnorm
+          inner_v = sum(jnp.einsum('BSND,CBSRN->CBSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
           v_in = jnp.einsum('CBSRD,CBSRN->CBSND', inner_v, dw2)
         else:
+          if not self.head_dw1_norm_on_activation: dw1 = self.head_dw1_norm(dw1)
           inner_v = sum(jnp.einsum('BSND,BSRN->BSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
-          inner_v = self.head_dw1_norm(inner_v) # rmsnorm
+          if self.head_dw1_norm_on_activation: inner_v = self.head_dw1_norm(inner_v) # rmsnorm
           v_in = jnp.einsum('BSRD,CBSRN->CBSND', inner_v, dw2)
     return x_out
 

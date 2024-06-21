@@ -1919,6 +1919,7 @@ class DotProductAttention(base_layer.BaseLayer):
   causal_depthwise_conv1d_tpl: LayerTpl = template_field(CausalDepthwiseConv1D)
   relu2_bias: bool = False #mqy
   linear_attn: bool = False #mqy
+  dynamic_head_dense_type: str = 'qk'
 
   # SPMD partition related params.
   #
@@ -2772,16 +2773,25 @@ class DotProductAttention(base_layer.BaseLayer):
       value_proj = self.dconv_v(value_proj, axis=1, segment_pos=key_segment_pos)
       self._fprop_update_decode_state('value_post_dconv', value_proj)
 
+    dyn_q, dyn_k, dyn_v, dyn_mixedv = None, None, None, None
     if v_in is not None: # CBSNd
-      if self.dynamic_qk_proj:
-        dyn_q = jnp.einsum('BSND,DE->BSNE', v_in[0], self.theta.dynamic_query)
-        dyn_k = jnp.einsum('BSND,DE->BSNE', v_in[1], self.theta.dynamic_key)
-      else:
+      assert self.dynamic_head_dense_type in ['qk', 'qkv', 'qkvo', 'o', 'v']
+      if self.dynamic_head_dense_type == 'qk':
         dyn_q, dyn_k = v_in[0], v_in[1]
-      query_proj = query_proj + dyn_q # BSNd
-      key_proj = key_proj + dyn_k # BSNd
-      if v_in.shape[0] >= 3:
-        value_proj = value_proj + v_in[2]
+      elif self.dynamic_head_dense_type == 'qkv':
+        dyn_q, dyn_k, dyn_v = v_in[0], v_in[1], v_in[2]
+      elif self.dynamic_head_dense_type == 'qkvo':
+        dyn_q, dyn_k, dyn_v, dyn_mixedv = v_in[0], v_in[1], v_in[2], v_in[3]
+      elif self.dynamic_head_dense_type == 'v':
+        dyn_v = v_in[0]
+      elif self.dynamic_head_dense_type == 'o':
+        dyn_mixedv = v_in[0]
+      if self.dynamic_qk_proj:
+        dyn_q = jnp.einsum('BSND,DE->BSNE', dyn_q, self.theta.dynamic_query)
+        dyn_k = jnp.einsum('BSND,DE->BSNE', dyn_k, self.theta.dynamic_key)
+      if dyn_q is not None: query_proj = query_proj + dyn_q # BTNd
+      if dyn_k is not None: key_proj = key_proj + dyn_k # BSNd
+      if dyn_v is not None: value_proj = value_proj + dyn_v #BSNd
 
     if self.qk_norm:  # XD
       query_proj, key_proj = self.q_norm(query_proj), self.k_norm(key_proj)
@@ -2835,8 +2845,8 @@ class DotProductAttention(base_layer.BaseLayer):
         query_proj, key_proj, value_proj, atten_mask, relative_bias,
         query_vec=query_vec, key_vec=key_vec,  # xd
     )
-    if v_in is not None and v_in.shape[0]==4:
-       encoded = encoded + v_in[3]
+    if dyn_mixedv is not None:
+      encoded = encoded + dyn_mixedv 
 
     if self.o_norm: # mqy 
       if self.o_groupnorm:
