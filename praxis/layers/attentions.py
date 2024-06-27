@@ -50,6 +50,9 @@ SplitDimsMapping = pytypes.SplitDimsMapping
 
 PREFIX_DECODE_CACHE = base_layer.PREFIX_DECODE_CACHE
 
+def _rms(x):
+  # Note: under pmap .mean() will produce a local mean, not across all hosts.
+  return (x**2.).mean().astype(jnp.float32)**.5
 
 def limited_context_mask(
     left_context: Union[int, None],
@@ -1920,6 +1923,9 @@ class DotProductAttention(base_layer.BaseLayer):
   relu2_bias: bool = False #mqy
   linear_attn: bool = False #mqy
   dynamic_head_dense_type: str = 'qk'
+  compose_mode: str = 'lp' # mqy ['lp', 'qkvo'] + combinations of ['q', 'k', 'v', 'o']; lp: logits+probs
+  compose_residual: bool = True
+  compose_inner_norm: bool = False
 
   # SPMD partition related params.
   #
@@ -2096,6 +2102,8 @@ class DotProductAttention(base_layer.BaseLayer):
 
     if self.o_norm: # mqy
       self.create_child('out_norm', self.o_norm_tpl.clone()) # epsilon=1e-6, axis=-1 
+    if self.compose_inner_norm:
+      self.create_child('inner_norm', self.o_norm_tpl.clone()) # epsilon=1e-6, axis=-1
     if self.use_rotary_position_emb:
       self._create_rotary_position_emb(
           self.rotary_position_emb_tpl if not self.pythia_rotary else self.pythia_rotary_position_emb_tpl, dim_per_head
@@ -2166,7 +2174,7 @@ class DotProductAttention(base_layer.BaseLayer):
       if self.shared_ov_dim > 0:
         self.create_child('value_scale', scale_qkv_projections(num_shared_heads, True))
 
-    if self.project_probs or self.project_logits:  # TODO: workaround for the mysterious oovmem bug when ONE of project_logits/probs is False
+    if (self.project_probs or self.project_logits) and self.compose_mode == 'lp':  # TODO: workaround for the mysterious oovmem bug when ONE of project_logits/probs is False
       self.create_child('pre_proj', project_logits_or_probs(
         self.cross_head_pre_proj_tpl,
         squeeze_ratio=self.logits_squeeze_ratio,
@@ -2175,7 +2183,7 @@ class DotProductAttention(base_layer.BaseLayer):
         residual=self.logits_residual, absorb_residual=self.logits_absorb_residual))
       if self.query_chunk_size is not None and not self.merge_dw_proj:
         self.create_child('dyn_w_pre_proj', project_dynamic_w(self.dynamic_w_pre_proj_tpl))
-    if self.project_logits or self.project_probs:  # TODO: workaround for the mysterious oovmem bug when ONE of project_logits/probs is False
+    if (self.project_logits or self.project_probs) and self.compose_mode == 'lp':  # TODO: workaround for the mysterious oovmem bug when ONE of project_logits/probs is False
       self.create_child('post_proj', project_logits_or_probs(
         self.cross_head_post_proj_tpl,
         squeeze_ratio=self.probs_squeeze_ratio,
@@ -2188,6 +2196,7 @@ class DotProductAttention(base_layer.BaseLayer):
       self.merge_dw_proj: # and self.query_chunk_size is not None:
       self.create_child('dyn_w_proj', project_dynamic_w(
         self.dynamic_w_post_proj_tpl, merge_projection=True))
+    assert self.compose_mode in ['lp', 'qkvo', 'vo']
 
     if self.relative_bias_tpl is not None:
       relative_bias_p = self.relative_bias_tpl.clone()
@@ -2540,7 +2549,7 @@ class DotProductAttention(base_layer.BaseLayer):
     #   if not self.transpose_logits:
     #     o_gate_proj = jnp.transpose(o_gate_proj, axes=(0,2,1,3)) # BTND->BNTD
 
-    if self.query_chunk_size is None:
+    if self.query_chunk_size is None or self.compose_mode != 'lp':
       encoded, probs = self._atten_context(query, key, value, atten_mask,
         query_vec=query_vec, key_vec=key_vec, rel_bias_mask=rel_bias_mask)
       # self.add_summary(f'prob_entropy', cal_probs_entropy(probs, atten_mask), verbosity=4)
@@ -2698,6 +2707,37 @@ class DotProductAttention(base_layer.BaseLayer):
     encoded = self._shard_bnh(encoded)
     return encoded, probs
 
+  def compose_btnd(
+      self,
+      hid: JTensor, # BTND
+      dw1: JTensor, # BTGIN
+      dw2: JTensor, # BTGIN
+      dd: JTensor): # BTGN
+    
+    def _chunk_compose(_hid, _dw1, _dw2, _dd, residual=True):
+      _hid = rearrange(_hid, 'B T (G N) D -> B T G N D', G=self.num_groups)
+      _ret = _hid if residual else 0
+      _inner = jnp.einsum('BTGND, BTGIN-> BTGID', _hid, _dw1)
+      if self.compose_inner_norm: _inner = self.inner_norm(_inner) # normalize activation 
+      _ret = _ret + jnp.einsum('BTGID,BTGIN->BTGND', _inner, _dw2)
+      _ret = _ret + jnp.einsum('BTGND, BTGN->BTGND', _hid, _dd)
+      _ret = rearrange(_ret, 'B T G N D -> B T (G N) D')
+      return _ret 
+
+    if self.query_chunk_size is not None: 
+      c = self.query_chunk_size
+      ret = jnp.zeros(hid.shape, dtype=hid.dtype)
+      for cidx in range(hid.shape[1]//c):
+        _hid = hid[:,cidx*c:(cidx+1)*c]
+        _dw1 = dw1[:,cidx*c:(cidx+1)*c]
+        _dw2 = dw2[:,cidx*c:(cidx+1)*c]
+        _dd = dd[:,cidx*c:(cidx+1)*c]
+        _ret = _chunk_compose(_hid, _dw1, _dw2, _dd, residual=self.compose_residual)
+        ret = ret.at[:, cidx*c:(cidx+1)*c].set(_ret)
+    else:
+      ret = _chunk_compose(hid,dw1,dw2,dd)
+    return ret 
+
   def __call__(
       self,
       query_vec: JTensor,
@@ -2773,6 +2813,17 @@ class DotProductAttention(base_layer.BaseLayer):
       value_proj = self.dconv_v(value_proj, axis=1, segment_pos=key_segment_pos)
       self._fprop_update_decode_state('value_post_dconv', value_proj)
 
+    if hasattr(self, 'dyn_w_proj') and self.compose_mode != 'lp':
+      pre_proj_dw_args, post_proj_dw_args = self.dyn_w_proj(query_vec, key_vec)
+      ((pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd),
+       (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd)) = pre_proj_dw_args, post_proj_dw_args
+    if 'q' in self.compose_mode:
+      query_proj = self.compose_btnd(query_proj, pre_qw1, pre_qw2, pre_qdd)
+    if 'k' in self.compose_mode:
+      key_proj = self.compose_btnd(key_proj, pre_kw1, pre_kw2, pre_kdd)
+    if 'v' in self.compose_mode:
+      value_proj = self.compose_btnd(value_proj, post_kw1, post_kw2, post_kdd)
+
     dyn_q, dyn_k, dyn_v, dyn_mixedv = None, None, None, None
     if v_in is not None: # CBSNd
       assert self.dynamic_head_dense_type in ['qk', 'qkv', 'qkvo', 'o', 'v']
@@ -2789,9 +2840,18 @@ class DotProductAttention(base_layer.BaseLayer):
       if self.dynamic_qk_proj:
         dyn_q = jnp.einsum('BSND,DE->BSNE', dyn_q, self.theta.dynamic_query)
         dyn_k = jnp.einsum('BSND,DE->BSNE', dyn_k, self.theta.dynamic_key)
-      if dyn_q is not None: query_proj = query_proj + dyn_q # BTNd
-      if dyn_k is not None: key_proj = key_proj + dyn_k # BSNd
-      if dyn_v is not None: value_proj = value_proj + dyn_v #BSNd
+      if dyn_q is not None: 
+        query_proj = query_proj + dyn_q # BTNd
+        # self.add_summary('dyn_q_rms', _rms(dyn_q), verbosity=4)
+        # self.add_summary('query_proj_rms', _rms(query_proj), verbosity=4)
+      if dyn_k is not None: 
+        key_proj = key_proj + dyn_k # BSNd
+        # self.add_summary('dyn_k_rms', _rms(dyn_k), verbosity=4)
+        # self.add_summary('key_proj_rms', _rms(key_proj), verbosity=4)
+      if dyn_v is not None: 
+        value_proj = value_proj + dyn_v #BSNd
+        # self.add_summary('dyn_v_rms', _rms(dyn_v), verbosity=4)
+        # self.add_summary('value_proj_rms', _rms(value_proj), verbosity=4)
 
     if self.qk_norm:  # XD
       query_proj, key_proj = self.q_norm(query_proj), self.k_norm(key_proj)
@@ -2845,9 +2905,15 @@ class DotProductAttention(base_layer.BaseLayer):
         query_proj, key_proj, value_proj, atten_mask, relative_bias,
         query_vec=query_vec, key_vec=key_vec,  # xd
     )
-    if dyn_mixedv is not None:
-      encoded = encoded + dyn_mixedv 
 
+    if 'o' in self.compose_mode:
+      encoded = self.compose_btnd(encoded, post_qw1, post_qw2, post_qdd)
+
+    if dyn_mixedv is not None:
+      # self.add_summary('dyn_o_rms', _rms(dyn_mixedv), verbosity=4)
+      # self.add_summary('o_proj_rms', _rms(encoded), verbosity=4)
+      encoded = encoded + dyn_mixedv 
+      
     if self.o_norm: # mqy 
       if self.o_groupnorm:
         encoded = self.out_norm(encoded) # BNTd group norm
