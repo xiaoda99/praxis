@@ -2196,7 +2196,7 @@ class DotProductAttention(base_layer.BaseLayer):
       self.merge_dw_proj: # and self.query_chunk_size is not None:
       self.create_child('dyn_w_proj', project_dynamic_w(
         self.dynamic_w_post_proj_tpl, merge_projection=True))
-    assert self.compose_mode in ['lp', 'qkvo', 'vo']
+    assert self.compose_mode in ['lp', 'qkvo', 'vo', 'qo']
 
     if self.relative_bias_tpl is not None:
       relative_bias_p = self.relative_bias_tpl.clone()
@@ -2533,7 +2533,10 @@ class DotProductAttention(base_layer.BaseLayer):
     if not (self.shared_qk_dim > 0 and self.float32_logits):  # XD
       query = self._scale_query(query)
 
-    query, key, value = [tensor.transpose(0, 2, 1, 3) for tensor in [query, key, value]] # btnh->bnth
+    if self.num_kv_heads == 1:
+      query = query.transpose(0, 2, 1, 3)
+    else:
+      query, key, value = [tensor.transpose(0, 2, 1, 3) for tensor in [query, key, value]] # btnh->bnth
     # atten_mask = jnp.transpose(atten_mask, (0, 2, 1, 3))  # XD: BNTS->BTNS
     if self.slope_rate is not None:
       rel_bias_mask = jnp.tril(jnp.arange(t)[None,:] - jnp.arange(t)[:,None]) + jnp.triu(jnp.zeros((t,t)) + float("-inf"), k=1) #TS
@@ -2583,7 +2586,7 @@ class DotProductAttention(base_layer.BaseLayer):
         start, stop = i * w, (i + 1) * w
         kv_start = max(0, stop - w - self.window_size) if self.window_size is not None else 0
         _query = query[:, :, start : stop, :]
-        _key, _value = key[:, :, kv_start : stop, :], value[:, :, kv_start : stop, :]
+        _key, _value = key[..., kv_start : stop, :], value[..., kv_start : stop, :] # ... means [:] for MQA and [:,:] for MHA
         if rel_bias_mask is None:
           _rel_bias_mask = None
         else:
