@@ -1215,7 +1215,12 @@ class Transformer(base_layer.BaseLayer):
   layer_index: int = 0 
   dense_conn: bool = False
   dynamic_dense: bool = False
+  dynamic_dense_attn: bool = False
+  dynamic_dense_attn_head_dim: int = 32
+  dynamic_dense_attn_num_heads: int = 8
+  dynamic_dense_attn_q_init: WeightInit = None
   use_dense_norm: bool = False
+  layer_output_norm: bool = False
   dense_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
   dynamic_dense_act_cls: activations_lib.BaseActivation = None # mqy
   comp_dense_diff: bool = False  # mqy; compose difference of hidden state in every layer 
@@ -1338,22 +1343,41 @@ class Transformer(base_layer.BaseLayer):
         # )
         # self.create_variable(f'dense_conn_{i}', dense_w)
       if self.dynamic_dense: # BTD, DL-> BTL
-        std = 1/math.sqrt(self.input_dims) 
-        l = i + 2 
-        dyn_dense_proj1 = WeightHParams(
-            shape=[self.input_dims, l], # DL
-            init=WeightInit.Gaussian(std),
-            mesh_shape=self.mesh_shape, 
-            tensor_split_dims_mapping=['data', None],
-        )
-        dyn_dense_proj2 = WeightHParams(
-            shape=[l, l], # LL
-            init=WeightInit.Constant(0),
-            mesh_shape=self.mesh_shape, 
-            tensor_split_dims_mapping=[None, None],
-        )
-        self.create_variable(f'dynamic_dense_conn1_{i}', dyn_dense_proj1)
-        self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
+        if self.dynamic_dense_attn:
+          std = math.sqrt(2/(self.input_dims+self.dynamic_dense_attn_head_dim)) 
+          q_shape = [self.input_dims, self.dynamic_dense_attn_num_heads, self.dynamic_dense_attn_head_dim]
+          k_shape = [self.input_dims, self.dynamic_dense_attn_num_heads, self.dynamic_dense_attn_head_dim]
+          layer_q_proj = WeightHParams(
+              shape=q_shape, # ENd
+              init=WeightInit.Gaussian(std) if self.dynamic_dense_attn_q_init is None else self.dynamic_dense_attn_q_init,
+              mesh_shape=self.mesh_shape, 
+              tensor_split_dims_mapping=['data', None, None],
+          )
+          layer_k_proj = WeightHParams(
+              shape=k_shape, # ENd
+              init=WeightInit.Gaussian(std),
+              mesh_shape=self.mesh_shape, 
+              tensor_split_dims_mapping=['data', None, None],
+          )
+          self.create_variable('layer_q', layer_q_proj)
+          self.create_variable('layer_k', layer_k_proj)
+        else:
+          std = 1/math.sqrt(self.input_dims) 
+          l = i + 2 
+          dyn_dense_proj1 = WeightHParams(
+              shape=[self.input_dims, l], # DL
+              init=WeightInit.Gaussian(std),
+              mesh_shape=self.mesh_shape, 
+              tensor_split_dims_mapping=['data', None],
+          )
+          dyn_dense_proj2 = WeightHParams(
+              shape=[l, l], # LL
+              init=WeightInit.Constant(0),
+              mesh_shape=self.mesh_shape, 
+              tensor_split_dims_mapping=[None, None],
+          )
+          self.create_variable(f'dynamic_dense_conn1_{i}', dyn_dense_proj1)
+          self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
     if self.dynamic_head_dense: # TODO: disentangle config between dynamic_dense and dynamic_head_dense  
       i = self.layer_index
       params = self.dense_norm_tpl.clone()
@@ -1561,21 +1585,30 @@ class Transformer(base_layer.BaseLayer):
     # generate dynamic dense conn weight
     dyn_dense_w = None
     if self.dynamic_dense:
-      dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{self.layer_index}'),  getattr(self.theta, f'dynamic_dense_conn2_{self.layer_index}'))
-      dense_proj1, dense_proj2 = dyn_dense_proj
       x_out_normed = self.dense_norm(output) if self.use_dense_norm else output
-      if self.dynamic_dense_act_cls is None:
-        dense_proj = dense_proj1 @ dense_proj2 # DL,LL->DL # 1024x25 , 25x25 -> 1024x25
-        dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out_normed, dense_proj)
+      if self.layer_output_norm: output = x_out_normed
+      if self.dynamic_dense_attn:
+        layer_q = jnp.einsum('B T E, E N D -> B T N D', x_out_normed, self.theta.layer_q)
+        layer_k = jnp.einsum('B T E, E N D -> B T N D', x_out_normed, self.theta.layer_k)
+        # scale q
+        layer_q = layer_q / math.sqrt(self.dynamic_dense_attn_head_dim)
+        dyn_dense_w = (layer_q, layer_k)
       else:
-        dense_w_inner = self.dense_activation(jnp.einsum('B T D, D K -> B T K', x_out_normed, dense_proj1))   # GELU activation
-        dyn_dense_w = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
+        dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{self.layer_index}'),  getattr(self.theta, f'dynamic_dense_conn2_{self.layer_index}'))
+        dense_proj1, dense_proj2 = dyn_dense_proj
+        if self.dynamic_dense_act_cls is None:
+          dense_proj = dense_proj1 @ dense_proj2 # DL,LL->DL # 1024x25 , 25x25 -> 1024x25
+          dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out_normed, dense_proj)
+        else:
+          dense_w_inner = self.dense_activation(jnp.einsum('B T D, D K -> B T K', x_out_normed, dense_proj1))   # GELU activation
+          dyn_dense_w = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
     dyn_head_dense_w = None   
     if self.dynamic_head_dense:
       dyn_head_dense_proj = (getattr(self.theta, f'dynamic_head_dense_conn1_{self.layer_index}'),  getattr(self.theta, f'dynamic_head_dense_conn2a_{self.layer_index}'), getattr(self.theta, f'dynamic_head_dense_conn2b_{self.layer_index}'))
       head_dense_proj1, head_dense_proj2a, head_dense_proj2b = dyn_head_dense_proj
       head_dense_proj2 = jnp.concatenate([head_dense_proj2a, head_dense_proj2b], axis=1) # KLRN, KCRN->K(L+C)RN
       x_out_normed = self.head_dense_norm(output) if self.use_dense_norm else output
+      if self.layer_output_norm: output = x_out_normed
       dense_w_inner = self.head_dense_activation(jnp.einsum('BTD,DK->BTK', x_out_normed, head_dense_proj1))   # GELU activation
       dyn_head_dense_w = jnp.einsum('BTK,KLRN->LBTRN', dense_w_inner, head_dense_proj2) # (L*C+C)BTRN
 
@@ -1802,7 +1835,14 @@ class StackedTransformer(base_layer.BaseLayer):
   pre_compute_atten_mask: bool = True
   dense_conn: bool = False
   dynamic_dense: bool = False
+  dynamic_dense_attn: bool = False 
+  dynamic_dense_attn_linear: bool = True
+  dynamic_dense_attn_head_dim: int = 32
+  dynamic_dense_attn_num_heads: int = 8
+  dynamic_dense_attn_scale: Optional[float] = 0.001 # init value
+  dynamic_dense_attn_q_init: WeightInit = None
   use_dense_norm: bool = False
+  layer_output_norm: bool = False
   dense_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
   dynamic_dense_act_cls: activations_lib.BaseActivation = None # mqy
   comp_dense_diff: bool = False  # mqy; compose difference of hidden state in every layer 
@@ -1911,9 +1951,14 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.dynamic_dense = self.dynamic_dense
       p_i.dense_bias_init_method = self.dense_bias_init_method
       p_i.comp_dense_diff = self.comp_dense_diff
+      p_i.dynamic_dense_attn = self.dynamic_dense_attn
+      p_i.dynamic_dense_attn_head_dim = self.dynamic_dense_attn_head_dim
+      p_i.dynamic_dense_attn_num_heads = self.dynamic_dense_attn_num_heads
+      p_i.dynamic_dense_attn_q_init = self.dynamic_dense_attn_q_init
 
       # shared hyper-params by dense and head_dense
       p_i.use_dense_norm = self.use_dense_norm
+      p_i.layer_output_norm = self.layer_output_norm
       p_i.dynamic_dense_act_cls = self.dynamic_dense_act_cls
 
       # head dense params
@@ -2005,6 +2050,27 @@ class StackedTransformer(base_layer.BaseLayer):
             collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
         )
         self.create_variable(f'dense_conn_{i}', dense_w)
+      if self.dynamic_dense_attn:
+        self.create_child('emb_norm', self.dense_norm_tpl.clone())
+        if self.dynamic_dense_attn_scale is not None:
+          init_v = self.dynamic_dense_attn_scale # 0.001
+          dw_scale = WeightHParams(
+            shape=[self.num_layers],
+            init=WeightInit.Constant(init_v), # L
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=[None],
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
+          )
+          self.create_variable('dw_scale', dw_scale)
+        std = math.sqrt(2/(self.model_dims+self.dynamic_dense_attn_head_dim))
+        k_shape = [self.model_dims, self.dynamic_dense_attn_num_heads, self.dynamic_dense_attn_head_dim]
+        layer_k_proj = WeightHParams(
+            shape=k_shape, # ENd
+            init=WeightInit.Gaussian(std),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=['data', None, None],
+        )
+        self.create_variable('layer_k', layer_k_proj)
         # if self.dynamic_dense: # BTD, DL-> BTL
         #   std = 1/math.sqrt(self.model_dims) 
         #   l = i + 2 
@@ -2136,6 +2202,9 @@ class StackedTransformer(base_layer.BaseLayer):
     
     if self.dense_conn:
       hids = [x_out]
+      if self.dynamic_dense_attn:
+        layer_k = jnp.einsum('B T E, E N D -> B T N D', self.emb_norm(x_out), self.theta.layer_k)
+        layer_ks = [layer_k]
     v_in = None
     v_outs = []
     for i in range(self.num_layers):
@@ -2162,14 +2231,32 @@ class StackedTransformer(base_layer.BaseLayer):
         else:
           hids.append(x_out)
         if self.dynamic_dense:
-          # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out, dyn_dense_proj) 
-          # dyn_dense_w = base_layer.maybe_shard(dyn_dense_w, ['data', None, None], self.mesh_axis_names)
-          assert len(hids) == dense_w.shape[0] and dyn_dense_w is not None and len(hids) == dyn_dense_w.shape[-1]
-          self.add_summary(f'dynamic_dense_w_max_{i}', dyn_dense_w.max(), verbosity=3)
-          self.add_summary(f'dynamic_dense_w_mean_{i}', dyn_dense_w.mean(), verbosity=3)
-          self.add_summary(f'dynamic_dense_w_min_{i}', dyn_dense_w.min(), verbosity=3)
-          x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j][..., None]) * hids[j] for j in range(i+2)]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
-          # x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j:j+1]) * hids[j] for j in range(len(hids))]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
+          if self.dynamic_dense_attn:
+            layer_q, layer_k = dyn_dense_w # BTND
+            layer_ks.append(layer_k) 
+            if self.dynamic_dense_attn_linear:
+              # linear attention
+              dw = jnp.stack([jnp.einsum('BTND, BTND -> BT', layer_q, k) for k in layer_ks]) # LBT
+            else:
+              # softmax attention TODO: scale probs
+              dw = jnp.stack([jnp.einsum('BTND, BTND -> BTN', layer_q, k) for k in layer_ks]) # LBTN
+              dw = jax.nn.softmax(dw, axis=0).mean(-1) # LBTN-> LBT
+              if self.dynamic_dense_attn_scale is not None: 
+                dw = dw * self.theta.dw_scale[i] # LBT, 1 -> LBT
+                self.add_summary(f'dynamic_dense_scale_{i}', self.theta.dw_scale[i], verbosity=3)
+            self.add_summary(f'dynamic_dense_w_max_{i}', dw.max(), verbosity=3)
+            self.add_summary(f'dynamic_dense_w_mean_{i}', dw.mean(), verbosity=3)
+            self.add_summary(f'dynamic_dense_w_min_{i}', dw.min(), verbosity=3)
+            x_out = sum([(dense_w[j] + dw[j][..., None]) * hids[j] for j in range(i+2)]) # (L + LBT),LBTD -> BTD
+          else:
+            # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out, dyn_dense_proj) 
+            # dyn_dense_w = base_layer.maybe_shard(dyn_dense_w, ['data', None, None], self.mesh_axis_names)
+            assert len(hids) == dense_w.shape[0] and dyn_dense_w is not None and len(hids) == dyn_dense_w.shape[-1]
+            self.add_summary(f'dynamic_dense_w_max_{i}', dyn_dense_w.max(), verbosity=3)
+            self.add_summary(f'dynamic_dense_w_mean_{i}', dyn_dense_w.mean(), verbosity=3)
+            self.add_summary(f'dynamic_dense_w_min_{i}', dyn_dense_w.min(), verbosity=3)
+            x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j][..., None]) * hids[j] for j in range(i+2)]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
+            # x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j:j+1]) * hids[j] for j in range(len(hids))]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
         else:
           x_out = sum([dense_w[j] * hids[j] for j in range(len(hids))])
       if self.dynamic_head_dense:
