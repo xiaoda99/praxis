@@ -1903,6 +1903,8 @@ class DotProductAttention(base_layer.BaseLayer):
   rotary_position_emb_tpl: Optional[LayerTpl] = template_field(
       embedding_softmax.RotaryPositionalEmbedding
   )
+  dynamic_position: bool = False
+  dynamic_position_activation_cls: activations_lib.BaseActivation = activations_lib.Sigmoid
   pythia_rotary_position_emb_tpl: Optional[LayerTpl] = template_field(
       embedding_softmax.PythiaRotaryPositionalEmbedding
   )
@@ -2099,6 +2101,15 @@ class DotProductAttention(base_layer.BaseLayer):
             init=WeightInit.Gaussian(math.sqrt(1.0 / dim_per_head)))
       self.create_variable('dynamic_query', dynamic_query)
       self.create_variable('dynamic_key', dynamic_key)
+    
+    if self.dynamic_position:
+      assert self.num_kv_heads != 1
+      dynamic_pos_proj = WeightHParams(shape=[self.input_dim, self.num_heads], # D,N
+      mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['data', 'mdl'],
+      init=WeightInit.Gaussian(math.sqrt(1.0 / (self.input_dim + self.num_heads))))
+      self.create_variable('dynamic_pos', dynamic_pos_proj)
+      if self.dynamic_position_activation_cls is not None:
+        self.create_child('dynamic_pos_activation',  pax_fiddle.Config(self.dynamic_position_activation_cls).clone()) # sigmoid
 
     if self.o_norm: # mqy
       self.create_child('out_norm', self.o_norm_tpl.clone()) # epsilon=1e-6, axis=-1 
@@ -2865,11 +2876,16 @@ class DotProductAttention(base_layer.BaseLayer):
     # Apply rotary position embeddings.
     # Paper: https://arxiv.org/abs/2104.09864.
     if self.use_rotary_position_emb:
-      query_proj = self.rotary_position_emb(query_proj, query_segment_pos)
+      dyn_pos = None
+      if self.dynamic_position:
+        dyn_pos = jnp.einsum('BSD,DN->BSN', key_vec, self.theta.dynamic_pos)
+        if self.dynamic_position_activation_cls is not None: dyn_pos = self.dynamic_pos_activation(dyn_pos) # sigmoid 0-1
+        dyn_pos = jnp.cumsum(dyn_pos, axis=1) # BSN, cumsum along S dimension 
+      query_proj = self.rotary_position_emb(query_proj, dyn_pos if self.dynamic_position else query_segment_pos)
       if self.num_kv_heads == 1:
         key_shape = key_proj.shape
         key_proj = jnp.expand_dims(key_proj, axis=-2)  # [B, S, H] -> [B, S, N(1), H]
-      key_proj = self.rotary_position_emb(key_proj, key_segment_pos)
+      key_proj = self.rotary_position_emb(key_proj, dyn_pos if self.dynamic_position else key_segment_pos)
       if self.num_kv_heads == 1: key_proj = jnp.reshape(key_proj, key_shape)
       # query_proj, key_proj = query_proj.astype(jnp.float32), key_proj.astype(jnp.float32)  # XD
       self._fprop_update_decode_state('key_post_rotary_pos_emb', key_proj)

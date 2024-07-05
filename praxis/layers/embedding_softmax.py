@@ -1115,7 +1115,10 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
     if position is None:
       seq_length = inputs.shape[1]
       position = jnp.arange(seq_length, dtype=jnp.float32)[jnp.newaxis, :]
-    position = position[:, :, jnp.newaxis, jnp.newaxis]
+    if len(position.shape) == 2: #BS
+      position = position[:, :, jnp.newaxis, jnp.newaxis]
+    elif len(position.shape) == 3: #BSN
+      position = position[:, :, :, jnp.newaxis]
     timescale = timescale[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
     sinusoid_inp = position / timescale
     sin = jnp.sin(sinusoid_inp)
