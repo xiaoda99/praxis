@@ -1899,12 +1899,19 @@ class DotProductAttention(base_layer.BaseLayer):
   # TODO(pax-dev): merge use_rotary_position_emb and rotary_position_emb_tpl
   # by initializing rotary_position_emb_tpl = None.
   use_rotary_position_emb: bool = False
+  rotary_position_emb_base: int = 10_000
   pythia_rotary: bool = False
   rotary_position_emb_tpl: Optional[LayerTpl] = template_field(
       embedding_softmax.RotaryPositionalEmbedding
   )
   dynamic_position: bool = False
+  dynamic_position_mlp: bool = False
+  dynamic_position_mlp_activation_cls: activations_lib.BaseActivation = activations_lib.GELU
   dynamic_position_activation_cls: activations_lib.BaseActivation = activations_lib.Sigmoid
+  dynamic_position_scale: float = 1
+  dynamic_position_bias: float = 0
+  dynamic_position_bias_learnable: bool = False 
+  dynamic_position_act_bias: float = 0  
   pythia_rotary_position_emb_tpl: Optional[LayerTpl] = template_field(
       embedding_softmax.PythiaRotaryPositionalEmbedding
   )
@@ -1972,6 +1979,7 @@ class DotProductAttention(base_layer.BaseLayer):
     pos_emb_p = layer_tpl.clone()
     pos_emb_p.embedding_dims = dim_per_head
     pos_emb_p.cast_as_fprop_dtype = self.cast_rotary_position_emb
+    pos_emb_p.max_timescale = self.rotary_position_emb_base
     self.create_child(name, pos_emb_p)  # XD: 'rotary_position_emb' -> name
 
   def setup(self) -> None:
@@ -2108,8 +2116,19 @@ class DotProductAttention(base_layer.BaseLayer):
       mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['data', 'mdl'],
       init=WeightInit.Gaussian(math.sqrt(1.0 / (self.input_dim + self.num_heads))))
       self.create_variable('dynamic_pos', dynamic_pos_proj)
+      if self.dynamic_position_mlp:
+        dynamic_pos_proj2 = WeightHParams(shape=[self.num_heads, self.num_heads], # N,N
+        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None],
+        init=WeightInit.Constant(0.))
+        self.create_variable('dynamic_pos2', dynamic_pos_proj2)
+        self.create_child('dynamic_pos_mlp_activation',  pax_fiddle.Config(self.dynamic_position_mlp_activation_cls).clone()) # gelu
       if self.dynamic_position_activation_cls is not None:
         self.create_child('dynamic_pos_activation',  pax_fiddle.Config(self.dynamic_position_activation_cls).clone()) # sigmoid
+      if self.dynamic_position_bias_learnable:
+        dynamic_pos_bias = WeightHParams(shape=[self.num_heads], # N
+        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl'],
+        init=WeightInit.Uniform(0.5)) # [-0.5,0.5]
+        self.create_variable('dynamic_pos_bias', dynamic_pos_bias)
 
     if self.o_norm: # mqy
       self.create_child('out_norm', self.o_norm_tpl.clone()) # epsilon=1e-6, axis=-1 
@@ -2879,7 +2898,16 @@ class DotProductAttention(base_layer.BaseLayer):
       dyn_pos = None
       if self.dynamic_position:
         dyn_pos = jnp.einsum('BSD,DN->BSN', key_vec, self.theta.dynamic_pos)
-        if self.dynamic_position_activation_cls is not None: dyn_pos = self.dynamic_pos_activation(dyn_pos) # sigmoid 0-1
+        if self.dynamic_position_mlp:
+          dyn_pos = self.dynamic_pos_mlp_activation(dyn_pos) # gelu
+          dyn_pos = jnp.einsum('BSN,NN->BSN', dyn_pos, self.theta.dynamic_pos2) # zero init 
+        if self.dynamic_position_activation_cls is not None: dyn_pos = self.dynamic_pos_activation(dyn_pos/self.dynamic_position_scale - self.dynamic_position_act_bias) * self.dynamic_position_scale # sigmoid [0,1] * scale
+        position_bias = self.dynamic_position_bias if not self.dynamic_position_bias_learnable else self.theta.dynamic_pos_bias[None,None,:] + 0.5 
+        dyn_pos = dyn_pos + position_bias
+        self.add_summary('dynamic_pos_max', dyn_pos.max(), verbosity=3)
+        self.add_summary('dynamic_pos_mean', dyn_pos.mean(), verbosity=3)
+        self.add_summary('dynamic_pos_min', dyn_pos.min(), verbosity=3)
+        self.add_summary('dynamic_pos_std', dyn_pos.std(), verbosity=3)
         dyn_pos = jnp.cumsum(dyn_pos, axis=1) # BSN, cumsum along S dimension 
       query_proj = self.rotary_position_emb(query_proj, dyn_pos if self.dynamic_position else query_segment_pos)
       if self.num_kv_heads == 1:
