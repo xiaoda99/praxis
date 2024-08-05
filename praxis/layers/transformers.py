@@ -1841,6 +1841,8 @@ class StackedTransformer(base_layer.BaseLayer):
   dynamic_dense_attn_num_heads: int = 8
   dynamic_dense_attn_scale: Optional[float] = 0.001 # init value
   dynamic_dense_attn_q_init: WeightInit = None
+  dynamic_dense_attn_uniform: bool = False
+  dynamic_dense_attn_layer_pos: bool = False
   use_dense_norm: bool = False
   layer_output_norm: bool = False
   dense_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
@@ -2071,6 +2073,16 @@ class StackedTransformer(base_layer.BaseLayer):
             tensor_split_dims_mapping=['data', None, None],
         )
         self.create_variable('layer_k', layer_k_proj)
+        if self.dynamic_dense_attn_layer_pos:
+          std = math.sqrt(1/(self.dynamic_dense_attn_head_dim))
+          layer_pos_emb = WeightHParams(
+            shape=[self.num_layers+1, self.dynamic_dense_attn_head_dim], # (L+1)*d
+            init=WeightInit.Gaussian(std),
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=[None, None],
+            # collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
+          )
+          self.create_variable('layer_pos_emb', layer_pos_emb)
         # if self.dynamic_dense: # BTD, DL-> BTL
         #   std = 1/math.sqrt(self.model_dims) 
         #   l = i + 2 
@@ -2239,14 +2251,19 @@ class StackedTransformer(base_layer.BaseLayer):
               dw = jnp.stack([jnp.einsum('BTND, BTND -> BT', layer_q, k) for k in layer_ks]) # LBT
             else:
               # softmax attention TODO: scale probs
-              dw = jnp.stack([jnp.einsum('BTND, BTND -> BTN', layer_q, k) for k in layer_ks]) # LBTN
+              if self.dynamic_dense_attn_layer_pos: 
+                dw = jnp.stack([jnp.einsum('BTND, BTND -> BTN', layer_q+self.theta.layer_pos_emb[i+1], k+self.theta.layer_pos_emb[_j]) for _j, k in enumerate(layer_ks)]) # LBTN
+              else:
+                dw = jnp.stack([jnp.einsum('BTND, BTND -> BTN', layer_q, k) for k in layer_ks]) # LBTN
               dw = jax.nn.softmax(dw, axis=0).mean(-1) # LBTN-> LBT
+              if self.dynamic_dense_attn_uniform: dw = dw - 1/(i+2) 
               if self.dynamic_dense_attn_scale is not None: 
                 dw = dw * self.theta.dw_scale[i] # LBT, 1 -> LBT
                 self.add_summary(f'dynamic_dense_scale_{i}', self.theta.dw_scale[i], verbosity=3)
             self.add_summary(f'dynamic_dense_w_max_{i}', dw.max(), verbosity=3)
             self.add_summary(f'dynamic_dense_w_mean_{i}', dw.mean(), verbosity=3)
             self.add_summary(f'dynamic_dense_w_min_{i}', dw.min(), verbosity=3)
+            self.add_summary(f'dynamic_dense_w_std_{i}', dw.std(), verbosity=3)
             x_out = sum([(dense_w[j] + dw[j][..., None]) * hids[j] for j in range(i+2)]) # (L + LBT),LBTD -> BTD
           else:
             # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out, dyn_dense_proj) 
