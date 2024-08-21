@@ -1215,6 +1215,10 @@ class Transformer(base_layer.BaseLayer):
   layer_index: int = 0 
   dense_conn: bool = False
   dynamic_dense: bool = False
+  dynamic_dense_num_groups : int = 1
+  dynamic_dense_ov: bool = False
+  dynamic_dense_ov_init: str = 'gauss+gauss' # ['gauss+gauss', 'gauss+const0']
+  dynamic_dense_ov_outer_loop: bool = False
   use_dense_norm: bool = False
   dense_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
   dynamic_dense_act_cls: activations_lib.BaseActivation = None # mqy
@@ -1340,6 +1344,7 @@ class Transformer(base_layer.BaseLayer):
       if self.dynamic_dense: # BTD, DL-> BTL
         std = 1/math.sqrt(self.input_dims) 
         l = i + 2 
+        l = l * self.dynamic_dense_num_groups
         dyn_dense_proj1 = WeightHParams(
             shape=[self.input_dims, l], # DL
             init=WeightInit.Gaussian(std),
@@ -1354,6 +1359,30 @@ class Transformer(base_layer.BaseLayer):
         )
         self.create_variable(f'dynamic_dense_conn1_{i}', dyn_dense_proj1)
         self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
+
+        if self.dynamic_dense_ov:
+          ov_rank = 64 
+          std = 1/math.sqrt(self.input_dims)
+          assert self.dynamic_dense_ov_init in ['gauss+gauss', 'gauss+const0']
+          if self.dynamic_dense_ov_init == 'gauss+gauss':
+            init_method = WeightInit.Gaussian(std) 
+          elif self.dynamic_dense_ov_init == 'gauss+const0':
+            init_method = WeightInit.Constant(0)
+          dyn_ov1 = WeightHParams(
+            shape=[self.input_dims, ov_rank], # DR
+            init=WeightInit.Gaussian(std),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=['data', None],
+          )
+          dyn_ov2 = WeightHParams(
+            shape=[ov_rank, self.input_dims], # RD
+            init=init_method,
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=[None, 'data'],
+          )
+          self.create_variable('dynamic_dense_ov1', dyn_ov1)
+          self.create_variable('dynamic_dense_ov2', dyn_ov2)
+
     if self.dynamic_head_dense: # TODO: disentangle config between dynamic_dense and dynamic_head_dense  
       i = self.layer_index
       params = self.dense_norm_tpl.clone()
@@ -1570,6 +1599,14 @@ class Transformer(base_layer.BaseLayer):
       else:
         dense_w_inner = self.dense_activation(jnp.einsum('B T D, D K -> B T K', x_out_normed, dense_proj1))   # GELU activation
         dyn_dense_w = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
+
+    if self.dynamic_dense_ov:
+      if not self.dynamic_dense_ov_outer_loop:
+        inner = jnp.einsum('B T D, D R -> B T R', output, self.theta.dynamic_dense_ov1)
+        output = output + jnp.einsum('B T R, R D -> B T D', inner, self.theta.dynamic_dense_ov2)
+        if self.dynamic_dense and self.dynamic_dense_ov_outer_loop: 
+          dyn_dense_w = (dyn_dense_w, self.theta.dynamic_dense_ov1, self.theta.dynamic_dense_ov2)
+
     dyn_head_dense_w = None   
     if self.dynamic_head_dense:
       dyn_head_dense_proj = (getattr(self.theta, f'dynamic_head_dense_conn1_{self.layer_index}'),  getattr(self.theta, f'dynamic_head_dense_conn2a_{self.layer_index}'), getattr(self.theta, f'dynamic_head_dense_conn2b_{self.layer_index}'))
@@ -1802,6 +1839,10 @@ class StackedTransformer(base_layer.BaseLayer):
   pre_compute_atten_mask: bool = True
   dense_conn: bool = False
   dynamic_dense: bool = False
+  dynamic_dense_num_groups : int = 1
+  dynamic_dense_ov: bool = False
+  dynamic_dense_ov_init: str = 'gauss+gauss' # ['gauss+gauss', 'gauss+const0']
+  dynamic_dense_ov_outer_loop: bool = False
   use_dense_norm: bool = False
   dense_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
   dynamic_dense_act_cls: activations_lib.BaseActivation = None # mqy
@@ -1909,6 +1950,10 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.layer_index = i
       p_i.dense_conn = self.dense_conn
       p_i.dynamic_dense = self.dynamic_dense
+      p_i.dynamic_dense_num_groups = self.dynamic_dense_num_groups
+      p_i.dynamic_dense_ov = self.dynamic_dense_ov
+      p_i.dynamic_dense_ov_init = self.dynamic_dense_ov_init
+      p_i.dynamic_dense_ov_outer_loop = self.dynamic_dense_ov_outer_loop
       p_i.dense_bias_init_method = self.dense_bias_init_method
       p_i.comp_dense_diff = self.comp_dense_diff
 
@@ -2164,12 +2209,28 @@ class StackedTransformer(base_layer.BaseLayer):
         if self.dynamic_dense:
           # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out, dyn_dense_proj) 
           # dyn_dense_w = base_layer.maybe_shard(dyn_dense_w, ['data', None, None], self.mesh_axis_names)
-          assert len(hids) == dense_w.shape[0] and dyn_dense_w is not None and len(hids) == dyn_dense_w.shape[-1]
+          ov = None
+          if isinstance(dyn_dense_w, tuple):
+            dyn_dense_w, ov = dyn_dense_w[0], dyn_dense_w[2:] # ov = ov1, ov2
+          assert len(hids) == dense_w.shape[0] and dyn_dense_w is not None and len(hids) == dyn_dense_w.shape[-1] / self.dynamic_dense_num_groups
           self.add_summary(f'dynamic_dense_w_max_{i}', dyn_dense_w.max(), verbosity=3)
           self.add_summary(f'dynamic_dense_w_mean_{i}', dyn_dense_w.mean(), verbosity=3)
           self.add_summary(f'dynamic_dense_w_min_{i}', dyn_dense_w.min(), verbosity=3)
-          x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j][..., None]) * hids[j] for j in range(i+2)]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
-          # x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j:j+1]) * hids[j] for j in range(len(hids))]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
+          def _ov_transform(_x, ov):
+            if ov is None: # identity transformation
+              return _x 
+            else: # low_rank transformation
+              ov1, ov2 = ov 
+              _layer = self.x_layers[i]
+              _x_normed = _layer.dense_norm(_x) if _layer.use_dense_norm else _x
+              _inner = jnp.einsum('B T D, D R -> B T R', _x_normed, ov1)
+              return _x + jnp.einsum('B T R, R D -> B T D', _inner, ov2)
+          dyn_dense_w = rearrange(dyn_dense_w, 'B T (L G) -> B T L G', G=self.dynamic_dense_num_groups)
+          if self.dynamic_dense_num_groups == 1:
+            x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j]) * _ov_transform(hids[j], ov) for j in range(i+2)]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
+          else:
+            group_dim = self.model_dims//self.dynamic_dense_num_groups
+            x_out = sum([jnp.repeat(dense_w[j] + dyn_dense_w[:,:,j], group_dim, axis=-1) * _ov_transform(hids[j], ov) for j in range(i+2)]) # 1 + BTLG -> BTLG -> BTL(Gd) repeat ;BTLD,LBTD-> BTD
         else:
           x_out = sum([dense_w[j] * hids[j] for j in range(len(hids))])
       if self.dynamic_head_dense:
