@@ -42,6 +42,7 @@ from praxis.layers import repeats
 from praxis.layers import stats
 from praxis.layers import stochastics
 from praxis.layers import GELU
+from praxis.layers import rnn_cell
 
 NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
@@ -1235,6 +1236,7 @@ class Transformer(base_layer.BaseLayer):
   laurel_lr: bool = False
   laurel_rw: bool = False
   laurel_normed_residual: bool = False
+  gating_mlp_input: Optional[str] = None # ['sigmoid', 'linear', 'attn_out_depend+sigmoid'] (a, 1-a) or (a,b) 
 
 
 
@@ -1409,6 +1411,16 @@ class Transformer(base_layer.BaseLayer):
         tensor_split_dims_mapping=['data', None],
         )
         self.create_variable('dynamic_dense_ov3', dyn_ov_gate)
+
+    if self.gating_mlp_input:
+      res_attn_w = WeightHParams(
+        shape=[self.input_dims, 2], # D2
+        init=WeightInit.Constant(0),
+        mesh_shape=self.mesh_shape, 
+        tensor_split_dims_mapping=['data', None],
+      )
+      self.create_variable('res_attn_w', res_attn_w)
+      self.create_child('gating_mlp_norm', self.dense_norm_tpl.clone())
 
 
 
@@ -1610,6 +1622,20 @@ class Transformer(base_layer.BaseLayer):
 
       if self.norm_policy == 'post_skip':
         atten_output = self.cross_layer_norm(atten_output)
+
+    # gating mlp inputs
+    if self.gating_mlp_input:
+      if 'attn_out_depend' in self.gating_mlp_input:
+        _input = atten_output
+      else: 
+        _input = inputs
+      res_attn_w = jnp.einsum('B T D, D R -> B T R', self.gating_mlp_norm(_input), self.theta.res_attn_w)
+      if 'linear' in self.gating_mlp_input:
+        a, b = res_attn_w[:,:,:1]+1, res_attn_w[:,:,1:2]+1
+      elif 'sigmoid' in self.gating_mlp_input:
+        a = jax.nn.sigmoid(res_attn_w[:,:,:1]) * 2
+        b = 2 - a
+      atten_output = inputs * a + (atten_output - inputs) * b 
 
     # Apply FFN layer
     output = self.ff_layer(atten_output, paddings=paddings) \
@@ -1884,6 +1910,7 @@ class StackedTransformer(base_layer.BaseLayer):
   pre_compute_atten_mask: bool = True
   dense_conn: bool = False
   dynamic_dense: bool = False
+  dynamic_dense_normalized: bool = False # softmax dynamic dense weight along the Layer dim 
   dynamic_dense_num_groups : int = 1
   dynamic_dense_ov: bool = False
   dynamic_dense_ov_gate: bool = False
@@ -1906,6 +1933,8 @@ class StackedTransformer(base_layer.BaseLayer):
   laurel_lr: bool = False
   laurel_rw: bool = False
   laurel_normed_residual: bool = False
+  use_recurrent_layer_mixing: bool = False
+  recurrent_layer_mixing_tpl: LayerTpl = template_field(rnn_cell.RecurrentLayerMix) # rnn, lstm 
 
 
 
@@ -2090,15 +2119,17 @@ class StackedTransformer(base_layer.BaseLayer):
       # if self.dynamic_dense_act_cls is not None:
       #   self.create_child('dense_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
         # assert isinstance(self.dynamic_dense_act_cls, GELU)
-      assert self.dense_bias_init_method in ['current_only', 'emb_only', 'uniform']
+      assert self.dense_bias_init_method in ['current_only', 'emb_only', 'uniform', 'current_only_softmax']
       b_init_method = self.dense_bias_init_method if not self.comp_dense_diff else 'uniform' # use uniform init with comp_dense_diff
       for i in range(self.num_layers):
         if b_init_method == 'uniform':
           init_v = [1] * (i+2) 
         elif b_init_method == 'current_only':
           init_v = [0] * (i+1) + [1] 
-        elif  b_init_method == 'emb_only':
+        elif b_init_method == 'emb_only':
           init_v = [1] + [0] * (i+1) 
+        elif b_init_method == 'current_only_softmax':
+          init_v = [0] * (i+1) + [5]
         dense_w = WeightHParams(
             shape=[len(init_v)],
             init=WeightInit.Constant(init_v), # L
@@ -2124,6 +2155,9 @@ class StackedTransformer(base_layer.BaseLayer):
         #   )
         #   self.create_variable(f'dynamic_dense_conn1_{i}', dyn_dense_proj1)
         #   self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
+
+    if self.use_recurrent_layer_mixing:
+      self.create_child('layer_mix', self.recurrent_layer_mixing_tpl.clone())
 
     if self.input_dropout_prob > 0.0:
       self.create_child(
@@ -2238,6 +2272,11 @@ class StackedTransformer(base_layer.BaseLayer):
     
     if self.dense_conn:
       hids = [x_out]
+
+    if self.use_recurrent_layer_mixing:
+      h_0 = jnp.zeros(x_out.shape, dtype=self.fprop_dtype)
+      cell_0 = jnp.zeros(x_out.shape, dtype=self.fprop_dtype)
+      layer_hid, x_out, cell = self.layer_mix(x_out, h_0, cell_0)
     v_in = None
     v_outs = []
     for i in range(self.num_layers):
@@ -2257,6 +2296,10 @@ class StackedTransformer(base_layer.BaseLayer):
           v_in,
       )
       x_out = checkpoint_name(x_out, 'transformer_layer_out')
+
+      if self.use_recurrent_layer_mixing:
+        layer_hid, x_out, cell = self.layer_mix(x_out, layer_hid, cell)
+
       if self.dense_conn:
         dense_w = getattr(self.theta, f'dense_conn_{i}')
         if self.comp_dense_diff:
@@ -2272,9 +2315,6 @@ class StackedTransformer(base_layer.BaseLayer):
           if self.dynamic_dense_ov:
             assert ov is not None
           assert len(hids) == dense_w.shape[0] and dyn_dense_w is not None and len(hids) == dyn_dense_w.shape[-1] / self.dynamic_dense_num_groups
-          self.add_summary(f'dynamic_dense_w_max_{i}', dyn_dense_w.max(), verbosity=3)
-          self.add_summary(f'dynamic_dense_w_mean_{i}', dyn_dense_w.mean(), verbosity=3)
-          self.add_summary(f'dynamic_dense_w_min_{i}', dyn_dense_w.min(), verbosity=3)
           def _ov_transform(_x, ov):
             if ov is None: # identity transformation
               return _x 
@@ -2294,12 +2334,19 @@ class StackedTransformer(base_layer.BaseLayer):
           else:
             ov_before, ov_after = ov, None
           if self.dynamic_dense_num_groups == 1:
-            x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j]) * _ov_transform(hids[j], ov_before) for j in range(i+2)]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
+            if self.dynamic_dense_normalized:
+              dyn_dense_w = jax.nn.softmax(dyn_dense_w + jnp.expand_dims(dense_w, 1), axis=2) # BTLG + LG-> BTLG 
+              x_out = sum([dyn_dense_w[:,:,j] * _ov_transform(hids[j], ov_before) for j in range(i+2)])
+            else:
+              x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j]) * _ov_transform(hids[j], ov_before) for j in range(i+2)]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
           else:
             group_dim = self.model_dims//self.dynamic_dense_num_groups
             x_out = sum([jnp.repeat(dense_w[j] + dyn_dense_w[:,:,j], group_dim, axis=-1) * _ov_transform(hids[j], ov_before) for j in range(i+2)]) # 1 + BTLG -> BTLG -> BTL(Gd) repeat ;BTLD,LBTD-> BTD
           if self.dynamic_dense_ov_after_merge:
             x_out = _ov_transform(x_out, ov_after)
+          self.add_summary(f'dynamic_dense_w_max_{i}', dyn_dense_w.max(), verbosity=3)
+          self.add_summary(f'dynamic_dense_w_mean_{i}', dyn_dense_w.mean(), verbosity=3)
+          self.add_summary(f'dynamic_dense_w_min_{i}', dyn_dense_w.min(), verbosity=3)
         else:
           x_out = sum([dense_w[j] * hids[j] for j in range(len(hids))])
       if self.dynamic_head_dense:

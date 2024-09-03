@@ -21,10 +21,20 @@ from praxis import asserts
 from praxis import base_layer
 from praxis import py_utils
 from praxis import pytypes
+from praxis import pax_fiddle
+from praxis.layers import linears
+from praxis.layers import activations as activations_lib
+from praxis.layers import normalizations
+
+from typing import Tuple
+
 
 NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
 WeightHParams = base_layer.WeightHParams
+
+template_field = base_layer.template_field
+LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 
 Params = py_utils.HParams
 JTensor = pytypes.JTensor
@@ -600,3 +610,96 @@ class CifgLstmCellSimple(LstmCellSimple):
     state1 = self._gates_internal(state0, i_i, f_g, o_g)
     state1 = self._apply_zoneout(state0, inputs, state1)
     return state1
+
+class RecurrentLayerMix(base_layer.BaseLayer): # mqy
+  input_dims: int = 1024
+  hidden_dims: int = 1024
+  has_bias: bool = False
+  mixing_mode: str = 'rnn'
+  mixing_res: float = 1.0 
+  fflayer_tpl: LayerTpl = template_field(linears.FeedForward)
+  use_layermix_norm: bool = False
+  layermix_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)
+  gate_activation_tpl: pax_fiddle.Config[activations_lib.BaseActivation] = template_field(activations_lib.Sigmoid)
+  activation_tpl: pax_fiddle.Config[activations_lib.BaseActivation] = template_field(activations_lib.Tanh)
+
+  def setup(self) -> None:
+    if self.use_layermix_norm:
+      self.create_child('layermix_norm', self.layermix_norm_tpl.clone())
+
+    self.create_child('activation', self.activation_tpl.clone()) # tanh
+    self.create_child('gate_activation', self.gate_activation_tpl.clone()) # sigmoid
+
+    input_linear_p = self.fflayer_tpl.clone()
+    input_linear_p.name = 'input_linear'
+    input_linear_p.input_dims = self.input_dims
+    input_linear_p.has_bias = self.has_bias
+    input_linear_p.activation_tpl = pax_fiddle.Config(activations_lib.Identity) # self.activation_tpl.clone() 
+    input_linear_p.output_dims = self.hidden_dims  
+    input_linear_p.weight_split_dims_mapping.wt = ['data', 'mdl'] # w_df
+    input_linear_p.activation_split_dims_mapping.out = [('replica', 'data'), None, 'mdl']  # BTD todo
+
+  
+    out_linear_p = input_linear_p.clone()
+    out_linear_p.name = 'out_linear' 
+    out_linear_p.input_dims = self.hidden_dims  
+    out_linear_p.output_dims = self.input_dims
+    out_linear_p.weight_split_dims_mapping.wt = ['mdl', 'data']
+
+    hidden_linear_p = input_linear_p.clone()
+    hidden_linear_p.input_dims = self.hidden_dims  
+    hidden_linear_p.output_dims = self.hidden_dims
+    hidden_linear_p.name = 'hidden_linear'
+
+    if self.mixing_mode in ['rnn', 'linear_rnn', 'gated_linear_rnn']:
+      self.create_child('input_linear', input_linear_p.clone())
+      self.create_child('out_linear', out_linear_p.clone())
+      self.create_child('hidden_linear', hidden_linear_p.clone())
+    elif self.mixing_mode == 'gru': # w_ih * 3, w_hh *3 , w_hi * 1
+      # https://pytorch.org/docs/stable/generated/torch.nn.GRU.html
+      for gate in ['r_input_gate', 'z_input_gate', 'n_input_gate']:
+        self.create_child(gate, input_linear_p.clone().set(name=gate))
+      for gate in ['r_hidden_gate', 'z_hidden_gate', 'n_hidden_gate']:
+        self.create_child(gate, hidden_linear_p.clone().set(name=gate))
+      self.create_child('out_linear', out_linear_p.clone())
+    elif self.mixing_mode == 'lstm': # w_ih * 4 , w_hh * 4, w_hi * 1
+      # https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html
+      for gate in ['i_input_gate', 'f_input_gate', 'o_input_gate', 'g_input_gate']:
+        self.create_child(gate, input_linear_p.clone().set(name=gate))
+      for gate in ['i_hidden_gate', 'f_hidden_gate', 'o_hidden_gate', 'g_hidden_gate']:
+        self.create_child(gate, hidden_linear_p.clone().set(name=gate)) 
+      self.create_child('out_linear', out_linear_p.clone()) 
+      
+  def __call__(self, input: JTensor, hidden: JTensor, c: JTensor)-> Tuple[JTensor, JTensor, JTensor]:
+    if self.use_layermix_norm: 
+      normed_input = self.layermix_norm(input)
+      normed_hidden = self.layermix_norm(hidden) # no norm on hidden for exp: PileLlamaMediumLayerMixRNNNorm
+    else:
+      normed_input = input 
+      normed_hidden = hidden
+
+    if self.mixing_mode == 'rnn':
+      hid = self.activation(self.hidden_linear(normed_hidden) + self.input_linear(normed_input)) # h = tanh(A @ h + B @ x) 
+      out = self.out_linear(hid) + self.mixing_res * input  # y = C @ h + x
+    elif self.mixing_mode == 'linear_rnn':
+      hid = self.hidden_linear(normed_hidden) + self.input_linear(normed_input) # h = A @ h + B @ x 
+      out = self.out_linear(hid) + self.mixing_res * input  # y = C @ h + x
+    elif self.mixing_mode == 'gated_linear_rnn': # unstable
+      hid = self.hidden_linear(normed_input) * hidden + self.input_linear(normed_input) * input # h = A @ h + B @ x 
+      out = self.out_linear(normed_input) * hid + self.mixing_res * input  # y = C @ h + x
+    elif self.mixing_mode == 'gru':
+      r_gate = self.gate_activation(self.r_hidden_gate(normed_hidden) + self.r_input_gate(normed_input))
+      z_gate = self.gate_activation(self.z_hidden_gate(normed_hidden) + self.z_input_gate(normed_input))
+      n = self.activation(r_gate * self.n_hidden_gate(normed_hidden) + self.n_input_gate(normed_input))
+      hid = (1 - z_gate) * n + z_gate * hidden 
+      out = self.out_linear(hid) + self.mixing_res * input 
+    elif self.mixing_mode == 'lstm':
+      i_gate = self.gate_activation(self.i_hidden_gate(normed_hidden) + self.i_input_gate(normed_input))
+      f_gate = self.gate_activation(self.f_hidden_gate(normed_hidden) + self.f_input_gate(normed_input))
+      o_gate = self.gate_activation(self.o_hidden_gate(normed_hidden) + self.o_input_gate(normed_input))
+      g = self.activation(self.g_hidden_gate(normed_hidden) + self.g_input_gate(normed_input)) # short-term memory 
+      c = f_gate * c + i_gate * g # update long-term memory
+      hid = o_gate * self.activation(c) 
+      out = self.out_linear(hid) + self.mixing_res * input  
+
+    return hid, out, c
