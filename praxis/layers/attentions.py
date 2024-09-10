@@ -1852,7 +1852,8 @@ class DotProductAttention(base_layer.BaseLayer):
   # XD: gated attention related
   dim_per_head_v: Optional[int] = None
   value_gate_activation_cls: activations_lib.BaseActivation = None
-  save_v_out: bool = False 
+  save_v_out: bool = False
+  q_gate_activation_cls: activations_lib.BaseActivation = None 
   o_gate_activation_cls: activations_lib.BaseActivation = None
   o_gate_rank: Optional[int] = None # 128
   o_norm: bool = False # mqy
@@ -2078,6 +2079,9 @@ class DotProductAttention(base_layer.BaseLayer):
       if self.value_gate_activation_cls:  # XD
         self.create_child('value_gate', project_input('value_gate', value_input_dim, dim_per_head_v, gaussian_std=value_std))
         self.create_child('value_gate_activation',  pax_fiddle.Config(self.value_gate_activation_cls).clone())
+      if self.q_gate_activation_cls: # mqy
+        self.create_child('query_gate', project_input('query_gate', query_input_dim, dim_per_head, self.num_heads, use_bias=use_qk_bias, gaussian_std=query_std)) 
+        self.create_child('q_gate_activation',  pax_fiddle.Config(self.q_gate_activation_cls).clone())
       if self.o_gate_activation_cls:  # XD
         if self.o_gate_rank is not None:
           og1 = WeightHParams(shape=[self.hidden_dim, self.o_gate_rank], # 1024, 128
@@ -2885,6 +2889,10 @@ class DotProductAttention(base_layer.BaseLayer):
         value_proj = value_proj + dyn_v #BSNd
         # self.add_summary('dyn_v_rms', _rms(dyn_v), verbosity=4)
         # self.add_summary('value_proj_rms', _rms(value_proj), verbosity=4)
+
+    if self.q_gate_activation_cls: # mqy
+      query_gate = self.q_gate_activation(self.query_gate(query_vec))
+      query_proj = query_proj * query_gate
 
     if self.qk_norm:  # XD
       query_proj, key_proj = self.q_norm(query_proj), self.k_norm(key_proj)

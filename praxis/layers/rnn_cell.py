@@ -615,7 +615,7 @@ class RecurrentLayerMix(base_layer.BaseLayer): # mqy
   input_dims: int = 1024
   hidden_dims: int = 1024
   has_bias: bool = False
-  mixing_mode: str = 'rnn'
+  mixing_mode: str = 'rnn' # ['lstm', 'gru', 'rnn']
   mixing_res: float = 1.0 
   fflayer_tpl: LayerTpl = template_field(linears.FeedForward)
   use_layermix_norm: bool = False
