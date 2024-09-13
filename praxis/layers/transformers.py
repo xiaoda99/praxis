@@ -2480,10 +2480,10 @@ class StackedTransformer(base_layer.BaseLayer):
             x_out = sum([jnp.repeat(dense_w[j] + dyn_dense_w[:,:,j], group_dim, axis=-1) * _ov_transform(hids[j], ov_before) for j in range(i+2)]) # 1 + BTLG -> BTLG -> BTL(Gd) repeat ;BTLD,LBTD-> BTD
           if self.dynamic_dense_ov_after_merge:
             x_out = _ov_transform(x_out, ov_after)
-          if not self.dynamic_dense_key_wise:
-            self.add_summary(f'dynamic_dense_w_max_{i}', dyn_dense_w.max(), verbosity=3)
-            self.add_summary(f'dynamic_dense_w_mean_{i}', dyn_dense_w.mean(), verbosity=3)
-            self.add_summary(f'dynamic_dense_w_min_{i}', dyn_dense_w.min(), verbosity=3)
+          # if not self.dynamic_dense_key_wise:
+          #   self.add_summary(f'dynamic_dense_w_max_{i}', dyn_dense_w.max(), verbosity=3)
+          #   self.add_summary(f'dynamic_dense_w_mean_{i}', dyn_dense_w.mean(), verbosity=3)
+          #   self.add_summary(f'dynamic_dense_w_min_{i}', dyn_dense_w.min(), verbosity=3)
         else:
           x_out = sum([dense_w[j] * hids[j] for j in range(len(hids))])
       if self.dynamic_head_dense:

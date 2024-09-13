@@ -1856,6 +1856,7 @@ class DotProductAttention(base_layer.BaseLayer):
   q_gate_activation_cls: activations_lib.BaseActivation = None 
   o_gate_activation_cls: activations_lib.BaseActivation = None
   o_gate_rank: Optional[int] = None # 128
+  o_gate2_init_method: str = 'gaussian'
   o_norm: bool = False # mqy
   o_groupnorm: bool = True # mqy
   o_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
@@ -2087,9 +2088,14 @@ class DotProductAttention(base_layer.BaseLayer):
           og1 = WeightHParams(shape=[self.hidden_dim, self.o_gate_rank], # 1024, 128
             mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None],
             init=WeightInit.Gaussian(math.sqrt(2.0 / (self.hidden_dim + self.o_gate_rank))))
+          assert self.o_gate2_init_method in ['gaussian' and 'zero']
+          if self.o_gate2_init_method == 'gaussian':
+            og2_init = WeightInit.Gaussian(math.sqrt(2.0 / (self.hidden_dim + self.o_gate_rank)))
+          elif self.o_gate2_init_method == 'zero':
+            og2_init = WeightInit.Constant(0)
           og2 = WeightHParams(shape=[self.o_gate_rank, self.hidden_dim], # 128, 1024
             mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None],
-            init=WeightInit.Gaussian(math.sqrt(2.0 / (self.hidden_dim + self.o_gate_rank))))
+            init=og2_init)
           self.create_variable('o_gate1', og1)
           self.create_variable('o_gate2', og2)
         else:
