@@ -43,6 +43,7 @@ from praxis.layers import stats
 from praxis.layers import stochastics
 from praxis.layers import GELU
 from praxis.layers import rnn_cell
+from praxis.layers.ssm import Mamba2
 
 NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
@@ -1245,6 +1246,8 @@ class Transformer(base_layer.BaseLayer):
   laurel_normed_residual: bool = False
   gating_mlp_input: Optional[str] = None # ['sigmoid', 'linear', 'attn_out_depend+sigmoid'] (a, 1-a) or (a,b) 
   gating_mlp_input_act: activations_lib.BaseActivation = activations_lib.GELU
+  use_mamba: bool = False
+  mamba_tpl: LayerTpl = template_field(Mamba2) 
 
 
 
@@ -1283,56 +1286,60 @@ class Transformer(base_layer.BaseLayer):
     else:
       raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
-    # Initialize multi-headed self-attention
-    self._setup_attention(self.tr_atten_tpl, 'self_attention')
+    if self.use_mamba:
+      assert self.norm_policy == 'pre'
+      self.create_child('mamba', self.mamba_tpl.clone())
+    else:
+      # Initialize multi-headed self-attention
+      self._setup_attention(self.tr_atten_tpl, 'self_attention')
 
-    # Initialize residual dropout.
-    params = self.dropout_tpl.clone()
-    params.keep_prob = 1.0 - self.residual_dropout_prob
-    self.create_child('residual_dropout', params)
+      # Initialize residual dropout.
+      params = self.dropout_tpl.clone()
+      params.keep_prob = 1.0 - self.residual_dropout_prob
+      self.create_child('residual_dropout', params)
 
-    # Initialize multi-headed cross-attention and layer norm.
-    if self.use_cross_attention:
-      if self.norm_policy in ('pre', 'post', 'post_skip'):
-        params = self.ln_tpl.clone()
-        params.name = 'cross_layer_norm'
-        params.dim = self.input_dims
-        self.create_child('cross_layer_norm', params)
-      elif self.norm_policy == 'primer_hybrid':
-        params = self.ln_tpl.clone()
-        params.dim = self.input_dims
-        self.create_child('pre_cross_layer_norm', params)
-        self.create_child('post_cross_layer_norm', params)
-      else:
-        raise ValueError(f'Unrecognized norm_policy: {self.norm_policy}')
+      # Initialize multi-headed cross-attention and layer norm.
+      if self.use_cross_attention:
+        if self.norm_policy in ('pre', 'post', 'post_skip'):
+          params = self.ln_tpl.clone()
+          params.name = 'cross_layer_norm'
+          params.dim = self.input_dims
+          self.create_child('cross_layer_norm', params)
+        elif self.norm_policy == 'primer_hybrid':
+          params = self.ln_tpl.clone()
+          params.dim = self.input_dims
+          self.create_child('pre_cross_layer_norm', params)
+          self.create_child('post_cross_layer_norm', params)
+        else:
+          raise ValueError(f'Unrecognized norm_policy: {self.norm_policy}')
 
-      if self.cross_atten_tpl is not None:
-        params = self.cross_atten_tpl
-      else:
-        params = self.tr_atten_tpl
-      self._setup_attention(params, 'cross_attention')
+        if self.cross_atten_tpl is not None:
+          params = self.cross_atten_tpl
+        else:
+          params = self.tr_atten_tpl
+        self._setup_attention(params, 'cross_attention')
 
-    # Initialize residual droppath
-    if self.residual_droppath_prob > 0:
-      droppath_p = pax_fiddle.Config(
-          stochastics.StochasticResidual,
-          name='residual_droppath',
-          survival_prob=1.0 - self.residual_droppath_prob,
-      )
-      self.create_child('residual_droppath', droppath_p)
+      # Initialize residual droppath
+      if self.residual_droppath_prob > 0:
+        droppath_p = pax_fiddle.Config(
+            stochastics.StochasticResidual,
+            name='residual_droppath',
+            survival_prob=1.0 - self.residual_droppath_prob,
+        )
+        self.create_child('residual_droppath', droppath_p)
 
-    # Initialize feed-forward layer
-    if self.tr_fflayer_tpl:
-      params = self.tr_fflayer_tpl.clone()
-      params.name = 'tr_fflayer'
-      params.input_dims = self.input_dims
-      params.hidden_dims = self.hidden_dims
-      params.relu_dropout_prob = self.relu_dropout_prob
-      params.residual_dropout_prob = self.residual_dropout_prob
-      params.residual_droppath_prob = self.residual_droppath_prob
-      params.norm_policy = self.norm_policy
-      params.add_skip_connection = not self.gpt_j_residual  # XD
-      self.create_child('ff_layer', params)
+      # Initialize feed-forward layer
+      if self.tr_fflayer_tpl:
+        params = self.tr_fflayer_tpl.clone()
+        params.name = 'tr_fflayer'
+        params.input_dims = self.input_dims
+        params.hidden_dims = self.hidden_dims
+        params.relu_dropout_prob = self.relu_dropout_prob
+        params.residual_dropout_prob = self.residual_dropout_prob
+        params.residual_droppath_prob = self.residual_droppath_prob
+        params.norm_policy = self.norm_policy
+        params.add_skip_connection = not self.gpt_j_residual  # XD
+        self.create_child('ff_layer', params)
     
     # Intialize dense conn params
     if self.dense_conn:
@@ -1608,108 +1615,114 @@ class Transformer(base_layer.BaseLayer):
     else:
       inputs_normalized = inputs
 
-    # Compute self-attention, key/value vectors are the input itself
-    atten_output, self_atten_probs, v_out = self.self_attention(
-        inputs_normalized,
-        inputs_normalized,
-        inputs_normalized,
-        atten_mask=attention_mask,
-        query_segment_pos=segment_pos,
-        key_segment_pos=segment_pos,
-        v_in=v_in)
-    atten_probs = NestedMap(self_atten=self_atten_probs)
-
-    self.add_summary('attention_output_rms', _rms(atten_output), verbosity=4)
-
-    if self.norm_policy == 'primer_hybrid':
-      atten_output = self.post_layer_norm(atten_output)
-    elif self.norm_policy == 'post':
-      atten_output = self.layer_norm(atten_output)
-
-    self.add_summary('attention_output_norm_rms', _rms(atten_output),
-                     verbosity=4)
-
-    # Residual dropout and connection
-    atten_output = self.residual_dropout(atten_output)
-
-    # Apply skip connection
-    if self.residual_droppath_prob > 0.0:
-      atten_output = self.residual_droppath(inputs, atten_output)
+    if self.use_mamba:
+      output = self.mamba(inputs_normalized) + inputs
+      atten_probs, v_out = None, None
     else:
-      atten_output += inputs
+      ### beginning of attn_mlp
+      # Compute self-attention, key/value vectors are the input itself
+      atten_output, self_atten_probs, v_out = self.self_attention(
+          inputs_normalized,
+          inputs_normalized,
+          inputs_normalized,
+          atten_mask=attention_mask,
+          query_segment_pos=segment_pos,
+          key_segment_pos=segment_pos,
+          v_in=v_in)
+      atten_probs = NestedMap(self_atten=self_atten_probs)
 
-    if self.norm_policy == 'post_skip':
-      atten_output = self.layer_norm(atten_output)
+      self.add_summary('attention_output_rms', _rms(atten_output), verbosity=4)
 
-    self.add_summary('attention_output_rel_cos', _rel_cos(inputs, atten_output),
-                     verbosity=4)
+      if self.norm_policy == 'primer_hybrid':
+        atten_output = self.post_layer_norm(atten_output)
+      elif self.norm_policy == 'post':
+        atten_output = self.layer_norm(atten_output)
 
-    # Apply cross attention if applicable
-    if self.use_cross_attention and (
-        not self.allow_skip_cross_attention or cross_inputs is not None
-    ):
-      assert cross_inputs is not None
-      assert cross_attention_mask is not None
-      if self.norm_policy == 'pre':
-        atten_output_normalized = self.cross_layer_norm(atten_output)
-      elif self.norm_policy == 'primer_hybrid':
-        atten_output_normalized = self.pre_cross_layer_norm(atten_output)
-      elif self.norm_policy in ('post', 'post_skip'):
-        atten_output_normalized = atten_output
-
-      cross_atten_output, cross_atten_probs = self.cross_attention(
-          atten_output_normalized,
-          cross_inputs,
-          cross_inputs,
-          atten_mask=cross_attention_mask)
-      atten_probs.cross_atten = cross_atten_probs
-
-      if self.norm_policy == 'post':
-        cross_atten_output = self.cross_layer_norm(cross_atten_output)
-      elif self.norm_policy == 'primer_hybrid':
-        cross_atten_output = self.post_cross_layer_norm(cross_atten_output)
+      self.add_summary('attention_output_norm_rms', _rms(atten_output),
+                      verbosity=4)
 
       # Residual dropout and connection
-      cross_atten_output = self.residual_dropout(cross_atten_output)
+      atten_output = self.residual_dropout(atten_output)
 
+      # Apply skip connection
       if self.residual_droppath_prob > 0.0:
-        atten_output = self.residual_droppath(atten_output, cross_atten_output)
+        atten_output = self.residual_droppath(inputs, atten_output)
       else:
-        atten_output += cross_atten_output
+        atten_output += inputs
 
       if self.norm_policy == 'post_skip':
-        atten_output = self.cross_layer_norm(atten_output)
+        atten_output = self.layer_norm(atten_output)
 
-    # gating mlp inputs
-    if self.gating_mlp_input:
-      if 'attn_out_depend' in self.gating_mlp_input:
-        _input = atten_output
-      else: 
-        _input = inputs
-      res_attn_w = jnp.einsum('B T D, D R -> B T R', self.gating_mlp_norm(_input), self.theta.res_attn_w) # 
-      if 'learnable_bias' in self.gating_mlp_input:
-        bs = self.theta.res_attn_bias 
+      self.add_summary('attention_output_rel_cos', _rel_cos(inputs, atten_output),
+                      verbosity=4)
+
+      # Apply cross attention if applicable
+      if self.use_cross_attention and (
+          not self.allow_skip_cross_attention or cross_inputs is not None
+      ):
+        assert cross_inputs is not None
+        assert cross_attention_mask is not None
+        if self.norm_policy == 'pre':
+          atten_output_normalized = self.cross_layer_norm(atten_output)
+        elif self.norm_policy == 'primer_hybrid':
+          atten_output_normalized = self.pre_cross_layer_norm(atten_output)
+        elif self.norm_policy in ('post', 'post_skip'):
+          atten_output_normalized = atten_output
+
+        cross_atten_output, cross_atten_probs = self.cross_attention(
+            atten_output_normalized,
+            cross_inputs,
+            cross_inputs,
+            atten_mask=cross_attention_mask)
+        atten_probs.cross_atten = cross_atten_probs
+
+        if self.norm_policy == 'post':
+          cross_atten_output = self.cross_layer_norm(cross_atten_output)
+        elif self.norm_policy == 'primer_hybrid':
+          cross_atten_output = self.post_cross_layer_norm(cross_atten_output)
+
+        # Residual dropout and connection
+        cross_atten_output = self.residual_dropout(cross_atten_output)
+
+        if self.residual_droppath_prob > 0.0:
+          atten_output = self.residual_droppath(atten_output, cross_atten_output)
+        else:
+          atten_output += cross_atten_output
+
+        if self.norm_policy == 'post_skip':
+          atten_output = self.cross_layer_norm(atten_output)
+
+      # gating mlp inputs
+      if self.gating_mlp_input:
+        if 'attn_out_depend' in self.gating_mlp_input:
+          _input = atten_output
+        else: 
+          _input = inputs
+        res_attn_w = jnp.einsum('B T D, D R -> B T R', self.gating_mlp_norm(_input), self.theta.res_attn_w) # 
+        if 'learnable_bias' in self.gating_mlp_input:
+          bs = self.theta.res_attn_bias 
+        else:
+          bs = [1, 1]
+        if 'linear' in self.gating_mlp_input:
+          a, b = res_attn_w[:,:,:1]+bs[0], res_attn_w[:,:,1:2]+bs[1] # 1 as bias, 
+        elif 'sigmoid' in self.gating_mlp_input:
+          a = jax.nn.sigmoid(res_attn_w[:,:,:1]) * 2
+          b = 2 - a
+        elif 'mlp' in self.gating_mlp_input:
+          res_attn_w = jnp.einsum('B T R, R Q -> B T Q', self.gmi_activation(res_attn_w), self.theta.res_attn_w2) # 
+          a, b = res_attn_w[:,:,:1]+bs[0], res_attn_w[:,:,1:2]+bs[1]
+        mlp_input = inputs * a + (atten_output - inputs) * b 
       else:
-        bs = [1, 1]
-      if 'linear' in self.gating_mlp_input:
-        a, b = res_attn_w[:,:,:1]+bs[0], res_attn_w[:,:,1:2]+bs[1] # 1 as bias, 
-      elif 'sigmoid' in self.gating_mlp_input:
-        a = jax.nn.sigmoid(res_attn_w[:,:,:1]) * 2
-        b = 2 - a
-      elif 'mlp' in self.gating_mlp_input:
-        res_attn_w = jnp.einsum('B T R, R Q -> B T Q', self.gmi_activation(res_attn_w), self.theta.res_attn_w2) # 
-        a, b = res_attn_w[:,:,:1]+bs[0], res_attn_w[:,:,1:2]+bs[1]
-      mlp_input = inputs * a + (atten_output - inputs) * b 
-    else:
-      mlp_input = atten_output
+        mlp_input = atten_output
 
-    # Apply FFN layer
-    output = self.ff_layer(mlp_input, paddings=paddings) \
-      if not self.gpt_j_residual else atten_output + self.ff_layer(inputs, paddings=paddings)  # XD
-    
-    if not self.gpt_j_residual and self.gating_mlp_input and 'skip_gating_residual' in self.gating_mlp_input:
-      output = (output - mlp_input) + atten_output
-    self.add_summary('layer_output_rms', _rms(output-inputs), verbosity=4)
+      # Apply FFN layer
+      output = self.ff_layer(mlp_input, paddings=paddings) \
+        if not self.gpt_j_residual else atten_output + self.ff_layer(inputs, paddings=paddings)  # XD
+      
+      if not self.gpt_j_residual and self.gating_mlp_input and 'skip_gating_residual' in self.gating_mlp_input:
+        output = (output - mlp_input) + atten_output
+      self.add_summary('layer_output_rms', _rms(output-inputs), verbosity=4)
+      ### end of attn _mlp 
 
     # output = inputs + (atten_output - inputs) + (output - atten_output)
     if self.laurel_lr:
@@ -2023,6 +2036,8 @@ class StackedTransformer(base_layer.BaseLayer):
   laurel_normed_residual: bool = False
   use_recurrent_layer_mixing: bool = False
   recurrent_layer_mixing_tpl: LayerTpl = template_field(rnn_cell.RecurrentLayerMix) # rnn, lstm 
+  mamba_lidxs: Optional[list] = None # list(range(48))
+  use_mamba: bool = False
 
 
 
@@ -2049,6 +2064,14 @@ class StackedTransformer(base_layer.BaseLayer):
       else:
         p_i = self._clone_layer_params(self.transformer_layer_params_tpl)
       p_i.name = f'layer_{i}'
+
+      # set mamba layer params
+      if self.use_mamba:
+        mamba_lidxs = self.mamba_lidxs if self.mamba_lidxs is not None else list(range(self.num_layers))
+        p_i.use_mamba = i in mamba_lidxs  
+        p_i.mamba_tpl.layer_idx = i 
+        p_i.mamba_tpl.d_model = self.model_dims
+
       share_except_layers = self.share_except_layers if self.share_except_layers is not None else []
       if self.share_interval is not None and i not in share_except_layers:
         assert self.share_mode in ['immediate', 'interleave']

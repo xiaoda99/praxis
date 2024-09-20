@@ -642,6 +642,7 @@ class DynamicWeightProjection(base_layer.BaseLayer):
   dw_hidden_gate_act_cls: activations_lib.BaseActivation = None
   merge_projection: bool = True
   summary_verbosity: int = 9
+  dw_param_gate: bool = False #mqy generate dynamic gate for dynamic weight: dw2(dw1(x)) -> dw2(dw1(x) * silu(wg(x))) 
   
   def setup(self) -> None:
     self.num_heads_per_group = self.num_heads // self.num_groups
@@ -687,6 +688,7 @@ class DynamicWeightProjection(base_layer.BaseLayer):
         for w_name in w_names:
           if w_name not in ['dw2_d', 'qd', 'kd', 'qkd']:
             I = dynamic_hidden_dim * (1 if self.merge_dynamic_w_hidden else 2)
+            if self.dw_param_gate: I += dynamic_hidden_dim # for wg
             if not self.decompose_dynamic_w: I = M
             if w_name == 'qkw':
               shape = [G, 4, K, I, M] 
@@ -762,10 +764,12 @@ class DynamicWeightProjection(base_layer.BaseLayer):
     ) -> JTensor:  
     theta = self.theta
     if self.merge_projection:
-      pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd = None, None, None, None, None, None
-      post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd = None, None, None, None, None, None
+      pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd, pre_qg, pre_kg = None, None, None, None, None, None, None, None
+      post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd, post_qg, post_kg = None, None, None, None, None, None, None, None
     else:
-      qw1, qw2, kw1, kw2, qdd, kdd = None, None, None, None, None, None
+      qw1, qw2, kw1, kw2, qdd, kdd, qg, kg = None, None, None, None, None, None, None, None
+    if self.dw_param_gate: 
+      assert self.dynamic_w_init is not None and self.dynamic_w_hidden_dim and not self.merge_dynamic_w_hidden and self.merge_projection
     if self.dynamic_w_init is not None:
       if self.dynamic_w_hidden_dim and not self.merge_dynamic_w_hidden:
         if self.merge_projection:
@@ -775,11 +779,16 @@ class DynamicWeightProjection(base_layer.BaseLayer):
             qkw = theta.qkw 
           else:
             qkw = jnp.concatenate([theta.qkw1, theta.qkw2], axis=-2)
-          w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, qkw), 2, axis=-2)
+          if self.dw_param_gate: 
+            w1, w2, wg = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, qkw), 3, axis=-2) # I=3*2
+          else:
+            w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, qkw), 2, axis=-2)
           # w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKMI->BTGCMI', dw_hidden, theta.qkw), 2, axis=-1)
           if self.dw1_norm_cls is not None: w1 = self.dw1_norm(w1)
           pre_qw1, pre_kw1, post_qw1, post_kw1 = unbind(w1, 4, axis=3) # BT4GIM->[BTGIM]*4
           pre_qw2, pre_kw2, post_qw2, post_kw2 = unbind(w2, 4, axis=3)
+          if self.dw_param_gate: 
+            pre_qg, pre_kg, post_qg, post_kg = unbind(wg, 4, axis=3) # BT4GIM->[BTGIM]*4
         else:
           dw_hidden = jnp.einsum('BTD,DGK->BTGK', query_vec, theta.dw1)
           if self.dw_hidden_gate_act_cls is not None:
@@ -821,9 +830,9 @@ class DynamicWeightProjection(base_layer.BaseLayer):
       if not self.merge_projection: qdd, kdd = jnp.split(dd, 2, axis=-1)
       else: pre_qdd, pre_kdd, post_qdd, post_kdd = jnp.split(dd, 4, axis=-1)
       # for k, v in zip(['qdd', 'kdd'], [qdd, kdd]): self.add_summaries(k, v, stat_keys=['mean', 'std'])
-    return (qw1, qw2, kw1, kw2, qdd, kdd) if not self.merge_projection else \
-      ((pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd),
-      (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd))
+    return (qw1, qw2, kw1, kw2, qdd, kdd, qg, kg) if not self.merge_projection else \
+      ((pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd, pre_qg, pre_kg),
+      (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd, post_qg, post_kg))
 
 class DynamicWeightMerger(base_layer.BaseLayer):
   n: int = None
@@ -905,6 +914,8 @@ class CrossHeadProjection(base_layer.BaseLayer):
   tgt_dependent: bool = True
   src_dependent: bool = True
   summary_verbosity: int = 9
+  dw_param_gate: bool = False #mqy generate dynamic gate for dynamic weight: dw2(dw1(x)) -> dw2(dw1(x) * silu(wg(x))) 
+
 
   def setup(self) -> None:
     if self.absorb_residual: assert self.squeeze_ratio is None and self.residual
@@ -1018,6 +1029,7 @@ class CrossHeadProjection(base_layer.BaseLayer):
       qw1: JTensor = None, qw2: JTensor = None,
       kw1: JTensor = None, kw2: JTensor = None,
       qdd: JTensor = None, kdd: JTensor = None,
+      qg: JTensor = None, kg: JTensor = None,
       query_vec: JTensor = None, key_vec: JTensor = None,
     ) -> JTensor:
     if not self.use_static_w and self.dynamic_w_init is None and qw1 is None and \
@@ -1097,6 +1109,10 @@ class CrossHeadProjection(base_layer.BaseLayer):
           else:
             hidden = jnp.einsum(eqn1, inputs, w1)
             if self.decompose_dynamic_w:
+              if qg is not None and sym == 'T':
+                hidden = hidden * jax.nn.silu(jnp.einsum(eqn1, inputs, qg))
+              elif kg is not None and sym == 'S':
+                hidden = hidden * jax.nn.silu(jnp.einsum(eqn1, inputs, kg))
               out = jnp.einsum(eqn2, hidden, w2)
               ret = ret + out
             else:
@@ -1621,6 +1637,8 @@ class CausalDepthwiseConv1D(base_layer.BaseLayer):
 
   kernel_size: int = 3
   hidden_dims: Union[int, Sequence[int]] = 0
+  bias: bool = False
+  skip_weight_decay: bool = True
 
   def setup(self) -> None:
     assert self.name
@@ -1653,6 +1671,22 @@ class CausalDepthwiseConv1D(base_layer.BaseLayer):
               tensor_split_dims_mapping=wp.wt,
           ),
       )
+    if self.bias:
+      assert isinstance(self.hidden_dims, int)
+      shape = [self.hidden_dims]
+      self.create_variable(
+          'b',
+          WeightHParams(
+              shape=shape,
+              init=base_layer.WeightInit.Constant(0),
+              mesh_shape=self.mesh_shape,
+              tensor_split_dims_mapping=wp.wt,
+              collections=None if not self.skip_weight_decay else [
+                base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION 
+            ]
+          ),
+      )
+
 
   def __call__(
       self, inputs: JTensor, axis: int, segment_pos: Optional[JTensor] = None
@@ -1669,7 +1703,8 @@ class CausalDepthwiseConv1D(base_layer.BaseLayer):
     Returns:
       Output sequence after applying the depth-wise convolution on the sequence.
     """
-    outputs = inputs * self.theta.dconv_0
+    outputs = inputs * self.theta.dconv_0 
+    if self.bias: outputs = outputs + self.theta.b
     for i in range(1, self.kernel_size):
       inputs = shift_1d(inputs, offset=1, axis=axis)
       if segment_pos is None:
@@ -2639,13 +2674,15 @@ class DotProductAttention(base_layer.BaseLayer):
         # _query = query[:, start : stop, :, :]
         # _key, _value = key[:, : stop, :, :], value[:, : stop, :, :]
         # _atten_mask = atten_mask[:, start : stop, :, : stop]
-        def slice_dw(qw1, qw2, kw1, kw2, qdd, kdd):
+        def slice_dw(qw1, qw2, kw1, kw2, qdd, kdd, qg, kg):
           return (qw1[:, start : stop] if qw1 is not None else None,
             qw2[:, start : stop] if qw2 is not None else None,
             kw1[:, kv_start : stop] if kw1 is not None else None,
             kw2[:, kv_start : stop] if kw2 is not None else None,
             qdd[:, start : stop] if qdd is not None else None,
-            kdd[:, kv_start : stop] if kdd is not None else None)
+            kdd[:, kv_start : stop] if kdd is not None else None,
+            qg[:, start : stop] if qg is not None else None,
+            kg[:, kv_start : stop] if kg is not None else None)
         _pre_proj_dw_args = slice_dw(*pre_proj_dw_args) if pre_proj_dw_args is not None and self.project_logits else ()  # debug
         _post_proj_dw_args = slice_dw(*post_proj_dw_args) if post_proj_dw_args is not None and self.project_probs else ()  # debug
         _encoded, _ = self._atten_context(_query, _key, _value, _atten_mask,
