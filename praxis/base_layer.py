@@ -722,11 +722,11 @@ def init_var(
   elif method in ['constant']:
     return jnp.array(scale) + jnp.zeros(shape=shape, dtype=init_dtype)
   elif method in ['mamba_dt_bias']:
-    dt = jnp.exp(jax.random.uniform(prng_key, [16], dtype=jnp.float32, minval=0, maxval=1.0) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clip(min=1e-4)
+    dt = jnp.exp(jax.random.uniform(prng_key, [32], dtype=jnp.float32, minval=0, maxval=1.0) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clip(min=1e-4)
     inv_dt = dt + jnp.log(-jnp.expm1(-dt))
     return inv_dt
   elif method in ['mamba_a_log']:
-    return jnp.log(jax.random.uniform(prng_key, [16], dtype=jnp.float32, minval=1, maxval=16)) # [1,16]
+    return jnp.log(jax.random.uniform(prng_key, [32], dtype=jnp.float32, minval=1, maxval=16)) # [1,16]
   elif method in ['xavier']:
     fan_in, fan_out = get_fan_in_fan_out(shape, fan_in_axes, fan_out_axes)
     limit = scale * math.sqrt(6. / (fan_in + fan_out))

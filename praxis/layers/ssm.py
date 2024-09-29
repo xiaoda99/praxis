@@ -289,10 +289,10 @@ class Mamba2(base_layer.BaseLayer): # mqy
   }
   '''
   d_model: int = 1024
-  d_state: int = 64
+  d_state: int = 128
   d_conv: int = 4
   expand: int = 2
-  headdim: int = 128
+  headdim: int = 64
   ngroups: int = 1
   A_init_range: Tuple = (1, 16)
   dt_min: float = 0.001
@@ -413,11 +413,13 @@ class Mamba2(base_layer.BaseLayer): # mqy
     
     if self.use_minimal:
       initial_states = jnp.zeros((batch, 1, self.d_inner // self.headdim, self.headdim, self.d_state)) # b1hpn
-      X = rearrange(x, "b l (h p) -> b l h p", p=self.headdim) * dt[...,None] # blhp,blh1 -> blhp 
+      x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
+      X = x * dt[...,None] # blhp,blh1 -> blhp 
       A = A * dt # h * blh; static * dynamic -> dynamic
       B = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups)
       C = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
       y, _ = ssd_minimal_discrete(X, A, B, C, self.chunk_size, initial_states=initial_states)
+      y = y + x * rearrange(self.theta.D, "h -> h 1")
     else:
       y = mamba_chunk_scan(
           rearrange(x, "b l (h p) -> b l h p", p=self.headdim), # V: B, L, H, head_dim, split V into H heads
