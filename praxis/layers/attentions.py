@@ -2906,13 +2906,15 @@ class DotProductAttention(base_layer.BaseLayer):
 
     dyn_q, dyn_k, dyn_v, dyn_mixedv = None, None, None, None
     if v_in is not None: # CBSNd
-      assert self.dynamic_head_dense_type in ['qk', 'qkv', 'qkvo', 'o', 'v']
+      assert self.dynamic_head_dense_type in ['qk', 'qkv', 'qkvo', 'o', 'v', 'q']
       if self.dynamic_head_dense_type == 'qk':
         dyn_q, dyn_k = v_in[0], v_in[1]
       elif self.dynamic_head_dense_type == 'qkv':
         dyn_q, dyn_k, dyn_v = v_in[0], v_in[1], v_in[2]
       elif self.dynamic_head_dense_type == 'qkvo':
         dyn_q, dyn_k, dyn_v, dyn_mixedv = v_in[0], v_in[1], v_in[2], v_in[3]
+      elif self.dynamic_head_dense_type == 'q':
+        dyn_q = v_in[0]
       elif self.dynamic_head_dense_type == 'v':
         dyn_v = v_in[0]
       elif self.dynamic_head_dense_type == 'o':
