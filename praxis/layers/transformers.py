@@ -1216,9 +1216,11 @@ class Transformer(base_layer.BaseLayer):
   ngrammer_tpl: Optional[LayerTpl] = template_field(None)
   layer_index: int = 0 
   num_layers: int = 1
+  num_ffn: int = 1 # mqy; group of feedforward layer
   dense_conn: bool = False
   dense_conn_on_attn: bool = False
   dynamic_dense: bool = False
+  dynamic_dense_sep_qkv_ln: bool = False
   dynamic_dense_stack: bool = True
   dynamic_dense_type: Optional[str] = None # ['qkv', 'qkvm']
   dynamic_dense_num_groups : int = 1
@@ -1289,6 +1291,8 @@ class Transformer(base_layer.BaseLayer):
       params.name = 'layer_norm'
       params.dim = self.input_dims
       self.create_child('layer_norm', params)
+      if self.dynamic_dense_type is not None and 'qkv' in self.dynamic_dense_type and self.dynamic_dense_sep_qkv_ln:
+        self.create_children('layer_norms', [self.ln_tpl.clone().set(name=f'layer_norm_{cidx}', dim=self.input_dims) for cidx in range(3)])
     else:
       raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
@@ -1336,21 +1340,41 @@ class Transformer(base_layer.BaseLayer):
 
       # Initialize feed-forward layer
       if self.tr_fflayer_tpl:
-        params = self.tr_fflayer_tpl.clone()
-        params.name = 'tr_fflayer'
-        params.input_dims = self.input_dims
-        params.hidden_dims = self.hidden_dims
-        params.relu_dropout_prob = self.relu_dropout_prob
-        params.residual_dropout_prob = self.residual_dropout_prob
-        params.residual_droppath_prob = self.residual_droppath_prob
-        params.norm_policy = self.norm_policy
-        params.add_skip_connection = not self.gpt_j_residual  # XD
-        self.create_child('ff_layer', params)
+        if self.num_ffn == 1:
+          params = self.tr_fflayer_tpl.clone()
+          params.name = 'tr_fflayer'
+          params.input_dims = self.input_dims
+          params.hidden_dims = self.hidden_dims
+          params.relu_dropout_prob = self.relu_dropout_prob
+          params.residual_dropout_prob = self.residual_dropout_prob
+          params.residual_droppath_prob = self.residual_droppath_prob
+          params.norm_policy = self.norm_policy
+          params.add_skip_connection = not self.gpt_j_residual  # XD
+          self.create_child('ff_layer', params)
+        else:
+          params_list = []
+          for i in range(self.num_ffn):
+            params = self.tr_fflayer_tpl.clone()
+            params.name = f'tr_fflayer_{i}'
+            params.input_dims = self.input_dims
+            params.hidden_dims = self.hidden_dims
+            params.relu_dropout_prob = self.relu_dropout_prob
+            params.residual_dropout_prob = self.residual_dropout_prob
+            params.residual_droppath_prob = self.residual_droppath_prob
+            params.norm_policy = self.norm_policy
+            params.add_skip_connection = False, 
+            params_list.append(params) 
+          self.create_children('ff_layers', params_list)
+
     
     # Intialize dense conn params
     if self.dense_conn:
       i = self.layer_index
-      self.create_child('dense_norm', self.dense_norm_tpl.clone())
+      params = self.dense_norm_tpl.clone()
+      params.name = 'dense_norm'
+      if hasattr(params, 'dim'): params.dim = self.input_dims
+      self.create_child('dense_norm', params)
+      # self.create_child('dense_norm', self.dense_norm_tpl.clone())
       if self.dynamic_dense_act_cls is not None:
         self.create_child('dense_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
         # assert isinstance(self.dynamic_dense_act_cls, GELU)
@@ -1660,13 +1684,20 @@ class Transformer(base_layer.BaseLayer):
         inputs_normalized = self.layer_norm(inputs) # BTD; CBTD 
       else: # tuple
         assert isinstance(inputs, tuple)
-        inputs_normalized = [self.layer_norm(_inputs) for _inputs in inputs]
+        if self.dynamic_dense_type is not None and 'qkv' in self.dynamic_dense_type:
+          if self.dynamic_dense_sep_qkv_ln:
+            inputs_normalized = [ln(_inputs) for _inputs, ln in zip(inputs[:3], self.layer_norms)]
+          else: 
+            inputs_normalized = [self.layer_norm(_inputs) for _inputs in inputs]
+        else: # dynamic_dense_type = 'm' 
+          assert len(inputs) == 2 # residual_stream_orig, one_way_dynamic_dense 
+          inputs_normalized = self.layer_norm(inputs[0])
     else:
       inputs_normalized = inputs
 
     if self.dynamic_dense_type is not None and self.layer_index !=0 :
       dyn_inputs = inputs
-      inputs = inputs[-1] if 'm' in self.dynamic_dense_type else inputs[0]
+      inputs = inputs[-1] if self.dynamic_dense_type.endswith('m') else inputs[0]
     if self.use_mamba:
       output = self.mamba(inputs_normalized) + inputs
       atten_probs, v_out = None, None
@@ -1779,8 +1810,19 @@ class Transformer(base_layer.BaseLayer):
         mlp_input = atten_output
 
       # Apply FFN layer
-      output = self.ff_layer(mlp_input, paddings=paddings) \
-        if not self.gpt_j_residual else atten_output + self.ff_layer(inputs, paddings=paddings)  # XD
+      if self.num_ffn == 1: # default
+        output = self.ff_layer(mlp_input, paddings=paddings) \
+          if not self.gpt_j_residual else atten_output + self.ff_layer(inputs, paddings=paddings)  # XD
+        if self.dynamic_dense_type is not None and 'l' in self.dynamic_dense_type and self.layer_index !=0:
+          output = (output - mlp_input) + atten_output_orig + dyn_inputs[self.dynamic_dense_type.index('l')] # -2 for 'qkvlm'
+      else:
+        assert self.dynamic_dense_type is not None and self.dynamic_dense_type.count('m') == self.num_ffn
+        if self.layer_index !=0:
+          mlp_inputs = [atten_output_orig + _mlp_input for _mlp_input in dyn_inputs[-self.num_ffn:]]
+        else:
+          mlp_inputs = [mlp_input] * self.num_ffn 
+        output = atten_output + sum([ff_layer(mlp_input, paddings=paddings) for ff_layer, mlp_input in zip(self.ff_layers, mlp_inputs)]) / 4
+      
       
       if not self.gpt_j_residual and self.gating_mlp_input and 'skip_gating_residual' in self.gating_mlp_input:
         output = (output - mlp_input) + atten_output
@@ -2081,7 +2123,11 @@ class StackedTransformer(base_layer.BaseLayer):
   dense_conn: bool = False
   dense_conn_on_attn: bool = False
   dense_conn_learnable: bool = True
+  dense_finetune_scale: bool = False
+  num_ffn: int = 1 # mqy; group of feedforward layer
   dynamic_dense: bool = False
+  dynamic_dense_ft_norm: bool = False
+  dynamic_dense_sep_qkv_ln: bool = False
   dynamic_dense_stack: bool = True
   dynamic_dense_type: Optional[str] = None # ['qkv', 'qkvm']
   dynamic_dense_normalized: bool = False # softmax dynamic dense weight along the Layer dim 
@@ -2223,10 +2269,12 @@ class StackedTransformer(base_layer.BaseLayer):
         )
       # dense params
       p_i.layer_index = i
+      p_i.num_ffn = self.num_ffn
       p_i.num_layers = self.num_layers
       p_i.dense_conn = self.dense_conn
       p_i.dense_conn_on_attn = self.dense_conn_on_attn
       p_i.dynamic_dense = self.dynamic_dense
+      p_i.dynamic_dense_sep_qkv_ln = self.dynamic_dense_sep_qkv_ln
       p_i.dynamic_dense_stack = self.dynamic_dense_stack
       p_i.dynamic_dense_type = self.dynamic_dense_type
       p_i.dynamic_dense_num_groups = self.dynamic_dense_num_groups
@@ -2323,7 +2371,7 @@ class StackedTransformer(base_layer.BaseLayer):
       assert len(self.dynamic_head_dense) == self.num_layers
 
     if self.dynamic_dense_type is not None:
-      assert self.dynamic_dense_type in ['qkv', 'qkvm']
+      assert self.dynamic_dense_type in ['qkv', 'qkvm', 'm', 'qkvmm', 'qkvlm']
 
     layer_params = [_layer_params(i) for i in range(self.num_layers)]
     self.create_children('x_layers', layer_params)
@@ -2362,6 +2410,17 @@ class StackedTransformer(base_layer.BaseLayer):
               collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
           )
           self.create_variable(f'dense_conn_{i}', dense_w)
+
+      if self.dense_finetune_scale:
+        for i in range(self.num_layers+1):
+          ft_scale = WeightHParams(
+              shape=[self.model_dims], # D 
+              init=WeightInit.Constant(1),
+              mesh_shape=self.mesh_shape,
+              tensor_split_dims_mapping=[None],
+              collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+          )
+          self.create_variable(f'dense_ft_scale_{i}', ft_scale)
 
       if self.dynamic_dense_key_wise: # BTD, DL-> BTL
         if self.use_dense_norm: 
@@ -2549,7 +2608,10 @@ class StackedTransformer(base_layer.BaseLayer):
         if self.dense_conn_on_attn:
           hids.append(atten_output)
         if self.comp_dense_diff:
-          hids.append(x_out - x_in)
+          if self.dynamic_dense_type is not None and self.dynamic_dense_type.endswith('m'):
+            hids.append(x_out - x_in[-1])
+          else:
+            hids.append(x_out - x_in)
         else:
           hids.append(x_out)
         if self.dynamic_dense:
@@ -2585,9 +2647,9 @@ class StackedTransformer(base_layer.BaseLayer):
             assert self.num_layers - (len(hids) - 2) == dyn_dense_w.shape[-1] / self.dynamic_dense_num_groups
             dyn_dense_w = rearrange(dyn_dense_w, 'B T (L G) -> B T L G', G=self.dynamic_dense_num_groups)
             dws_key_wise.append(dyn_dense_w) # BTLG; L=num_layers - i
-          def _ov_transform(_x, ov):
+          def _ov_transform(_x, ov, normalize=False):
             if ov is None: # identity transformation
-              return _x 
+              return _x if not normalize else self.x_layers[i].dense_norm(_x) 
             else: # low_rank transformation
               ov1, ov2, ov_gate = ov 
               _layer = self.x_layers[i]
@@ -2613,19 +2675,26 @@ class StackedTransformer(base_layer.BaseLayer):
                 if self.dynamic_dense_type is not None:
                   dyn_dense_w = dyn_dense_w + dense_w[:,None,None,:,None]  # CBTL1 + C11L1 -> CBTL1
                   C = len(self.dynamic_dense_type)
-                  if self.attn_out_orig: # CBTL
+                  if self.dynamic_dense_type == 'qkvm' and self.attn_out_orig: # CBTL
                     assert self.dynamic_dense_type == 'qkvm'
                     x_out_qkv = [sum([dyn_dense_w[cidx,:,:,j] * hids[(j-1)*2+1] for j in range(1,i+2)]) + hids[-1] for cidx in range(3)] # 3BTL, LBTD -> 3BTD; L = num_layers  
                     x_out_m = sum([dyn_dense_w[3,:,:,j] * hids[j*2] for j in range(0,i+2)]) # BTL, LBTD -> BTD; L = num_layers + 1 
                     x_out_qkv.append(x_out_m)
                     x_out = jnp.stack(x_out_qkv)
-                  else:
-                    x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before) for j in hid_idxs]) for cidx in range(C)])
+                  elif self.dynamic_dense_type == 'm' and not self.dynamic_dense_stack:
+                    x_out = (hids[-1], sum([dyn_dense_w[0,:,:,j] * _ov_transform(hids[j], ov_before) for j in hid_idxs]))
+                  else: # DyanmicDenseQKVM branch
+                    if self.dense_finetune_scale:
+                      #ft_scale = getattr(self.theta, f'dense_ft_scale_{i}')
+                      x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * (_ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) * getattr(self.theta, f'dense_ft_scale_{j}')[None,None,:]) for j in hid_idxs]) for cidx in range(C)])
+                    else:
+                      x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]) for cidx in range(C)])
                     if self.dynamic_dense_stack:
                       x_out = jnp.stack(x_out)
-                    # x_out = jnp.concatenate([hids[-1][None], x_out], axis=0)
-                else:
-                  x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j]) * _ov_transform(hids[j], ov_before) for j in hid_idxs]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
+                else: # dynamic dense branch
+                  dyn_dense_w = dyn_dense_w + dense_w[None,None,:,None]  # BTLG, L
+                  x_out = sum([dyn_dense_w[:,:,j] * _ov_transform(hids[j], ov_before) for j in hid_idxs]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
+                  # x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j]) * _ov_transform(hids[j], ov_before) for j in hid_idxs]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
               elif self.dynamic_dense_key_wise:
                 # dws_key_wise: [BTL,BTL,BT(L-1),...BT1] L=num_layers, len=25
                 x_out = sum([(dense_w[j] + dws_key_wise[j][:,:,self.num_layers-1-i]) * _ov_transform(hids[j], ov_before) for j in hid_idxs])
@@ -2658,9 +2727,9 @@ class StackedTransformer(base_layer.BaseLayer):
           v_in = jnp.einsum('CBSRD,CBSRN->CBSND', inner_v, dw2)
         else:
           if not self.head_dw1_norm_on_activation: dw1 = self.head_dw1_norm(dw1)
-          inner_v = sum(jnp.einsum('BSND,BSRN->BSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, LBSRN->BSRD
+          inner_v = sum(jnp.einsum('BSND,BSRN->BSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSrD, (C)LBSRr->(C)BSRD # 
           if self.head_dw1_norm_on_activation: inner_v = self.head_dw1_norm(inner_v) # rmsnorm
-          v_in = jnp.einsum('BSRD,CBSRN->CBSND', inner_v, dw2) # C=4, QKVO
+          v_in = jnp.einsum('BSRD,CBSRN->CBSND', inner_v, dw2) # C=4, QKVO  # [LBSrD -> BSND for _ in range(4)] # CLrN
           # dynamic_conv(v_out) : LBSND, LBS-> BSND
           # dynamic_conv4(v_out) : LBSND, CLBS1-> CBSND
           # dynamic_conv4_byhead(v_out) : LBSND, CLBSN-> CBSND
