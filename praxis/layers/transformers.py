@@ -1217,8 +1217,14 @@ class Transformer(base_layer.BaseLayer):
   layer_index: int = 0 
   num_layers: int = 1
   num_ffn: int = 1 # mqy; group of feedforward layer
+  hyper_conn: bool = False 
+  hyper_conn_n: int = 4
+  hyper_conn_merge_wcdc: bool = False # whether to merge width connection and depth connection
+  hyper_conn_tanh: bool = False
+  hyper_conn_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)  # mqy
   dense_conn: bool = False
   dense_conn_on_attn: bool = False
+  dense_conn_on_layerdiff: bool = False
   dynamic_dense: bool = False
   dynamic_dense_sep_qkv_ln: bool = False
   dynamic_dense_stack: bool = True
@@ -1397,6 +1403,8 @@ class Transformer(base_layer.BaseLayer):
       if self.dense_conn_on_attn:
         assert self.dynamic_dense_query_wise and not self.dynamic_dense_key_wise
         factor = 2 if not self.attn_out_orig else 1
+      elif self.dense_conn_on_layerdiff:
+        factor = 2
       else:
         factor = 1
       if self.dynamic_dense: # BTD, DL-> BTL
@@ -1441,7 +1449,64 @@ class Transformer(base_layer.BaseLayer):
           )
           self.create_variable(f'dynamic_dense_gate_{i}', dyn_dense_proj_gate)
 
- 
+    if self.hyper_conn:
+      self.create_child('hyper_conn_norm', self.hyper_conn_norm_tpl.clone().set(dim=self.input_dims))
+      # static w: alpha_sw, beta_sw
+      m_w = np.array([1 if _i == self.layer_index % self.hyper_conn_n else 0 for _i in range(self.hyper_conn_n)]) 
+      r_w = np.eye(self.hyper_conn_n)
+      sw_arr = np.concatenate([m_w[:,None], r_w], axis=-1)
+      alpha_sw = WeightHParams(
+          shape=[self.hyper_conn_n, 1+self.hyper_conn_n], # N(1+N)
+          init=WeightInit.Constant(sw_arr.tolist()), 
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=[None, None],
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
+      )
+      self.create_variable('hyper_conn_alpha_sw', alpha_sw)
+      beta_sw = WeightHParams(
+          shape=[self.hyper_conn_n], # N
+          init=WeightInit.Constant(1), 
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=[None],
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
+      )
+      self.create_variable('hyper_conn_beta_sw', beta_sw)
+      # dynamic alpha w: alpha_dw, alpha_scale
+      # std = 1/ math.sqrt(self.input_dims)
+      alpha_dw = WeightHParams(
+          shape=[self.input_dims, 1+self.hyper_conn_n], # D(1+N)
+          # init=WeightInit.Gaussian(std),
+          init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=['data', None],
+      )
+      alpha_scale = WeightHParams(
+          shape=[1],
+          init=WeightInit.Constant(0.01), # L or CL
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=[None],
+      )
+      self.create_variable('hyper_conn_alpha_dw', alpha_dw)
+      self.create_variable('hyper_conn_alpha_scale', alpha_scale)
+      # dynamic beta w: beta_dw, beta_scale
+      # std = 1/ math.sqrt(self.input_dims)
+      beta_dw = WeightHParams(
+          shape=[self.input_dims], # D
+          # init=WeightInit.Gaussian(std),
+          init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None],
+      )
+      beta_scale = WeightHParams(
+          shape=[1],
+          init=WeightInit.Constant(0.01), # L or CL
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=[None],
+      )
+      self.create_variable('hyper_conn_beta_dw', beta_dw)
+      self.create_variable('hyper_conn_beta_scale', beta_scale)
+
+
     if self.laurel_rw:
         init_v = [1, 1]
         rw = WeightHParams(
@@ -1643,6 +1708,7 @@ class Transformer(base_layer.BaseLayer):
       segment_pos: Optional[JTensor] = None,
       segment_ids: Optional[JTensor] = None,
       v_in:Optional[JTensor] = None, # mqy: cross head values, 2BTNd (2:q/k) 
+      hhids:Optional[JTensor] = None, # mqy: hyper hidden states, NBTD (N:4) 
       ) -> Tuple[JTensor, JTensor]:
     """Transformer decoder layer.
 
@@ -1677,6 +1743,21 @@ class Transformer(base_layer.BaseLayer):
 
     # self.add_summary('attention_input_rms', _rms(inputs), verbosity=4)
 
+    if self.hyper_conn and not self.hyper_conn_merge_wcdc: # width connections
+      alpha_sw, alpha_dw, alpha_scale = getattr(self.theta, 'hyper_conn_alpha_sw'), getattr(self.theta, 'hyper_conn_alpha_dw'), getattr(self.theta, 'hyper_conn_alpha_scale')
+      beta_sw, beta_dw, beta_scale = getattr(self.theta, 'hyper_conn_beta_sw'), getattr(self.theta, 'hyper_conn_beta_dw'), getattr(self.theta, 'hyper_conn_beta_scale')
+      hhids_normed = self.hyper_conn_norm(hhids)
+      B_w = jnp.einsum('NBTD, D->BTN', hhids_normed, beta_dw) # beta 
+      Amr_w = jnp.einsum('NBTD, DM->BTNM', hhids_normed, alpha_dw) # alpha  BTN(1+N)
+      if self.hyper_conn_tanh: 
+        B_w = jnp.tanh(B_w)
+        Amr_w = jnp.tanh(Amr_w)
+      Amr_w = Amr_w * alpha_scale + alpha_sw[None,None]
+      B_w = B_w * beta_scale + beta_sw[None,None]
+      Am_w, Ar_w = Amr_w[...,0], Amr_w[...,1:] # BTN, BTNN
+      inputs = jnp.einsum('NBTD,BTN->BTD', hhids, Am_w) # mixed inputs
+      hhids = jnp.einsum('NBTD,BTNM->MBTD',hhids,Ar_w) # mixed hyper hidden states
+      
     if self.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
@@ -1907,7 +1988,26 @@ class Transformer(base_layer.BaseLayer):
       _output = jnp.zeros(output.shape, dtype=output.dtype)
       ouput = output + _output.at[:, 1:, :].set(output[:,:-1] * tf_w[:,1:,:1]) + output * tf_w[:,:,1:]
     attn_out = atten_output_orig if self.attn_out_orig else atten_output
-    return output, attn_out, atten_probs, dyn_dense_w, dyn_head_dense_w, v_out  # pytype: disable=bad-return-type  # jax-ndarray
+    
+    if self.hyper_conn:
+      if not self.hyper_conn_merge_wcdc: # depth connections 
+        hhids = hhids +  jnp.einsum('BTD,BTN->NBTD',output - inputs, B_w)  # fuse current output into hyper hidden states
+      else:
+        alpha_sw, alpha_dw, alpha_scale = getattr(self.theta, 'hyper_conn_alpha_sw'), getattr(self.theta, 'hyper_conn_alpha_dw'), getattr(self.theta, 'hyper_conn_alpha_scale')
+        beta_sw, beta_dw, beta_scale = getattr(self.theta, 'hyper_conn_beta_sw'), getattr(self.theta, 'hyper_conn_beta_dw'), getattr(self.theta, 'hyper_conn_beta_scale')
+        hhids_normed = self.hyper_conn_norm(hhids)
+        B_w = jnp.einsum('NBTD, D->BTN', hhids_normed, beta_dw) # beta 
+        Amr_w = jnp.einsum('NBTD, DM->BTNM', hhids_normed, alpha_dw) # alpha  BTN(1+N)
+        if self.hyper_conn_tanh: 
+          B_w = jnp.tanh(B_w)
+          Amr_w = jnp.tanh(Amr_w)
+        Amr_w = Amr_w * alpha_scale + alpha_sw[None,None]
+        B_w = B_w * beta_scale + beta_sw[None,None]
+        Am_w, Ar_w = Amr_w[...,0], Amr_w[...,1:] # BTN, BTNN
+        hhids = jnp.einsum('NBTD,BTNM->MBTD',hhids,Ar_w) +  jnp.einsum('BTD,BTN->NBTD',output - inputs, B_w)  # fuse current output into hyper hidden states
+        output = jnp.einsum('NBTD,BTN->BTD', hhids, Am_w)
+
+    return output, attn_out, atten_probs, dyn_dense_w, dyn_head_dense_w, v_out, hhids  # pytype: disable=bad-return-type  # jax-ndarray
 
   def extend_step(self,
                   inputs: JTensor,
@@ -2120,8 +2220,14 @@ class StackedTransformer(base_layer.BaseLayer):
   slope_rate_lidxs: Optional[list] = None 
   lrpe_layers: Optional[list] = None
   pre_compute_atten_mask: bool = True
+  hyper_conn: bool = False 
+  hyper_conn_merge_wcdc: bool = False # whether to merge width connection and depth connection
+  hyper_conn_n: int = 4
+  hyper_conn_tanh: bool = False
+  hyper_conn_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)  # mqy
   dense_conn: bool = False
   dense_conn_on_attn: bool = False
+  dense_conn_on_layerdiff: bool = False
   dense_conn_learnable: bool = True
   dense_finetune_scale: bool = False
   num_ffn: int = 1 # mqy; group of feedforward layer
@@ -2267,12 +2373,20 @@ class StackedTransformer(base_layer.BaseLayer):
         p_i.residual_droppath_prob = (
             self.residual_droppath_prob * i / max(1, self.num_layers)
         )
+      # hyper connections params
+      p_i.hyper_conn = self.hyper_conn 
+      p_i.hyper_conn_n = self.hyper_conn_n
+      p_i.hyper_conn_tanh = self.hyper_conn_tanh
+      p_i.hyper_conn_norm_tpl = self.hyper_conn_norm_tpl
+      p_i.hyper_conn_merge_wcdc = self.hyper_conn_merge_wcdc
+      
       # dense params
       p_i.layer_index = i
       p_i.num_ffn = self.num_ffn
       p_i.num_layers = self.num_layers
       p_i.dense_conn = self.dense_conn
       p_i.dense_conn_on_attn = self.dense_conn_on_attn
+      p_i.dense_conn_on_layerdiff = self.dense_conn_on_layerdiff
       p_i.dynamic_dense = self.dynamic_dense
       p_i.dynamic_dense_sep_qkv_ln = self.dynamic_dense_sep_qkv_ln
       p_i.dynamic_dense_stack = self.dynamic_dense_stack
@@ -2385,7 +2499,7 @@ class StackedTransformer(base_layer.BaseLayer):
       if self.dense_conn_learnable:
         b_init_method = self.dense_bias_init_method if not self.comp_dense_diff else 'uniform' # use uniform init with comp_dense_diff
         C = len(self.dynamic_dense_type) if self.dynamic_dense_type is not None else None # 'qkv'
-        if self.dense_conn_on_attn:
+        if self.dense_conn_on_attn or self.dense_conn_on_layerdiff:
           assert 'current_only' in b_init_method
           factor = 2 if not self.attn_out_orig else 1
         else:
@@ -2525,8 +2639,9 @@ class StackedTransformer(base_layer.BaseLayer):
         cross_attention_mask,
         segment_pos,
         v_in,
+        hhids,
     ):
-      x_out, atten_output, _, dyn_dense_w, dyn_head_dense_w, v_out = transformer(
+      x_out, atten_output, _, dyn_dense_w, dyn_head_dense_w, v_out, hhids = transformer(
           x_in,
           paddings,
           attention_mask,
@@ -2534,6 +2649,7 @@ class StackedTransformer(base_layer.BaseLayer):
           cross_attention_mask,
           segment_pos=segment_pos,
           v_in=v_in,
+          hhids=hhids,
       )
       # dyn_dense_w = None
       # if dyn_dense_proj is not None:
@@ -2550,7 +2666,7 @@ class StackedTransformer(base_layer.BaseLayer):
 
       #   # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', self.dense_norm(x_out), dyn_dense_proj)
       #   # dyn_dense_w = self.dense_norm(dyn_dense_w)
-      return x_out, atten_output, dyn_dense_w, dyn_head_dense_w, v_out
+      return x_out, atten_output, dyn_dense_w, dyn_head_dense_w, v_out, hhids
 
     fprop = _fprop
     if self.remat:
@@ -2572,6 +2688,11 @@ class StackedTransformer(base_layer.BaseLayer):
         dyn_dense_w_keywise = rearrange(dyn_dense_w_keywise, 'B T (L G) -> B T L G', G=self.dynamic_dense_num_groups)
         dws_key_wise = [dyn_dense_w_keywise] # BTLG, L=num_layers
 
+    if self.hyper_conn:
+      hhids = jnp.stack([x_out] * self.hyper_conn_n) # nD hyper hidden states
+    else:
+      hhids = None
+
     if self.use_recurrent_layer_mixing:
       h_0 = jnp.zeros(x_out.shape, dtype=self.fprop_dtype)
       cell_0 = jnp.zeros(x_out.shape, dtype=self.fprop_dtype)
@@ -2579,14 +2700,14 @@ class StackedTransformer(base_layer.BaseLayer):
     v_in = None
     v_outs = []
     x_in = x_out
-    block_factor = 2 if self.dense_conn_on_attn else 1
+    block_factor = 2 if self.dense_conn_on_attn or self.dense_conn_on_layerdiff else 1
     for i in range(self.num_layers):  
       hid_idxs = list(range((i+1)*block_factor +1))
       # if self.dynamic_dense:
       #   dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{i}'),  getattr(self.theta, f'dynamic_dense_conn2_{i}'))
       # else:
       #   dyn_dense_proj = None 
-      x_out, atten_output, dyn_dense_w, dyn_head_dense_w, v_out = fprop(
+      x_out, atten_output, dyn_dense_w, dyn_head_dense_w, v_out, hhids = fprop(
           self.x_layers[i],
           x_in,
           paddings,
@@ -2595,6 +2716,7 @@ class StackedTransformer(base_layer.BaseLayer):
           cross_attention_mask,
           segment_pos,
           v_in,
+          hhids,
       )
       x_out = checkpoint_name(x_out, 'transformer_layer_out')
       v_in = None
@@ -2607,6 +2729,11 @@ class StackedTransformer(base_layer.BaseLayer):
         dense_w = getattr(self.theta, f'dense_conn_{i}') if self.dense_conn_learnable else jnp.array([0] * (i+1) + [1]) 
         if self.dense_conn_on_attn:
           hids.append(atten_output)
+        elif self.dense_conn_on_layerdiff:
+          if self.dynamic_dense_type is not None and self.dynamic_dense_type.endswith('m'):
+            hids.append(x_out - x_in[-1])
+          else:
+            hids.append(x_out - x_in)
         if self.comp_dense_diff:
           if self.dynamic_dense_type is not None and self.dynamic_dense_type.endswith('m'):
             hids.append(x_out - x_in[-1])
@@ -2740,6 +2867,8 @@ class StackedTransformer(base_layer.BaseLayer):
       x_in = x_out   
     if self.dynamic_dense_type is not None:
       x_out = x_out[1] # dynamic combination of all previous layer outputs
+    elif self.hyper_conn:
+      x_out = hhids.sum(axis=0)
     return x_out
 
   def extend_step(self,
