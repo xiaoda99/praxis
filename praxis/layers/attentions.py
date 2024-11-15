@@ -2856,7 +2856,7 @@ class DotProductAttention(base_layer.BaseLayer):
     else:
       # Project inputs to key, value and query, respectively has shape
       # [B, S, N, H], [B, S, N, H], and [B, T, N, H].
-      query_proj = self.query(query_vec)
+      query_proj = self.query(query_vec) # BTNd
       key_proj = self.key(key_vec)
       value_proj = self.value(value_vec)
       if self.value_gate_activation_cls:  # XD

@@ -62,6 +62,9 @@ def _rms(x):
   # Note: under pmap .mean() will produce a local mean, not across all hosts.
   return (x**2.).mean().astype(jnp.float32)**.5
 
+def _contains_one(string, s_l):
+  return any([s in string for s in s_l])
+
 
 def _rel_cos(x, y):
   """Computes cosine similarity between residual x and layer output y."""
@@ -295,6 +298,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
   use_gated_activation: bool = False
   fflayer_tpl: LayerTpl = template_field(linears.FeedForward)
   ln_tpl: LayerTpl = template_field(normalizations.LayerNorm)
+  seperate_gating_ln: bool = False # mqy
   residual_dropout_prob: float = 0.0
   relu_dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
   relu_dropout_prob: float = 0.0
@@ -356,6 +360,11 @@ class TransformerFeedForward(base_layer.BaseLayer):
       ln_p.name = 'fflayer_ln'
       ln_p.dim = self.input_dims
       self.create_child('layer_norm', ln_p)
+      if self.seperate_gating_ln:
+        ln_p = self.ln_tpl.clone()
+        ln_p.name = 'fflayer_ln_gating'
+        ln_p.dim = self.input_dims
+        self.create_child('layer_norm_gating', ln_p)
     else:
       raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
@@ -453,7 +462,8 @@ class TransformerFeedForward(base_layer.BaseLayer):
   def __call__(self,
                inputs: JTensor,
                paddings: Optional[JTensor] = None,
-               segment_ids: Optional[JTensor] = None) -> JTensor:
+               segment_ids: Optional[JTensor] = None,
+               gate_inputs: Optional[JTensor] = None) -> JTensor:
     # Expand paddings to last dim if not None to have shape [batch, time, 1]
     if paddings is not None:
       paddings = jnp.expand_dims(paddings, axis=-1)
@@ -464,10 +474,14 @@ class TransformerFeedForward(base_layer.BaseLayer):
     self.add_summary('input_rms', _rms(inputs), verbosity=4)
     residual = inputs
 
+    if gate_inputs is None: gate_inputs = inputs 
+    
     if self.norm_policy == 'primer_hybrid':
       inputs = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
       inputs = self.layer_norm(inputs)
+      if self.seperate_gating_ln:
+        gate_inputs = self.layer_norm_gating(gate_inputs)
 
     if self.norm_policy in ('primer_hybrid', 'pre'):
       self.add_summary('input_norm_rms', _rms(inputs), verbosity=4)
@@ -476,7 +490,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
       # Apply first FFN layer
       if self._is_ffn1_gated:
         # theta.ffn_layer1_gate corresponds to gshard_builder's wi0
-        gate_value = self.ffn_layer1_gate(inputs)
+        gate_value = self.ffn_layer1_gate(gate_inputs)
         # theta.ffn_layer1 corresponds to gshard_builder's wi1
         activations = gate_value * self.ffn_layer1(inputs)
       else:
@@ -504,7 +518,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
       outputs = None
       for i in range(self.n_chunks):
         if self._is_ffn1_gated:
-          gate_value = self.ffn_layer1_gate[i](inputs)
+          gate_value = self.ffn_layer1_gate[i](gate_inputs)
           activations = gate_value * self.ffn_layer1[i](inputs)
         else:
           activations = self.ffn_layer1[i](inputs)
@@ -1241,6 +1255,9 @@ class Transformer(base_layer.BaseLayer):
   dynamic_dense_multilayer: bool = True
   dynamic_dense_gate_mlp: bool = False
   dynamic_dense_glu_mlp: bool = False 
+  dynamic_dense_seperate_gating_ln: bool = False
+  dynamic_dense_share_qk_way: bool = False # default: share q/k/v with mlp way cross-layer composition
+  dynamic_dense_fix_last_layer: bool = False # reduce static dense and dynamic dense to 1-way
   v_out_rank: Optional[int] = None
   v_out_dynamic: bool = False
   attn_out_orig: bool = False
@@ -1297,8 +1314,12 @@ class Transformer(base_layer.BaseLayer):
       params.name = 'layer_norm'
       params.dim = self.input_dims
       self.create_child('layer_norm', params)
-      if self.dynamic_dense_type is not None and 'qkv' in self.dynamic_dense_type and self.dynamic_dense_sep_qkv_ln:
-        self.create_children('layer_norms', [self.ln_tpl.clone().set(name=f'layer_norm_{cidx}', dim=self.input_dims) for cidx in range(3)])
+      if self.dynamic_dense_type is not None and self.dynamic_dense_sep_qkv_ln:
+        num_lns = sum([self.dynamic_dense_type.count(s) for s in 'qkv']) 
+        assert self.dynamic_dense_type.endswith('m') # qkvm, kvm, qkm, qvm
+        if not self.dynamic_dense_share_qk_way: 
+          num_lns = min(3, num_lns+1) # Due to sharing one-way cross-layer composition with mlp, we need to create one more layernorm when num_qkv <3 
+        self.create_children('layer_norms', [self.ln_tpl.clone().set(name=f'layer_norm_{cidx}', dim=self.input_dims) for cidx in range(num_lns)])
     else:
       raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
@@ -1356,6 +1377,7 @@ class Transformer(base_layer.BaseLayer):
           params.residual_droppath_prob = self.residual_droppath_prob
           params.norm_policy = self.norm_policy
           params.add_skip_connection = not self.gpt_j_residual  # XD
+          params.seperate_gating_ln = self.dynamic_dense_seperate_gating_ln # mqy
           self.create_child('ff_layer', params)
         else:
           params_list = []
@@ -1414,7 +1436,10 @@ class Transformer(base_layer.BaseLayer):
           l = (i + 1) * factor + 1
         elif self.dynamic_dense_key_wise:
           l = self.num_layers - i
-        C = len(self.dynamic_dense_type) if self.dynamic_dense_type is not None else 1 
+        if self.dynamic_dense_type is not None:
+          C = 1 if self.dynamic_dense_fix_last_layer and i== self.num_layers-1 else len(self.dynamic_dense_type)
+        else:
+          C = 1 
         l = l * self.dynamic_dense_num_groups * C 
         std = 1/math.sqrt(self.input_dims) 
         dyn_dense_proj1 = WeightHParams(
@@ -1765,9 +1790,19 @@ class Transformer(base_layer.BaseLayer):
         inputs_normalized = self.layer_norm(inputs) # BTD; CBTD 
       else: # tuple
         assert isinstance(inputs, tuple)
-        if self.dynamic_dense_type is not None and 'qkv' in self.dynamic_dense_type:
+        if self.dynamic_dense_type is not None and _contains_one(self.dynamic_dense_type, ['qkv','kvm', 'qkm', 'qvm']): # q,k,v,[q/k/v][q/k/v], qkv
+          # num_qkv = sum([self.dynamic_dense_type.count(s) for s in 'qkv']) 
           if self.dynamic_dense_sep_qkv_ln:
-            inputs_normalized = [ln(_inputs) for _inputs, ln in zip(inputs[:3], self.layer_norms)]
+            assert self.dynamic_dense_type.endswith('m')
+            inputs_normalized = []
+            for _type in 'qkv':
+              if _type in self.dynamic_dense_type:
+                _idx = self.dynamic_dense_type.index(_type)
+              elif self.dynamic_dense_share_qk_way and _type in ['q', 'k']:
+                _idx = self.dynamic_dense_type.index('qk'.replace(_type, '')) # q->k or k->q
+              else: # share mlp-way cross-layer composition
+                _idx = -1
+              inputs_normalized.append(self.layer_norms[_idx](inputs[_idx]))
           else: 
             inputs_normalized = [self.layer_norm(_inputs) for _inputs in inputs]
         else: # dynamic_dense_type = 'm' 
@@ -1776,7 +1811,7 @@ class Transformer(base_layer.BaseLayer):
     else:
       inputs_normalized = inputs
 
-    if self.dynamic_dense_type is not None and self.layer_index !=0 :
+    if self.dynamic_dense_type is not None and self.layer_index > 0 :
       dyn_inputs = inputs
       inputs = inputs[-1] if self.dynamic_dense_type.endswith('m') else inputs[0]
     if self.use_mamba:
@@ -1785,7 +1820,7 @@ class Transformer(base_layer.BaseLayer):
     else:
       ### beginning of attn_mlp
       # Compute self-attention, key/value vectors are the input itself
-      if self.dynamic_dense_type is not None and 'qkv' in self.dynamic_dense_type and self.layer_index !=0:
+      if self.dynamic_dense_type is not None and _contains_one(self.dynamic_dense_type, ['qkv','kvm','qkm','qvm']) and self.layer_index >0:
         query_vec, key_vec, value_vec = inputs_normalized[0], inputs_normalized[1], inputs_normalized[2]
       else:
         query_vec, key_vec, value_vec = inputs_normalized, inputs_normalized, inputs_normalized
@@ -1817,7 +1852,7 @@ class Transformer(base_layer.BaseLayer):
       if self.residual_droppath_prob > 0.0:
         atten_output = self.residual_droppath(inputs, atten_output)
       else:
-        if self.dynamic_dense_type is not None and 'm' in self.dynamic_dense_type and self.layer_index !=0:
+        if self.dynamic_dense_type is not None and self.dynamic_dense_type.endswith('m') and self.layer_index > 0:
           res = dyn_inputs[-1]
         else:
           res = inputs
@@ -1892,7 +1927,10 @@ class Transformer(base_layer.BaseLayer):
 
       # Apply FFN layer
       if self.num_ffn == 1: # default
-        output = self.ff_layer(mlp_input, paddings=paddings) \
+        gate_inputs = None 
+        if self.layer_index >0 and self.dynamic_dense_type is not None and 'g' in self.dynamic_dense_type:
+          gate_inputs = atten_output_orig + dyn_inputs[self.dynamic_dense_type.index('g')]
+        output = self.ff_layer(mlp_input, paddings=paddings, gate_inputs=gate_inputs) \
           if not self.gpt_j_residual else atten_output + self.ff_layer(inputs, paddings=paddings)  # XD
         if self.dynamic_dense_type is not None and 'l' in self.dynamic_dense_type and self.layer_index !=0:
           output = (output - mlp_input) + atten_output_orig + dyn_inputs[self.dynamic_dense_type.index('l')] # -2 for 'qkvlm'
@@ -2252,6 +2290,9 @@ class StackedTransformer(base_layer.BaseLayer):
   dynamic_dense_glu_mlp: bool = False  
   dynamic_dense_norm_on_weight: bool = False 
   dynamic_dense_disentangle: bool = False 
+  dynamic_dense_seperate_gating_ln: bool = False
+  dynamic_dense_share_qk_way: bool = False # default: share q/k/v with mlp way cross-layer composition
+  dynamic_dense_fix_last_layer: bool = False # reduce multi-way static and dynamic dense to 1-way
   v_out_rank: Optional[int] = None
   v_out_dynamic: bool = False
   attn_out_orig: bool = False
@@ -2403,8 +2444,11 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.dynamic_dense_multilayer = self.dynamic_dense_multilayer
       p_i.dynamic_dense_gate_mlp = self.dynamic_dense_gate_mlp
       p_i.dynamic_dense_glu_mlp = self.dynamic_dense_glu_mlp 
+      p_i.dynamic_dense_seperate_gating_ln = self.dynamic_dense_seperate_gating_ln
       p_i.dense_bias_init_method = self.dense_bias_init_method
       p_i.comp_dense_diff = self.comp_dense_diff
+      p_i.dynamic_dense_share_qk_way = self.dynamic_dense_share_qk_way
+      p_i.dynamic_dense_fix_last_layer = self.dynamic_dense_fix_last_layer
 
       p_i.laurel_lr = self.laurel_lr
       p_i.laurel_rw = self.laurel_rw
@@ -2485,7 +2529,7 @@ class StackedTransformer(base_layer.BaseLayer):
       assert len(self.dynamic_head_dense) == self.num_layers
 
     if self.dynamic_dense_type is not None:
-      assert self.dynamic_dense_type in ['qkv', 'qkvm', 'm', 'qkvmm', 'qkvlm']
+      assert self.dynamic_dense_type in ['qkv', 'qkvm', 'm', 'qkvmm', 'qkvlm', 'qkvgm', 'kvm', 'qkm', 'qvm']
 
     layer_params = [_layer_params(i) for i in range(self.num_layers)]
     self.create_children('x_layers', layer_params)
@@ -2498,13 +2542,16 @@ class StackedTransformer(base_layer.BaseLayer):
       assert self.dense_bias_init_method in ['current_only', 'emb_only', 'uniform', 'zeros3+current_only', 'current_only_softmax']
       if self.dense_conn_learnable:
         b_init_method = self.dense_bias_init_method if not self.comp_dense_diff else 'uniform' # use uniform init with comp_dense_diff
-        C = len(self.dynamic_dense_type) if self.dynamic_dense_type is not None else None # 'qkv'
         if self.dense_conn_on_attn or self.dense_conn_on_layerdiff:
           assert 'current_only' in b_init_method
           factor = 2 if not self.attn_out_orig else 1
         else:
           factor = 1
         for i in range(self.num_layers):
+          if self.dynamic_dense_type is not None:
+            C = 1 if i==self.num_layers-1 and self.dynamic_dense_fix_last_layer else len(self.dynamic_dense_type)
+          else:
+            C = None 
           if b_init_method == 'uniform':
             init_v = [1] * (i+2) 
           elif b_init_method == 'current_only':
@@ -2756,6 +2803,9 @@ class StackedTransformer(base_layer.BaseLayer):
             assert ov is not None
           if not self.attn_out_orig:
             assert len(hids) == dense_w.shape[-1] and dyn_dense_w is not None
+          
+          if self.dynamic_dense_type is not None:
+            C = 1 if self.dynamic_dense_fix_last_layer and i==self.num_layers-1  else len(self.dynamic_dense_type) 
           if self.dynamic_dense_query_wise and self.dynamic_dense_key_wise:
             assert self.dynamic_dense_num_groups == 1 and not self.dynamic_dense_normalized
             assert self.num_layers + 2 == dyn_dense_w.shape[-1] / self.dynamic_dense_num_groups 
@@ -2764,7 +2814,6 @@ class StackedTransformer(base_layer.BaseLayer):
             dws_key_wise.append(kw)
           elif self.dynamic_dense_query_wise: # default
             if self.dynamic_dense_type is not None:
-              C = len(self.dynamic_dense_type)
               dyn_dense_w = rearrange(dyn_dense_w, 'B T (C L G) -> C B T L G', G=self.dynamic_dense_num_groups, C=C)
             else: # default
               assert len(hids) == dyn_dense_w.shape[-1] / self.dynamic_dense_num_groups
@@ -2801,7 +2850,7 @@ class StackedTransformer(base_layer.BaseLayer):
               elif self.dynamic_dense_query_wise: # default
                 if self.dynamic_dense_type is not None:
                   dyn_dense_w = dyn_dense_w + dense_w[:,None,None,:,None]  # CBTL1 + C11L1 -> CBTL1
-                  C = len(self.dynamic_dense_type)
+                  # C = len(self.dynamic_dense_type)
                   if self.dynamic_dense_type == 'qkvm' and self.attn_out_orig: # CBTL
                     assert self.dynamic_dense_type == 'qkvm'
                     x_out_qkv = [sum([dyn_dense_w[cidx,:,:,j] * hids[(j-1)*2+1] for j in range(1,i+2)]) + hids[-1] for cidx in range(3)] # 3BTL, LBTD -> 3BTD; L = num_layers  
@@ -2810,11 +2859,10 @@ class StackedTransformer(base_layer.BaseLayer):
                     x_out = jnp.stack(x_out_qkv)
                   elif self.dynamic_dense_type == 'm' and not self.dynamic_dense_stack:
                     x_out = (hids[-1], sum([dyn_dense_w[0,:,:,j] * _ov_transform(hids[j], ov_before) for j in hid_idxs]))
-                  else: # DyanmicDenseQKVM branch
+                  else: # DyanmicDense ['qkvm', 'qkvgm', 'qkm', 'qvm', 'kvm'] branch
                     if self.dense_finetune_scale:
-                      #ft_scale = getattr(self.theta, f'dense_ft_scale_{i}')
                       x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * (_ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) * getattr(self.theta, f'dense_ft_scale_{j}')[None,None,:]) for j in hid_idxs]) for cidx in range(C)])
-                    else:
+                    else: # default 
                       x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]) for cidx in range(C)])
                     if self.dynamic_dense_stack:
                       x_out = jnp.stack(x_out)
@@ -2866,7 +2914,7 @@ class StackedTransformer(base_layer.BaseLayer):
           # v_in = sum(v_outs[j] for j in range(i+1)) / len(v_outs); v_in = v_in[None]
       x_in = x_out   
     if self.dynamic_dense_type is not None:
-      x_out = x_out[1] # dynamic combination of all previous layer outputs
+      x_out = x_out[0] if self.dynamic_dense_fix_last_layer else x_out[1] # dynamic combination of all previous layer outputs
     elif self.hyper_conn:
       x_out = hhids.sum(axis=0)
     return x_out
