@@ -135,12 +135,12 @@ def compute_xent_loss_helper(
   batch_weights = jnp.sum(weights, axis=-1)
   batch_weights = jnp.maximum(batch_weights, 1)
   logging.info(f'acc_batch_mean: {acc_batch_mean}')
-  if acc_batch_mean:
-      batch_right = jnp.sum((labels == predicted_labels) * weights, axis=-1)
-      batch_mean_acc = jnp.mean(batch_right / batch_weights)
-      fraction_of_correct_next_step_preds = (batch_mean_acc, metric_weight)
-  else:
-      fraction_of_correct_next_step_preds = (mean_acc, metric_weight)
+  # if acc_batch_mean:
+  batch_right = jnp.sum((labels == predicted_labels) * weights, axis=-1)
+  batch_mean_acc = jnp.mean(batch_right / batch_weights)
+    # fraction_of_correct_next_step_preds = (batch_mean_acc, metric_weight)
+  # else:
+  fraction_of_correct_next_step_preds = (mean_acc, metric_weight)
 
   if hasattr(predictions, 'avg_xent_weight'):
     avg_xent_weight = predictions.avg_xent_weight
@@ -157,6 +157,8 @@ def compute_xent_loss_helper(
       log_pplx=(predictions.avg_xent, avg_xent_weight),
       fraction_of_correct_next_step_preds=fraction_of_correct_next_step_preds,
       num_predictions=(num_preds, jnp.array(1.0, num_preds.dtype)),
+      batch_avg_xent=(predictions.batch_avg_xent, avg_xent_weight),
+      batch_avg_acc=(batch_mean_acc, metric_weight)
   )
   if report_strict_acc:
     num_acc = jnp.sum(weights, axis=-1, dtype=jnp.float32)
