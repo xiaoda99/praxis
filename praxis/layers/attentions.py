@@ -1972,6 +1972,7 @@ class DotProductAttention(base_layer.BaseLayer):
   compose_mode: str = 'lp' # mqy ['lp', 'qkvo'] + combinations of ['q', 'k', 'v', 'o']; lp: logits+probs
   compose_residual: bool = True
   compose_inner_norm: bool = False
+  dynamic_dense_by_group_heads: bool = False
 
   # SPMD partition related params.
   #
@@ -2859,6 +2860,13 @@ class DotProductAttention(base_layer.BaseLayer):
       query_proj = self.query(query_vec) # BTNd
       key_proj = self.key(key_vec)
       value_proj = self.value(value_vec)
+      if self.dynamic_dense_by_group_heads: # mqy: ugly aproximation
+        assert self.num_heads == 16 
+        _query_proj = jnp.concatenate([query_proj[:,:,:5], key_proj[:,:,:5], value_proj[:,:,:5],query_proj[:,:,-1:]],axis=-2)
+        _key_proj = jnp.concatenate([query_proj[:,:,5:10], key_proj[:,:,5:10], value_proj[:,:,5:10],key_proj[:,:,-1:]],axis=-2)
+        _value_proj = jnp.concatenate([query_proj[:,:,10:15], key_proj[:,:,10:15], value_proj[:,:,10:15],value_proj[:,:,-1:]],axis=-2)
+        query_proj, key_proj, value_proj = _query_proj, _key_proj, _value_proj
+
       if self.value_gate_activation_cls:  # XD
         value_gate_proj = self.value_gate(value_vec)
         value_gate_proj = self._shard_blnh(value_gate_proj)

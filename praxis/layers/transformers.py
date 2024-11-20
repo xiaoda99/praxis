@@ -473,15 +473,16 @@ class TransformerFeedForward(base_layer.BaseLayer):
 
     self.add_summary('input_rms', _rms(inputs), verbosity=4)
     residual = inputs
-
-    if gate_inputs is None: gate_inputs = inputs 
     
     if self.norm_policy == 'primer_hybrid':
       inputs = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
       inputs = self.layer_norm(inputs)
-      if self.seperate_gating_ln:
+      if self.seperate_gating_ln: 
+        assert gate_inputs is not None
         gate_inputs = self.layer_norm_gating(gate_inputs)
+      else:
+        gate_inputs = inputs
 
     if self.norm_policy in ('primer_hybrid', 'pre'):
       self.add_summary('input_norm_rms', _rms(inputs), verbosity=4)
@@ -2293,6 +2294,7 @@ class StackedTransformer(base_layer.BaseLayer):
   dynamic_dense_seperate_gating_ln: bool = False
   dynamic_dense_share_qk_way: bool = False # default: share q/k/v with mlp way cross-layer composition
   dynamic_dense_fix_last_layer: bool = False # reduce multi-way static and dynamic dense to 1-way
+  dynamic_dense_by_group_heads: bool = False
   v_out_rank: Optional[int] = None
   v_out_dynamic: bool = False
   attn_out_orig: bool = False
@@ -2483,6 +2485,8 @@ class StackedTransformer(base_layer.BaseLayer):
         p_i.tr_fflayer_tpl = moe_p
 
       atten_tpl = p_i.tr_atten_tpl
+
+      atten_tpl.dynamic_dense_by_group_heads = self.dynamic_dense_by_group_heads
       # assert atten_tpl.project_logits
       # assert atten_tpl.project_probs
       # if i == 1:
