@@ -380,6 +380,18 @@ class WeightInit:
 
   @pax_fiddle.auto_config
   @staticmethod
+  def MambaDtBias(scale: Union[float, bool] = 1.0):
+    """scale."""
+    return WeightInit('mamba_dt_bias', scale)
+
+  @pax_fiddle.auto_config
+  @staticmethod
+  def MambaALog(scale: Union[float, bool] = 1.0):
+    """scale."""
+    return WeightInit('mamba_a_log', scale)
+
+  @pax_fiddle.auto_config
+  @staticmethod
   def TruncatedGaussian(scale: float = 1.0):
     """scale * jax.random.truncated_normal(-2.0, 2.0)."""
     return WeightInit('truncated_gaussian', scale)
@@ -624,7 +636,8 @@ def init_var(
   assert var_p is not None and var_p.init is not None
   method = var_p.init.method
   scale = var_p.init.scale
-  assert isinstance(scale, (int, float))
+  if method != 'constant':
+    assert isinstance(scale, (int, float))
   shape = var_p.shape
   init_dtype = var_p.dtype
   fan_in_axes = var_p.fan_in_axes
@@ -707,7 +720,13 @@ def init_var(
     return scale * jrandom.truncated_normal(
         prng_key, lower=-2.0, upper=2.0, shape=shape, dtype=init_dtype)
   elif method in ['constant']:
-    return scale + jnp.zeros(shape=shape, dtype=init_dtype)
+    return jnp.array(scale) + jnp.zeros(shape=shape, dtype=init_dtype)
+  elif method in ['mamba_dt_bias']:
+    dt = jnp.exp(jax.random.uniform(prng_key, [32], dtype=jnp.float32, minval=0, maxval=1.0) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clip(min=1e-4)
+    inv_dt = dt + jnp.log(-jnp.expm1(-dt))
+    return inv_dt
+  elif method in ['mamba_a_log']:
+    return jnp.log(jax.random.uniform(prng_key, [32], dtype=jnp.float32, minval=1, maxval=16)) # [1,16]
   elif method in ['xavier']:
     fan_in, fan_out = get_fan_in_fan_out(shape, fan_in_axes, fan_out_axes)
     limit = scale * math.sqrt(6. / (fan_in + fan_out))
@@ -1240,6 +1259,7 @@ def instantiate_layer(layer_p: pax_fiddle.Config, scope: Any) -> BaseLayer:
     assert jax_context is not None
     pre_created = jax_context.lookup_shared_layer(
         scope, layer_p.shared_weight_layer_id)
+    #logging.info(f"{layer_p.name}: pre_created is_None {pre_created is None};sid:{layer_p.shared_weight_layer_id}; scope:{list(scope._variables.keys())}{scope._variables['params'].keys()};context keys:{list(jax_context._root_scope_to_shared_layers_map[scope].keys())};scopes:{jax_context._root_scope_to_shared_layers_map.keys()}")
     if pre_created is not None:
       assert compatible_hparams(
           pre_created.hparams,

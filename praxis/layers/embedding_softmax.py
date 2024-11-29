@@ -268,19 +268,19 @@ class FullSoftmax(base_layer.BaseLayer):
     per_example_argmax = jax.lax.stop_gradient(
         jnp.argmax(logits.astype(jnp.float32), axis=-1))
 
-    if self.loss_batch_mean:
+    # if self.loss_batch_mean:
         # lsp class_weights: bsz * len * 1
-        # logging.info(f'============loss_batch_mean: {self.loss_batch_mean}==========')
-        logging.info(f'per_example_xent: {per_example_xent.shape} class_weights： {class_weights.shape}' )
-        total_xent_batch = jnp.sum(
-            jnp.expand_dims(per_example_xent, axis=-1) * class_weights,
-            dtype=jnp.float32, axis=-2,
-        )
-        total_weight_batch = jnp.maximum(jnp.sum(class_weights, dtype=jnp.float32, axis=-2), 1e-10)
-        batch_avg_xent = jnp.mean(total_xent_batch / total_weight_batch)
-    else:
-        # logging.info(f'============loss_batch_mean: {self.loss_batch_mean}==========')
-        batch_avg_xent = None
+    logging.info(f'============loss_batch_mean: {self.loss_batch_mean}==========')
+    logging.info(f'per_example_xent: {per_example_xent.shape} class_weights： {class_weights.shape}' )
+    total_xent_batch = jnp.sum(
+        jnp.expand_dims(per_example_xent, axis=-1) * class_weights,
+        dtype=jnp.float32, axis=-2,
+    )
+    total_weight_batch = jnp.maximum(jnp.sum(class_weights, dtype=jnp.float32, axis=-2), 1e-10)
+    batch_avg_xent = jnp.mean(total_xent_batch / total_weight_batch)
+    # else:
+    #     # logging.info(f'============loss_batch_mean: {self.loss_batch_mean}==========')
+    #     batch_avg_xent = None
 
     # Compute total softmax cross-entropy loss for the output tensor.
     total_xent = jnp.sum(
@@ -366,7 +366,8 @@ class FullSoftmax(base_layer.BaseLayer):
         per_example_xent=per_example_xent.astype(jnp.float32),
         total_xent=total_xent,
         total_weight=total_weight,
-        avg_xent=(total_xent / (total_weight + 1e-6)).astype(jnp.float32) if not self.loss_batch_mean else batch_avg_xent,
+        avg_xent=(total_xent / (total_weight + 1e-6)).astype(jnp.float32),# if not self.loss_batch_mean else batch_avg_xent,
+        batch_avg_xent=batch_avg_xent,
     )
     if self.z_loss_weight > 0.0:
       output_nmap['z_loss'] = z_loss
@@ -1115,7 +1116,10 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
     if position is None:
       seq_length = inputs.shape[1]
       position = jnp.arange(seq_length, dtype=jnp.float32)[jnp.newaxis, :]
-    position = position[:, :, jnp.newaxis, jnp.newaxis]
+    if len(position.shape) == 2: #BS
+      position = position[:, :, jnp.newaxis, jnp.newaxis]
+    elif len(position.shape) == 3: #BSN
+      position = position[:, :, :, jnp.newaxis]
     timescale = timescale[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
     sinusoid_inp = position / timescale
     sin = jnp.sin(sinusoid_inp)
@@ -1318,3 +1322,34 @@ class TrainablePositionalEmbedding(PositionalEmbedding):
         embs, ap.emb_out_split_dims_mapping, self.mesh_axis_names
     )
     return embs
+
+
+class LinearRelativePosEmbedding(base_layer.BaseLayer): # mqy https://huggingface.co/OpenNLPLab/TransNormerLLM-7B/blob/main/modeling_transnormer.py#L91-L118
+
+  num_heads: int = 16
+  embed_dim: int = 64
+  # seq_len: int = 1024
+
+  def setup(self) -> None:
+    super().setup()
+    d = self.num_heads * self.embed_dim
+    init_theta = 10000**(-2 / d * np.arange(d)).reshape(self.num_heads, 1, self.embed_dim) # head, t, d
+    self.create_variable(
+        'theta_v',
+        WeightHParams(
+            shape=[self.num_heads, 1, self.embed_dim],
+            init=base_layer.WeightInit.Constant(init_theta.tolist()),
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=['mdl', None, None],
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+        ),
+    )
+
+  def __call__(self, x: JTensor, offset: int =0) -> JTensor:
+    # x: b, t, n, d; shape in original code: b, h, n,d
+    seq_len = x.shape[1]
+    index = jnp.arange(seq_len)[None,:,None] + offset
+    theta_v = self.theta.theta_v * index # n, t, d
+    theta_v = jnp.transpose(theta_v, axes=[1,0,2]) # n,t,d -> t, n, d
+    x = jnp.concatenate([x * jnp.cos(theta_v), x * jnp.sin(theta_v)], axis=-1)
+    return x

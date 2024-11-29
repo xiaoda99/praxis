@@ -354,6 +354,23 @@ class LinearRampupCosineDecay(BaseSchedule):
         jnp.float32,
     )
 
+class LinearRampupCosineDecayLinearDecay(LinearRampupCosineDecay): #mqy
+  linear_decay_start: int = 0 
+  linear_decay_end: int = 0
+  linear_decay_end_lr: int = 0
+  linear_decay_start_lr: int = 0
+
+  def __post_init__(self):
+    super().__post_init__()
+
+    self._boundaries.append(self.linear_decay_start)
+    self._schedules.append(
+          instantiate(
+              pax_fiddle.Config(
+                  Linear, start=(self.linear_decay_start, self.linear_decay_start_lr), limit=(self.linear_decay_end, self.linear_decay_end_lr)
+              )
+          )
+      )
 
 class PiecewiseConstant(BaseSchedule):
   """A schedule with piecewise constants rate decay.

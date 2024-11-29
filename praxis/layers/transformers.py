@@ -26,6 +26,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from einops import rearrange, repeat  # XD
 import numpy as np
+import math
 from praxis import base_layer
 from praxis import gshard_utils
 from praxis import pax_fiddle
@@ -40,6 +41,9 @@ from praxis.layers import pipeline
 from praxis.layers import repeats
 from praxis.layers import stats
 from praxis.layers import stochastics
+from praxis.layers import GELU
+from praxis.layers import rnn_cell
+from praxis.layers.ssm import Mamba2
 
 NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
@@ -57,6 +61,9 @@ AutodiffCheckpointType = checkpoint_policy.AutodiffCheckpointType
 def _rms(x):
   # Note: under pmap .mean() will produce a local mean, not across all hosts.
   return (x**2.).mean().astype(jnp.float32)**.5
+
+def _contains_one(string, s_l):
+  return any([s in string for s in s_l])
 
 
 def _rel_cos(x, y):
@@ -291,6 +298,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
   use_gated_activation: bool = False
   fflayer_tpl: LayerTpl = template_field(linears.FeedForward)
   ln_tpl: LayerTpl = template_field(normalizations.LayerNorm)
+  seperate_gating_ln: bool = False # mqy
   residual_dropout_prob: float = 0.0
   relu_dropout_tpl: LayerTpl = template_field(stochastics.Dropout)
   relu_dropout_prob: float = 0.0
@@ -352,6 +360,11 @@ class TransformerFeedForward(base_layer.BaseLayer):
       ln_p.name = 'fflayer_ln'
       ln_p.dim = self.input_dims
       self.create_child('layer_norm', ln_p)
+      if self.seperate_gating_ln:
+        ln_p = self.ln_tpl.clone()
+        ln_p.name = 'fflayer_ln_gating'
+        ln_p.dim = self.input_dims
+        self.create_child('layer_norm_gating', ln_p)
     else:
       raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
@@ -449,7 +462,8 @@ class TransformerFeedForward(base_layer.BaseLayer):
   def __call__(self,
                inputs: JTensor,
                paddings: Optional[JTensor] = None,
-               segment_ids: Optional[JTensor] = None) -> JTensor:
+               segment_ids: Optional[JTensor] = None,
+               gate_inputs: Optional[JTensor] = None) -> JTensor:
     # Expand paddings to last dim if not None to have shape [batch, time, 1]
     if paddings is not None:
       paddings = jnp.expand_dims(paddings, axis=-1)
@@ -459,11 +473,16 @@ class TransformerFeedForward(base_layer.BaseLayer):
 
     self.add_summary('input_rms', _rms(inputs), verbosity=4)
     residual = inputs
-
+    
     if self.norm_policy == 'primer_hybrid':
       inputs = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
       inputs = self.layer_norm(inputs)
+      if self.seperate_gating_ln: 
+        assert gate_inputs is not None
+        gate_inputs = self.layer_norm_gating(gate_inputs)
+      else:
+        gate_inputs = inputs
 
     if self.norm_policy in ('primer_hybrid', 'pre'):
       self.add_summary('input_norm_rms', _rms(inputs), verbosity=4)
@@ -472,7 +491,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
       # Apply first FFN layer
       if self._is_ffn1_gated:
         # theta.ffn_layer1_gate corresponds to gshard_builder's wi0
-        gate_value = self.ffn_layer1_gate(inputs)
+        gate_value = self.ffn_layer1_gate(gate_inputs)
         # theta.ffn_layer1 corresponds to gshard_builder's wi1
         activations = gate_value * self.ffn_layer1(inputs)
       else:
@@ -500,7 +519,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
       outputs = None
       for i in range(self.n_chunks):
         if self._is_ffn1_gated:
-          gate_value = self.ffn_layer1_gate[i](inputs)
+          gate_value = self.ffn_layer1_gate[i](gate_inputs)
           activations = gate_value * self.ffn_layer1[i](inputs)
         else:
           activations = self.ffn_layer1[i](inputs)
@@ -1210,6 +1229,59 @@ class Transformer(base_layer.BaseLayer):
   tr_fflayer_tpl: LayerTpl = template_field(TransformerFeedForward)
   gpt_j_residual: bool = False  # XD
   ngrammer_tpl: Optional[LayerTpl] = template_field(None)
+  layer_index: int = 0 
+  num_layers: int = 1
+  num_ffn: int = 1 # mqy; group of feedforward layer
+  hyper_conn: bool = False 
+  hyper_conn_n: int = 4
+  hyper_conn_merge_wcdc: bool = False # whether to merge width connection and depth connection
+  hyper_conn_tanh: bool = False
+  hyper_conn_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)  # mqy
+  dense_conn: bool = False
+  dense_conn_on_attn: bool = False
+  dense_conn_on_layerdiff: bool = False
+  dynamic_dense: bool = False
+  dynamic_dense_sep_qkv_ln: bool = False
+  dynamic_dense_stack: bool = True
+  dynamic_dense_type: Optional[str] = None # ['qkv', 'qkvm']
+  dynamic_dense_num_groups : int = 1
+  dynamic_dense_ov: bool = False
+  dynamic_dense_ov_gate: bool = False
+  dynamic_dense_ov_init: str = 'gauss+gauss' # ['gauss+gauss', 'gauss+const0']
+  dynamic_dense_ov_rank: int = 64
+  dynamic_dense_ov_outer_loop: bool = False
+  dynamic_dense_hidden_expand: int = 1
+  dynamic_dense_key_wise: bool = False 
+  dynamic_dense_query_wise: bool = True
+  dynamic_dense_multilayer: bool = True
+  dynamic_dense_gate_mlp: bool = False
+  dynamic_dense_glu_mlp: bool = False 
+  dynamic_dense_seperate_gating_ln: bool = False
+  dynamic_dense_share_qk_way: bool = False # default: share q/k/v with mlp way cross-layer composition
+  dynamic_dense_fix_last_layer: bool = False # reduce static dense and dynamic dense to 1-way
+  v_out_rank: Optional[int] = None
+  v_out_dynamic: bool = False
+  attn_out_orig: bool = False
+  use_dense_norm: bool = False
+  dense_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
+  dynamic_dense_act_cls: activations_lib.BaseActivation = None # mqy
+  comp_dense_diff: bool = False  # mqy; compose difference of hidden state in every layer 
+  dense_bias_init_method: Optional[str] = 'current_only' # emb_only, current_only, uniform
+  dynamic_head_dense: bool = False
+  dynamic_head_rank: int = 2
+  dynamic_head_dense_type: str = 'qk'
+  # dynamic_qk_proj: bool = False
+  dynamic_head_seperate_param: bool = False
+  dynamic_token_shift: int = 0
+  laurel_lr: bool = False
+  laurel_rw: bool = False
+  laurel_normed_residual: bool = False
+  gating_mlp_input: Optional[str] = None # ['sigmoid', 'linear', 'attn_out_depend+sigmoid'] (a, 1-a) or (a,b) 
+  gating_mlp_input_act: activations_lib.BaseActivation = activations_lib.GELU
+  use_mamba: bool = False
+  mamba_tpl: LayerTpl = template_field(Mamba2) 
+
+
 
   # This function can be overridden by subclasses.
   def _setup_attention(self, atten_tpl: LayerTpl, name: str)-> None:
@@ -1243,59 +1315,398 @@ class Transformer(base_layer.BaseLayer):
       params.name = 'layer_norm'
       params.dim = self.input_dims
       self.create_child('layer_norm', params)
+      if self.dynamic_dense_type is not None and self.dynamic_dense_sep_qkv_ln:
+        num_lns = sum([self.dynamic_dense_type.count(s) for s in 'qkv']) 
+        assert self.dynamic_dense_type.endswith('m') # qkvm, kvm, qkm, qvm
+        if not self.dynamic_dense_share_qk_way: 
+          num_lns = min(3, num_lns+1) # Due to sharing one-way cross-layer composition with mlp, we need to create one more layernorm when num_qkv <3 
+        self.create_children('layer_norms', [self.ln_tpl.clone().set(name=f'layer_norm_{cidx}', dim=self.input_dims) for cidx in range(num_lns)])
     else:
       raise ValueError('Unrecognized norm_policy: %s' % self.norm_policy)
 
-    # Initialize multi-headed self-attention
-    self._setup_attention(self.tr_atten_tpl, 'self_attention')
+    if self.use_mamba:
+      assert self.norm_policy == 'pre'
+      self.create_child('mamba', self.mamba_tpl.clone())
+    else:
+      # Initialize multi-headed self-attention
+      self._setup_attention(self.tr_atten_tpl, 'self_attention')
 
-    # Initialize residual dropout.
-    params = self.dropout_tpl.clone()
-    params.keep_prob = 1.0 - self.residual_dropout_prob
-    self.create_child('residual_dropout', params)
+      # Initialize residual dropout.
+      params = self.dropout_tpl.clone()
+      params.keep_prob = 1.0 - self.residual_dropout_prob
+      self.create_child('residual_dropout', params)
 
-    # Initialize multi-headed cross-attention and layer norm.
-    if self.use_cross_attention:
-      if self.norm_policy in ('pre', 'post', 'post_skip'):
-        params = self.ln_tpl.clone()
-        params.name = 'cross_layer_norm'
-        params.dim = self.input_dims
-        self.create_child('cross_layer_norm', params)
-      elif self.norm_policy == 'primer_hybrid':
-        params = self.ln_tpl.clone()
-        params.dim = self.input_dims
-        self.create_child('pre_cross_layer_norm', params)
-        self.create_child('post_cross_layer_norm', params)
+      # Initialize multi-headed cross-attention and layer norm.
+      if self.use_cross_attention:
+        if self.norm_policy in ('pre', 'post', 'post_skip'):
+          params = self.ln_tpl.clone()
+          params.name = 'cross_layer_norm'
+          params.dim = self.input_dims
+          self.create_child('cross_layer_norm', params)
+        elif self.norm_policy == 'primer_hybrid':
+          params = self.ln_tpl.clone()
+          params.dim = self.input_dims
+          self.create_child('pre_cross_layer_norm', params)
+          self.create_child('post_cross_layer_norm', params)
+        else:
+          raise ValueError(f'Unrecognized norm_policy: {self.norm_policy}')
+
+        if self.cross_atten_tpl is not None:
+          params = self.cross_atten_tpl
+        else:
+          params = self.tr_atten_tpl
+        self._setup_attention(params, 'cross_attention')
+
+      # Initialize residual droppath
+      if self.residual_droppath_prob > 0:
+        droppath_p = pax_fiddle.Config(
+            stochastics.StochasticResidual,
+            name='residual_droppath',
+            survival_prob=1.0 - self.residual_droppath_prob,
+        )
+        self.create_child('residual_droppath', droppath_p)
+
+      # Initialize feed-forward layer
+      if self.tr_fflayer_tpl:
+        if self.num_ffn == 1:
+          params = self.tr_fflayer_tpl.clone()
+          params.name = 'tr_fflayer'
+          params.input_dims = self.input_dims
+          params.hidden_dims = self.hidden_dims
+          params.relu_dropout_prob = self.relu_dropout_prob
+          params.residual_dropout_prob = self.residual_dropout_prob
+          params.residual_droppath_prob = self.residual_droppath_prob
+          params.norm_policy = self.norm_policy
+          params.add_skip_connection = not self.gpt_j_residual  # XD
+          params.seperate_gating_ln = self.dynamic_dense_seperate_gating_ln # mqy
+          self.create_child('ff_layer', params)
+        else:
+          params_list = []
+          for i in range(self.num_ffn):
+            params = self.tr_fflayer_tpl.clone()
+            params.name = f'tr_fflayer_{i}'
+            params.input_dims = self.input_dims
+            params.hidden_dims = self.hidden_dims
+            params.relu_dropout_prob = self.relu_dropout_prob
+            params.residual_dropout_prob = self.residual_dropout_prob
+            params.residual_droppath_prob = self.residual_droppath_prob
+            params.norm_policy = self.norm_policy
+            params.add_skip_connection = False, 
+            params_list.append(params) 
+          self.create_children('ff_layers', params_list)
+
+    
+    # Intialize dense conn params
+    if self.dense_conn:
+      i = self.layer_index
+      params = self.dense_norm_tpl.clone()
+      params.name = 'dense_norm'
+      if hasattr(params, 'dim'): params.dim = self.input_dims
+      self.create_child('dense_norm', params)
+      # self.create_child('dense_norm', self.dense_norm_tpl.clone())
+      if self.dynamic_dense_act_cls is not None:
+        self.create_child('dense_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
+        # assert isinstance(self.dynamic_dense_act_cls, GELU)
+      # assert self.dense_bias_init_method in ['current_only', 'emb_only', 'uniform']
+      # b_init_method = self.dense_bias_init_method if not self.comp_dense_diff else 'uniform' # use uniform init with comp_dense_diff
+        # if b_init_method == 'uniform':
+        #   init_v = [1] * (i+2) 
+        # elif b_init_method == 'current_only':
+        #   init_v = [0] * (i+1) + [1] 
+        # elif  b_init_method == 'emb_only':
+        #   init_v = [1] + [0] * (i+1) 
+        # dense_w = WeightHParams(
+        #     shape=[len(init_v)],
+        #     init=WeightInit.Constant(init_v), # L
+        #     mesh_shape=self.mesh_shape,
+        #     tensor_split_dims_mapping=[None],
+        #     collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+        # )
+        # self.create_variable(f'dense_conn_{i}', dense_w)
+      if self.dense_conn_on_attn:
+        assert self.dynamic_dense_query_wise and not self.dynamic_dense_key_wise
+        factor = 2 if not self.attn_out_orig else 1
+      elif self.dense_conn_on_layerdiff:
+        factor = 2
       else:
-        raise ValueError(f'Unrecognized norm_policy: {self.norm_policy}')
+        factor = 1
+      if self.dynamic_dense: # BTD, DL-> BTL
+        if self.dynamic_dense_query_wise and self.dynamic_dense_key_wise: 
+          l = i + 2 + (self.num_layers - i)
+        elif self.dynamic_dense_query_wise: # default
+          l = (i + 1) * factor + 1
+        elif self.dynamic_dense_key_wise:
+          l = self.num_layers - i
+        if self.dynamic_dense_type is not None:
+          C = 1 if self.dynamic_dense_fix_last_layer and i== self.num_layers-1 else len(self.dynamic_dense_type)
+        else:
+          C = 1 
+        l = l * self.dynamic_dense_num_groups * C 
+        std = 1/math.sqrt(self.input_dims) 
+        dyn_dense_proj1 = WeightHParams(
+            shape=[self.input_dims, l * self.dynamic_dense_hidden_expand], # DL
+            init=WeightInit.Gaussian(std),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=['data', None],
+        )
+        dyn_dense_proj2 = WeightHParams(
+            shape=[l * self.dynamic_dense_hidden_expand, l], # LL
+            init=WeightInit.Constant(0),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=[None, None],
+        )
+        self.create_variable(f'dynamic_dense_conn1_{i}', dyn_dense_proj1)
+        self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
+        if self.dynamic_dense_gate_mlp:
+          assert self.dynamic_dense_hidden_expand == 1
+          dyn_dense_proj_gate = WeightHParams(
+              shape=[self.input_dims, l], # DL
+              init=WeightInit.Constant(0),
+              mesh_shape=self.mesh_shape, 
+              tensor_split_dims_mapping=['data', None],
+          )
+          self.create_variable(f'dynamic_dense_gate_{i}', dyn_dense_proj_gate)
+        elif self.dynamic_dense_glu_mlp:
+          dyn_dense_proj_gate = WeightHParams(
+              shape=[self.input_dims, l* self.dynamic_dense_hidden_expand], # DL
+              init=WeightInit.Gaussian(std),
+              mesh_shape=self.mesh_shape, 
+              tensor_split_dims_mapping=['data', None],
+          )
+          self.create_variable(f'dynamic_dense_gate_{i}', dyn_dense_proj_gate)
 
-      if self.cross_atten_tpl is not None:
-        params = self.cross_atten_tpl
-      else:
-        params = self.tr_atten_tpl
-      self._setup_attention(params, 'cross_attention')
-
-    # Initialize residual droppath
-    if self.residual_droppath_prob > 0:
-      droppath_p = pax_fiddle.Config(
-          stochastics.StochasticResidual,
-          name='residual_droppath',
-          survival_prob=1.0 - self.residual_droppath_prob,
+    if self.hyper_conn:
+      self.create_child('hyper_conn_norm', self.hyper_conn_norm_tpl.clone().set(dim=self.input_dims))
+      # static w: alpha_sw, beta_sw
+      m_w = np.array([1 if _i == self.layer_index % self.hyper_conn_n else 0 for _i in range(self.hyper_conn_n)]) 
+      r_w = np.eye(self.hyper_conn_n)
+      sw_arr = np.concatenate([m_w[:,None], r_w], axis=-1)
+      alpha_sw = WeightHParams(
+          shape=[self.hyper_conn_n, 1+self.hyper_conn_n], # N(1+N)
+          init=WeightInit.Constant(sw_arr.tolist()), 
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=[None, None],
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
       )
-      self.create_child('residual_droppath', droppath_p)
+      self.create_variable('hyper_conn_alpha_sw', alpha_sw)
+      beta_sw = WeightHParams(
+          shape=[self.hyper_conn_n], # N
+          init=WeightInit.Constant(1), 
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=[None],
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
+      )
+      self.create_variable('hyper_conn_beta_sw', beta_sw)
+      # dynamic alpha w: alpha_dw, alpha_scale
+      # std = 1/ math.sqrt(self.input_dims)
+      alpha_dw = WeightHParams(
+          shape=[self.input_dims, 1+self.hyper_conn_n], # D(1+N)
+          # init=WeightInit.Gaussian(std),
+          init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=['data', None],
+      )
+      alpha_scale = WeightHParams(
+          shape=[1],
+          init=WeightInit.Constant(0.01), # L or CL
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=[None],
+      )
+      self.create_variable('hyper_conn_alpha_dw', alpha_dw)
+      self.create_variable('hyper_conn_alpha_scale', alpha_scale)
+      # dynamic beta w: beta_dw, beta_scale
+      # std = 1/ math.sqrt(self.input_dims)
+      beta_dw = WeightHParams(
+          shape=[self.input_dims], # D
+          # init=WeightInit.Gaussian(std),
+          init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None],
+      )
+      beta_scale = WeightHParams(
+          shape=[1],
+          init=WeightInit.Constant(0.01), # L or CL
+          mesh_shape=self.mesh_shape,
+          tensor_split_dims_mapping=[None],
+      )
+      self.create_variable('hyper_conn_beta_dw', beta_dw)
+      self.create_variable('hyper_conn_beta_scale', beta_scale)
 
-    # Initialize feed-forward layer
-    if self.tr_fflayer_tpl:
-      params = self.tr_fflayer_tpl.clone()
-      params.name = 'tr_fflayer'
-      params.input_dims = self.input_dims
-      params.hidden_dims = self.hidden_dims
-      params.relu_dropout_prob = self.relu_dropout_prob
-      params.residual_dropout_prob = self.residual_dropout_prob
-      params.residual_droppath_prob = self.residual_droppath_prob
-      params.norm_policy = self.norm_policy
-      params.add_skip_connection = not self.gpt_j_residual  # XD
-      self.create_child('ff_layer', params)
+
+    if self.laurel_rw:
+        init_v = [1, 1]
+        rw = WeightHParams(
+            shape=[len(init_v)],
+            init=WeightInit.Constant(init_v), # L
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=[None],
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+        )
+        self.create_variable('laurel_rw_weight', rw)
+    if self.laurel_lr:
+      self.create_child('laurel_norm', self.dense_norm_tpl.clone())
+
+    if self.dynamic_dense_ov or self.laurel_lr:
+      ov_rank = self.dynamic_dense_ov_rank 
+      std = 1/math.sqrt(self.input_dims)
+      assert self.dynamic_dense_ov_init in ['gauss+gauss', 'gauss+const0']
+      if self.dynamic_dense_ov_init == 'gauss+gauss':
+        init_method = WeightInit.Gaussian(std) 
+      elif self.dynamic_dense_ov_init == 'gauss+const0':
+        init_method = WeightInit.Constant(0)
+      dyn_ov1 = WeightHParams(
+        shape=[self.input_dims, ov_rank], # DR
+        init=WeightInit.Gaussian(std),
+        mesh_shape=self.mesh_shape, 
+        tensor_split_dims_mapping=['data', None],
+      )
+      dyn_ov2 = WeightHParams(
+        shape=[ov_rank, self.input_dims], # RD
+        init=init_method,
+        mesh_shape=self.mesh_shape, 
+        tensor_split_dims_mapping=[None, 'data'],
+      )
+      self.create_variable('dynamic_dense_ov1', dyn_ov1)
+      self.create_variable('dynamic_dense_ov2', dyn_ov2)
+      if self.dynamic_dense_ov_gate:
+        dyn_ov_gate = WeightHParams(
+        shape=[self.input_dims, ov_rank], # DR
+        init=WeightInit.Gaussian(std),
+        mesh_shape=self.mesh_shape, 
+        tensor_split_dims_mapping=['data', None],
+        )
+        self.create_variable('dynamic_dense_ov3', dyn_ov_gate)
+
+    if self.gating_mlp_input:
+      self.create_child('gating_mlp_norm', self.dense_norm_tpl.clone())
+      if self.gating_mlp_input_act is not None:
+        self.create_child('gmi_activation', pax_fiddle.Config(self.gating_mlp_input_act).clone()) # gelu
+      if 'learnable_bias' in self.gating_mlp_input:
+        res_attn_bias = WeightHParams(
+          shape=[2], # D2
+          init=WeightInit.Constant(1),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None],
+        )
+        self.create_variable('res_attn_bias', res_attn_bias)
+      if 'linear' in self.gating_mlp_input or 'sigmoid' in self.gating_mlp_input or 'b_only' in self.gating_mlp_input:
+        res_attn_w = WeightHParams(
+          shape=[self.input_dims, 2], # D2
+          init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=['data', None],
+        )
+      elif 'mlp' in self.gating_mlp_input:
+        std = 1/math.sqrt(self.input_dims)
+        res_attn_w = WeightHParams(
+          shape=[self.input_dims, 2], # D2
+          init=WeightInit.Gaussian(std),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=['data', None],
+        )
+        res_attn_w2 = WeightHParams(
+          shape=[2, 2], # 22
+          init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None, None],
+        )
+        self.create_variable('res_attn_w2', res_attn_w2)
+      self.create_variable('res_attn_w', res_attn_w)
+
+
+
+    if self.dynamic_head_dense or self.v_out_rank: # TODO: disentangle config between dynamic_dense and dynamic_head_dense  
+      i = self.layer_index
+      params = self.dense_norm_tpl.clone()
+      params.name = 'head_dense_norm'
+      if hasattr(params, 'dim'): params.dim = self.input_dims
+      self.create_child('head_dense_norm', params)
+      if self.dynamic_dense_act_cls is not None:
+        self.create_child('head_dense_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
+
+    if self.dynamic_head_dense:
+      std = 1/math.sqrt(self.input_dims) 
+      l = i+1
+      n, R = self.num_heads, self.dynamic_head_rank
+      r = self.v_out_rank if self.v_out_rank else n
+      C = len(self.dynamic_head_dense_type)
+      _l = l * C if self.dynamic_head_seperate_param else l
+      K = _l * R * r + C * R * n 
+      # K = C * R * n 
+      std2 = 1 / math.sqrt(K) 
+      dyn_head_dense_proj1 = WeightHParams(
+          shape=[self.input_dims, K], # D(L+1)NR; BTD, DK->BTK , (L+C)BSRN
+          init=WeightInit.Gaussian(std),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=['data', None], 
+      )
+      dyn_head_dense_proj2a = WeightHParams(
+          shape=[K, _l, R, r], # K(L+1)CRr; BTK, K(LC)Rr->(LC)BTRr
+          # init=WeightInit.Constant(0),
+          init=WeightInit.Gaussian(std2),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None, None, None, None], # TODO: check sharding
+      )
+      dyn_head_dense_proj2b = WeightHParams(
+          shape=[K, C, R, n], # K(L+1)RN; BTK, KLRN->LBTRN
+          init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None, None, None, None], # TODO: check sharding
+      )
+      self.create_variable(f'dynamic_head_dense_conn1_{i}', dyn_head_dense_proj1)
+      self.create_variable(f'dynamic_head_dense_conn2a_{i}', dyn_head_dense_proj2a)
+      self.create_variable(f'dynamic_head_dense_conn2b_{i}', dyn_head_dense_proj2b)
+    if self.v_out_rank: 
+      if self.v_out_dynamic: 
+        K = self.num_heads * self.v_out_rank
+        std1 = 2 / math.sqrt(self.input_dims + K)
+        std2 = 1 / math.sqrt(K)
+        v_out_dyn1 = WeightHParams(
+        shape=[self.input_dims, K], # DK
+        init=WeightInit.Gaussian(std1),
+        mesh_shape=self.mesh_shape, 
+        tensor_split_dims_mapping=[None, None], # TODO: check sharding
+        )
+        v_out_dyn2 = WeightHParams(
+        shape=[K, self.num_heads, self.v_out_rank], # KNr
+        init=WeightInit.Gaussian(std2),
+        mesh_shape=self.mesh_shape, 
+        tensor_split_dims_mapping=[None, None, None], # TODO: check sharding
+        )
+        self.create_variable('v_out_dyn1', v_out_dyn1)
+        self.create_variable('v_out_dyn2', v_out_dyn2)
+      else:
+        std = 2 / math.sqrt(self.num_heads + self.v_out_rank)
+        v_out_proj = WeightHParams(
+        shape=[self.num_heads, self.v_out_rank], # Nr
+        init=WeightInit.Gaussian(std),
+        mesh_shape=self.mesh_shape, 
+        tensor_split_dims_mapping=[None, None], # TODO: check sharding
+        )
+        self.create_variable('v_out_proj', v_out_proj)
+
+    if self.dynamic_token_shift >= 2:
+      self.create_child('token_shift_norm', self.dense_norm_tpl.clone())
+      if self.dynamic_dense_act_cls is not None:
+        self.create_child('token_shift_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
+      std = 1/math.sqrt(self.input_dims) 
+      tf_proj1 = WeightHParams(
+          shape=[self.input_dims, self.dynamic_token_shift], # Dt
+          init=WeightInit.Gaussian(std),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=['data', None],
+      )
+      std2 = 1/math.sqrt(self.dynamic_token_shift)
+      tf_proj2 = WeightHParams(
+          shape=[self.dynamic_token_shift, self.dynamic_token_shift], # tt
+          init=WeightInit.Gaussian(std2),
+          # init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None, None],
+      )
+      self.create_variable('dynamic_tf1', tf_proj1)
+      self.create_variable('dynamic_tf2', tf_proj2)
+
 
   def init_states(self, target_batch_size: int, target_max_length: int) -> None:
     """Initialize the cache for the Transformer layer.
@@ -1321,7 +1732,10 @@ class Transformer(base_layer.BaseLayer):
       cross_inputs: Optional[JTensor] = None,
       cross_attention_mask: Optional[JTensor] = None,
       segment_pos: Optional[JTensor] = None,
-      segment_ids: Optional[JTensor] = None) -> Tuple[JTensor, JTensor]:
+      segment_ids: Optional[JTensor] = None,
+      v_in:Optional[JTensor] = None, # mqy: cross head values, 2BTNd (2:q/k) 
+      hhids:Optional[JTensor] = None, # mqy: hyper hidden states, NBTD (N:4) 
+      ) -> Tuple[JTensor, JTensor]:
     """Transformer decoder layer.
 
     Args:
@@ -1353,90 +1767,286 @@ class Transformer(base_layer.BaseLayer):
     # self.add_summary('xformer_input_std', inputs_stats.std_v, verbosity=3)
     # self.add_summary('xformer_input_abs_max', inputs_stats.max_v, verbosity=3)
 
-    self.add_summary('attention_input_rms', _rms(inputs), verbosity=4)
+    # self.add_summary('attention_input_rms', _rms(inputs), verbosity=4)
 
+    if self.hyper_conn and not self.hyper_conn_merge_wcdc: # width connections
+      alpha_sw, alpha_dw, alpha_scale = getattr(self.theta, 'hyper_conn_alpha_sw'), getattr(self.theta, 'hyper_conn_alpha_dw'), getattr(self.theta, 'hyper_conn_alpha_scale')
+      beta_sw, beta_dw, beta_scale = getattr(self.theta, 'hyper_conn_beta_sw'), getattr(self.theta, 'hyper_conn_beta_dw'), getattr(self.theta, 'hyper_conn_beta_scale')
+      hhids_normed = self.hyper_conn_norm(hhids)
+      B_w = jnp.einsum('NBTD, D->BTN', hhids_normed, beta_dw) # beta 
+      Amr_w = jnp.einsum('NBTD, DM->BTNM', hhids_normed, alpha_dw) # alpha  BTN(1+N)
+      if self.hyper_conn_tanh: 
+        B_w = jnp.tanh(B_w)
+        Amr_w = jnp.tanh(Amr_w)
+      Amr_w = Amr_w * alpha_scale + alpha_sw[None,None]
+      B_w = B_w * beta_scale + beta_sw[None,None]
+      Am_w, Ar_w = Amr_w[...,0], Amr_w[...,1:] # BTN, BTNN
+      inputs = jnp.einsum('NBTD,BTN->BTD', hhids, Am_w) # mixed inputs
+      hhids = jnp.einsum('NBTD,BTNM->MBTD',hhids,Ar_w) # mixed hyper hidden states
+      
     if self.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
-      inputs_normalized = self.layer_norm(inputs)
+      if self.dynamic_dense_stack or self.layer_index ==0: # tensor
+        inputs_normalized = self.layer_norm(inputs) # BTD; CBTD 
+      else: # tuple
+        assert isinstance(inputs, tuple)
+        if self.dynamic_dense_type is not None and _contains_one(self.dynamic_dense_type, ['qkv','kvm', 'qkm', 'qvm']): # q,k,v,[q/k/v][q/k/v], qkv
+          # num_qkv = sum([self.dynamic_dense_type.count(s) for s in 'qkv']) 
+          if self.dynamic_dense_sep_qkv_ln:
+            assert self.dynamic_dense_type.endswith('m')
+            inputs_normalized = []
+            for _type in 'qkv':
+              if _type in self.dynamic_dense_type:
+                _idx = self.dynamic_dense_type.index(_type)
+              elif self.dynamic_dense_share_qk_way and _type in ['q', 'k']:
+                _idx = self.dynamic_dense_type.index('qk'.replace(_type, '')) # q->k or k->q
+              else: # share mlp-way cross-layer composition
+                _idx = -1
+              inputs_normalized.append(self.layer_norms[_idx](inputs[_idx]))
+          else: 
+            inputs_normalized = [self.layer_norm(_inputs) for _inputs in inputs]
+        else: # dynamic_dense_type = 'm' 
+          assert len(inputs) == 2 # residual_stream_orig, one_way_dynamic_dense 
+          inputs_normalized = self.layer_norm(inputs[0])
     else:
       inputs_normalized = inputs
 
-    # Compute self-attention, key/value vectors are the input itself
-    atten_output, self_atten_probs = self.self_attention(
-        inputs_normalized,
-        inputs_normalized,
-        inputs_normalized,
-        atten_mask=attention_mask,
-        query_segment_pos=segment_pos,
-        key_segment_pos=segment_pos)
-    atten_probs = NestedMap(self_atten=self_atten_probs)
-
-    self.add_summary('attention_output_rms', _rms(atten_output), verbosity=4)
-
-    if self.norm_policy == 'primer_hybrid':
-      atten_output = self.post_layer_norm(atten_output)
-    elif self.norm_policy == 'post':
-      atten_output = self.layer_norm(atten_output)
-
-    self.add_summary('attention_output_norm_rms', _rms(atten_output),
-                     verbosity=4)
-
-    # Residual dropout and connection
-    atten_output = self.residual_dropout(atten_output)
-
-    # Apply skip connection
-    if self.residual_droppath_prob > 0.0:
-      atten_output = self.residual_droppath(inputs, atten_output)
+    if self.dynamic_dense_type is not None and self.layer_index > 0 :
+      dyn_inputs = inputs
+      inputs = inputs[-1] if self.dynamic_dense_type.endswith('m') else inputs[0]
+    if self.use_mamba:
+      output = self.mamba(inputs_normalized) + inputs
+      atten_probs, v_out = None, None
     else:
-      atten_output += inputs
+      ### beginning of attn_mlp
+      # Compute self-attention, key/value vectors are the input itself
+      if self.dynamic_dense_type is not None and _contains_one(self.dynamic_dense_type, ['qkv','kvm','qkm','qvm']) and self.layer_index >0:
+        query_vec, key_vec, value_vec = inputs_normalized[0], inputs_normalized[1], inputs_normalized[2]
+      else:
+        query_vec, key_vec, value_vec = inputs_normalized, inputs_normalized, inputs_normalized
+      atten_output, self_atten_probs, v_out = self.self_attention(
+          query_vec,
+          key_vec,
+          value_vec,
+          atten_mask=attention_mask,
+          query_segment_pos=segment_pos,
+          key_segment_pos=segment_pos,
+          v_in=v_in)
+      atten_output_orig = atten_output
+      atten_probs = NestedMap(self_atten=self_atten_probs)
 
-    if self.norm_policy == 'post_skip':
-      atten_output = self.layer_norm(atten_output)
+      self.add_summary('attention_output_rms', _rms(atten_output), verbosity=4)
 
-    self.add_summary('attention_output_rel_cos', _rel_cos(inputs, atten_output),
-                     verbosity=4)
+      if self.norm_policy == 'primer_hybrid':
+        atten_output = self.post_layer_norm(atten_output)
+      elif self.norm_policy == 'post':
+        atten_output = self.layer_norm(atten_output)
 
-    # Apply cross attention if applicable
-    if self.use_cross_attention and (
-        not self.allow_skip_cross_attention or cross_inputs is not None
-    ):
-      assert cross_inputs is not None
-      assert cross_attention_mask is not None
-      if self.norm_policy == 'pre':
-        atten_output_normalized = self.cross_layer_norm(atten_output)
-      elif self.norm_policy == 'primer_hybrid':
-        atten_output_normalized = self.pre_cross_layer_norm(atten_output)
-      elif self.norm_policy in ('post', 'post_skip'):
-        atten_output_normalized = atten_output
-
-      cross_atten_output, cross_atten_probs = self.cross_attention(
-          atten_output_normalized,
-          cross_inputs,
-          cross_inputs,
-          atten_mask=cross_attention_mask)
-      atten_probs.cross_atten = cross_atten_probs
-
-      if self.norm_policy == 'post':
-        cross_atten_output = self.cross_layer_norm(cross_atten_output)
-      elif self.norm_policy == 'primer_hybrid':
-        cross_atten_output = self.post_cross_layer_norm(cross_atten_output)
+      self.add_summary('attention_output_norm_rms', _rms(atten_output),
+                      verbosity=4)
 
       # Residual dropout and connection
-      cross_atten_output = self.residual_dropout(cross_atten_output)
+      atten_output = self.residual_dropout(atten_output)
 
+      # Apply skip connection
       if self.residual_droppath_prob > 0.0:
-        atten_output = self.residual_droppath(atten_output, cross_atten_output)
+        atten_output = self.residual_droppath(inputs, atten_output)
       else:
-        atten_output += cross_atten_output
+        if self.dynamic_dense_type is not None and self.dynamic_dense_type.endswith('m') and self.layer_index > 0:
+          res = dyn_inputs[-1]
+        else:
+          res = inputs
+        atten_output += res
 
       if self.norm_policy == 'post_skip':
-        atten_output = self.cross_layer_norm(atten_output)
+        atten_output = self.layer_norm(atten_output)
 
-    # Apply FFN layer
-    output = self.ff_layer(atten_output, paddings=paddings) \
-      if not self.gpt_j_residual else atten_output + self.ff_layer(inputs, paddings=paddings)  # XD
-    return output, atten_probs  # pytype: disable=bad-return-type  # jax-ndarray
+      # self.add_summary('attention_output_rel_cos', _rel_cos(inputs, atten_output),
+      #                 verbosity=4)
+
+      # Apply cross attention if applicable
+      if self.use_cross_attention and (
+          not self.allow_skip_cross_attention or cross_inputs is not None
+      ):
+        assert cross_inputs is not None
+        assert cross_attention_mask is not None
+        if self.norm_policy == 'pre':
+          atten_output_normalized = self.cross_layer_norm(atten_output)
+        elif self.norm_policy == 'primer_hybrid':
+          atten_output_normalized = self.pre_cross_layer_norm(atten_output)
+        elif self.norm_policy in ('post', 'post_skip'):
+          atten_output_normalized = atten_output
+
+        cross_atten_output, cross_atten_probs = self.cross_attention(
+            atten_output_normalized,
+            cross_inputs,
+            cross_inputs,
+            atten_mask=cross_attention_mask)
+        atten_probs.cross_atten = cross_atten_probs
+
+        if self.norm_policy == 'post':
+          cross_atten_output = self.cross_layer_norm(cross_atten_output)
+        elif self.norm_policy == 'primer_hybrid':
+          cross_atten_output = self.post_cross_layer_norm(cross_atten_output)
+
+        # Residual dropout and connection
+        cross_atten_output = self.residual_dropout(cross_atten_output)
+
+        if self.residual_droppath_prob > 0.0:
+          atten_output = self.residual_droppath(atten_output, cross_atten_output)
+        else:
+          atten_output += cross_atten_output
+
+        if self.norm_policy == 'post_skip':
+          atten_output = self.cross_layer_norm(atten_output)
+
+      # gating mlp inputs
+      if self.gating_mlp_input:
+        if 'attn_out_depend' in self.gating_mlp_input:
+          _input = atten_output
+        else: 
+          _input = inputs
+        res_attn_w = jnp.einsum('B T D, D R -> B T R', self.gating_mlp_norm(_input), self.theta.res_attn_w) # 
+        if 'learnable_bias' in self.gating_mlp_input:
+          bs = self.theta.res_attn_bias 
+        else:
+          bs = [1, 1]
+        if 'linear' in self.gating_mlp_input:
+          a, b = res_attn_w[:,:,:1]+bs[0], res_attn_w[:,:,1:2]+bs[1] # 1 as bias, 
+        elif 'sigmoid' in self.gating_mlp_input:
+          a = jax.nn.sigmoid(res_attn_w[:,:,:1]) * 2
+          b = 2 - a
+        elif 'mlp' in self.gating_mlp_input:
+          res_attn_w = jnp.einsum('B T R, R Q -> B T Q', self.gmi_activation(res_attn_w), self.theta.res_attn_w2) # 
+          a, b = res_attn_w[:,:,:1]+bs[0], res_attn_w[:,:,1:2]+bs[1]
+        elif 'b_only' in self.gating_mlp_input:
+          a, b = 1, res_attn_w[:,:,1:2]+bs[1]
+        mlp_input = inputs * a + (atten_output - inputs) * b 
+      else:
+        mlp_input = atten_output
+
+      # Apply FFN layer
+      if self.num_ffn == 1: # default
+        gate_inputs = None 
+        if self.layer_index >0 and self.dynamic_dense_type is not None and 'g' in self.dynamic_dense_type:
+          gate_inputs = atten_output_orig + dyn_inputs[self.dynamic_dense_type.index('g')]
+        output = self.ff_layer(mlp_input, paddings=paddings, gate_inputs=gate_inputs) \
+          if not self.gpt_j_residual else atten_output + self.ff_layer(inputs, paddings=paddings)  # XD
+        if self.dynamic_dense_type is not None and 'l' in self.dynamic_dense_type and self.layer_index !=0:
+          output = (output - mlp_input) + atten_output_orig + dyn_inputs[self.dynamic_dense_type.index('l')] # -2 for 'qkvlm'
+      else:
+        assert self.dynamic_dense_type is not None and self.dynamic_dense_type.count('m') == self.num_ffn
+        if self.layer_index !=0:
+          mlp_inputs = [atten_output_orig + _mlp_input for _mlp_input in dyn_inputs[-self.num_ffn:]]
+        else:
+          mlp_inputs = [mlp_input] * self.num_ffn 
+        output = atten_output + sum([ff_layer(mlp_input, paddings=paddings) for ff_layer, mlp_input in zip(self.ff_layers, mlp_inputs)]) / 4
+      
+      
+      if not self.gpt_j_residual and self.gating_mlp_input and 'skip_gating_residual' in self.gating_mlp_input:
+        output = (output - mlp_input) + atten_output
+      self.add_summary('layer_output_rms', _rms(output-inputs), verbosity=4)
+      ### end of attn _mlp 
+
+    # output = inputs + (atten_output - inputs) + (output - atten_output)
+    if self.laurel_lr:
+      if self.laurel_rw:
+        rw = jax.nn.softmax(self.theta.laurel_rw_weight, axis=0) * 2 # [1,1] -> [0.5, 0.5] * 2 -> [1,1]
+      else:
+        rw = [1, 1]
+      inputs_normed = self.laurel_norm(inputs)
+      inner = jnp.einsum('B T D, D R -> B T R', inputs_normed, self.theta.dynamic_dense_ov1)
+      output_lr = jnp.einsum('B T R, R D -> B T D', inner, self.theta.dynamic_dense_ov2)
+      if self.laurel_normed_residual:
+        output_lr = output_lr + inputs_normed
+      output = inputs * rw[0] + (output - inputs) * rw[1] + output_lr
+
+
+    # generate dynamic dense conn weight
+    dyn_dense_w = None
+    if self.dynamic_dense:
+      dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{self.layer_index}'),  getattr(self.theta, f'dynamic_dense_conn2_{self.layer_index}'))
+      dense_proj1, dense_proj2 = dyn_dense_proj
+      x_out_normed = self.dense_norm(output) if self.use_dense_norm else output
+      if self.dynamic_dense_act_cls is None:
+        dense_proj = dense_proj1 @ dense_proj2 if self.dynamic_dense_multilayer else dense_proj1 # DL,LL->DL # 1024x25 , 25x25 -> 1024x25
+        dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out_normed, dense_proj)
+      else:
+        dense_w_inner = self.dense_activation(jnp.einsum('B T D, D K -> B T K', x_out_normed, dense_proj1)) # GELU
+        if self.dynamic_dense_gate_mlp:
+          gate_w = getattr(self.theta, f'dynamic_dense_gate_{self.layer_index}') # DL
+          gate = jnp.einsum('B T D, D K -> B T K', x_out_normed, gate_w) # BTL
+          dyn_dense_w = gate * dense_w_inner
+        elif self.dynamic_dense_glu_mlp:
+          gate_w = getattr(self.theta, f'dynamic_dense_gate_{self.layer_index}') # DL
+          gate = jnp.einsum('B T D, D K -> B T K', x_out_normed, gate_w) # BTL
+          dyn_dense_w = jnp.einsum('B T K, K L -> B T L', gate * dense_w_inner, dense_proj2)
+        else:
+          dyn_dense_w = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
+
+    if self.dynamic_dense_ov:
+      assert self.dynamic_dense
+      if not self.dynamic_dense_ov_outer_loop:
+        inner = jnp.einsum('B T D, D R -> B T R', output, self.theta.dynamic_dense_ov1)
+        output = output + jnp.einsum('B T R, R D -> B T D', inner, self.theta.dynamic_dense_ov2)
+        if self.laurel_normed_residual: output = output + x_out_normed
+      if self.dynamic_dense and self.dynamic_dense_ov_outer_loop: 
+        dyn_dense_w = (dyn_dense_w, self.theta.dynamic_dense_ov1, self.theta.dynamic_dense_ov2, (self.theta.dynamic_dense_ov3 if self.dynamic_dense_ov_gate else None))      
+
+
+    dyn_head_dense_w = None   
+    if self.dynamic_head_dense or self.v_out_rank:
+      x_out_normed = self.head_dense_norm(output) if self.use_dense_norm else output
+
+    if self.dynamic_head_dense:
+      dyn_head_dense_proj = (getattr(self.theta, f'dynamic_head_dense_conn1_{self.layer_index}'),  getattr(self.theta, f'dynamic_head_dense_conn2a_{self.layer_index}'), getattr(self.theta, f'dynamic_head_dense_conn2b_{self.layer_index}'))
+      head_dense_proj1, head_dense_proj2a, head_dense_proj2b = dyn_head_dense_proj
+      dense_w_inner = self.head_dense_activation(jnp.einsum('BTD,DK->BTK', x_out_normed, head_dense_proj1))   # GELU activation
+      if self.v_out_rank is None:
+        head_dense_proj2 = jnp.concatenate([head_dense_proj2a, head_dense_proj2b], axis=1) # KLRN, KCRN->K(L+C)RN
+        dyn_head_dense_w = jnp.einsum('BTK,KLRN->LBTRN', dense_w_inner, head_dense_proj2) # (L*C+C)BTRN
+      else:
+        dyn_head_dense_wa = jnp.einsum('BTK,KLRQ->LBTRQ', dense_w_inner, head_dense_proj2a) # BTK, KLRr->LBTRr
+        dyn_head_dense_wb = jnp.einsum('BTK,KCRN->CBTRN', dense_w_inner, head_dense_proj2b) # 
+        dyn_head_dense_w = (dyn_head_dense_wa, dyn_head_dense_wb)
+
+    if self.v_out_rank: 
+      if self.v_out_dynamic:
+        _v_out_proj = self.head_dense_activation(jnp.einsum('BTD,DK->BTK', x_out_normed, self.theta.v_out_dyn1))   # GELU activation
+        v_out_proj = jnp.einsum('BTK,KNR->BTNR', _v_out_proj, self.theta.v_out_dyn2)
+        v_out = jnp.einsum('BTND, BTNR -> BTRD', v_out, v_out_proj)
+      else:
+        v_out = jnp.einsum('BTND, NR -> BTRD', v_out, self.theta.v_out_proj)
+
+    if self.dynamic_token_shift >= 2:
+      x_out_normed = self.token_shift_norm(output)
+      tf_inner = self.token_shift_activation(jnp.einsum('BTD,DK->BTK', x_out_normed, self.theta.dynamic_tf1))   # GELU activation
+      tf_w = jnp.einsum('BTK,KF->BTF', tf_inner, self.theta.dynamic_tf2) # BTF
+      assert self.dynamic_token_shift == 2
+      _output = jnp.zeros(output.shape, dtype=output.dtype)
+      ouput = output + _output.at[:, 1:, :].set(output[:,:-1] * tf_w[:,1:,:1]) + output * tf_w[:,:,1:]
+    attn_out = atten_output_orig if self.attn_out_orig else atten_output
+    
+    if self.hyper_conn:
+      if not self.hyper_conn_merge_wcdc: # depth connections 
+        hhids = hhids +  jnp.einsum('BTD,BTN->NBTD',output - inputs, B_w)  # fuse current output into hyper hidden states
+      else:
+        alpha_sw, alpha_dw, alpha_scale = getattr(self.theta, 'hyper_conn_alpha_sw'), getattr(self.theta, 'hyper_conn_alpha_dw'), getattr(self.theta, 'hyper_conn_alpha_scale')
+        beta_sw, beta_dw, beta_scale = getattr(self.theta, 'hyper_conn_beta_sw'), getattr(self.theta, 'hyper_conn_beta_dw'), getattr(self.theta, 'hyper_conn_beta_scale')
+        hhids_normed = self.hyper_conn_norm(hhids)
+        B_w = jnp.einsum('NBTD, D->BTN', hhids_normed, beta_dw) # beta 
+        Amr_w = jnp.einsum('NBTD, DM->BTNM', hhids_normed, alpha_dw) # alpha  BTN(1+N)
+        if self.hyper_conn_tanh: 
+          B_w = jnp.tanh(B_w)
+          Amr_w = jnp.tanh(Amr_w)
+        Amr_w = Amr_w * alpha_scale + alpha_sw[None,None]
+        B_w = B_w * beta_scale + beta_sw[None,None]
+        Am_w, Ar_w = Amr_w[...,0], Amr_w[...,1:] # BTN, BTNN
+        hhids = jnp.einsum('NBTD,BTNM->MBTD',hhids,Ar_w) +  jnp.einsum('BTD,BTN->NBTD',output - inputs, B_w)  # fuse current output into hyper hidden states
+        output = jnp.einsum('NBTD,BTN->BTD', hhids, Am_w)
+
+    return output, attn_out, atten_probs, dyn_dense_w, dyn_head_dense_w, v_out, hhids  # pytype: disable=bad-return-type  # jax-ndarray
 
   def extend_step(self,
                   inputs: JTensor,
@@ -1637,6 +2247,78 @@ class StackedTransformer(base_layer.BaseLayer):
   checkpoint_policy: AutodiffCheckpointType = (
       AutodiffCheckpointType.SAVE_DOT_EXCEPT_LOGITS_FFN1
   )
+  share_interval: Optional[int] = None # 2 for interleave sharing, 1 for sharing all layers
+  share_interval_idxs: Optional[list] = None
+  share_mode : str = 'interleave' # interleave or immediate 
+  share_attn_only: bool = False
+  share_qknorm: bool = True
+  share_qkov: bool = True
+  share_dynamic_proj: bool = True
+  share_except_layers: Optional[list] = None
+  use_slope_rate: bool = False
+  slope_rate_lidxs: Optional[list] = None 
+  lrpe_layers: Optional[list] = None
+  pre_compute_atten_mask: bool = True
+  hyper_conn: bool = False 
+  hyper_conn_merge_wcdc: bool = False # whether to merge width connection and depth connection
+  hyper_conn_n: int = 4
+  hyper_conn_tanh: bool = False
+  hyper_conn_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)  # mqy
+  dense_conn: bool = False
+  dense_conn_on_attn: bool = False
+  dense_conn_on_layerdiff: bool = False
+  dense_conn_learnable: bool = True
+  dense_finetune_scale: bool = False
+  num_ffn: int = 1 # mqy; group of feedforward layer
+  dynamic_dense: bool = False
+  dynamic_dense_ft_norm: bool = False
+  dynamic_dense_sep_qkv_ln: bool = False
+  dynamic_dense_stack: bool = True
+  dynamic_dense_type: Optional[str] = None # ['qkv', 'qkvm']
+  dynamic_dense_normalized: bool = False # softmax dynamic dense weight along the Layer dim 
+  dynamic_dense_num_groups : int = 1
+  dynamic_dense_ov: bool = False
+  dynamic_dense_ov_gate: bool = False
+  dynamic_dense_ov_init: str = 'gauss+gauss' # ['gauss+gauss', 'gauss+const0']
+  dynamic_dense_ov_outer_loop: bool = False
+  dynamic_dense_ov_rank: int = 64
+  dynamic_dense_ov_after_merge: bool = False 
+  dynamic_dense_hidden_expand: int = 1
+  dynamic_dense_key_wise: bool = False 
+  dynamic_dense_query_wise: bool = True
+  dynamic_dense_multilayer: bool = True
+  dynamic_dense_gate_mlp: bool = False
+  dynamic_dense_glu_mlp: bool = False  
+  dynamic_dense_norm_on_weight: bool = False 
+  dynamic_dense_disentangle: bool = False 
+  dynamic_dense_seperate_gating_ln: bool = False
+  dynamic_dense_share_qk_way: bool = False # default: share q/k/v with mlp way cross-layer composition
+  dynamic_dense_fix_last_layer: bool = False # reduce multi-way static and dynamic dense to 1-way
+  dynamic_dense_by_group_heads: bool = False
+  v_out_rank: Optional[int] = None
+  v_out_dynamic: bool = False
+  attn_out_orig: bool = False
+  use_dense_norm: bool = False
+  dense_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
+  dynamic_dense_act_cls: activations_lib.BaseActivation = None # mqy
+  comp_dense_diff: bool = False  # mqy; compose difference of hidden state in every layer 
+  dense_bias_init_method: Optional[str] = 'current_only' # emb_only, current_only, uniform
+  dynamic_head_dense: Union[bool, tuple] = False
+  dynamic_head_rank: Union[int, tuple] = 2 # 
+  head_dw1_norm_on_activation: bool = True
+  head_dw1_norm_tpl: LayerTpl = template_field(normalizations.RmsNormNoScale)  # mqy
+  dynamic_head_dense_type: str = 'qk'
+  dynamic_head_seperate_param: bool = False
+  # dynamic_qk_proj: bool = False
+  laurel_lr: bool = False
+  laurel_rw: bool = False
+  laurel_normed_residual: bool = False
+  use_recurrent_layer_mixing: bool = False
+  recurrent_layer_mixing_tpl: LayerTpl = template_field(rnn_cell.RecurrentLayerMix) # rnn, lstm 
+  mamba_lidxs: Optional[list] = None # list(range(48))
+  use_mamba: bool = False
+
+
 
   def _clone_layer_params(self, layer_tpl: LayerTpl) -> LayerTpl:
     """Useful to let sublasses switch the class (e.g. Streaming version)."""
@@ -1661,6 +2343,63 @@ class StackedTransformer(base_layer.BaseLayer):
       else:
         p_i = self._clone_layer_params(self.transformer_layer_params_tpl)
       p_i.name = f'layer_{i}'
+
+      # set mamba layer params
+      if self.use_mamba:
+        mamba_lidxs = self.mamba_lidxs if self.mamba_lidxs is not None else list(range(self.num_layers))
+        p_i.use_mamba = i in mamba_lidxs  
+        p_i.mamba_tpl.layer_idx = i 
+        p_i.mamba_tpl.d_model = self.model_dims
+
+      share_except_layers = self.share_except_layers if self.share_except_layers is not None else []
+      if self.share_interval is not None and i not in share_except_layers:
+        assert self.share_mode in ['immediate', 'interleave']
+        if self.share_mode == 'interleave':
+          ii = i % self.share_interval
+        elif self.share_mode == 'immediate':
+          ii = i // self.share_interval
+        
+        if self.share_interval_idxs is None: 
+          if self.share_mode == 'interleave':
+            ii_max = self.share_interval 
+          elif self.share_mode == 'immediate':
+            ii_max = self.num_layers // self.share_interval
+          share_interval_idxs = list(range(ii_max))
+        else:
+          share_interval_idxs = self.share_interval_idxs
+
+        if ii in share_interval_idxs:  # specify shared idxs in the block
+          if self.share_attn_only:
+            if self.share_qknorm and self.share_qkov and self.share_dynamic_proj:
+              p_i.tr_atten_tpl.shared_weight_layer_id = f'shared_attn_{ii}'
+            else: #TOOD(mqy):add other tpls for sharing 
+              shared_tpls = []
+              #shared_tpls = ['cross_head_pre_proj_tpl', 'cross_head_post_proj_tpl', 'dynamic_w_pre_proj_tpl', 'dynamic_w_post_proj_tpl','proj_tpl', 'qk_norm_tpl']
+              if self.share_qknorm: shared_tpls += ['qk_norm_tpl']
+              if self.share_dynamic_proj: shared_tpls += ['cross_head_pre_proj_tpl', 'cross_head_post_proj_tpl', 'dynamic_w_pre_proj_tpl', 'dynamic_w_post_proj_tpl']
+              if self.share_qkov: shared_tpls += ['proj_tpl']
+              for name in shared_tpls:
+                shared_name = 'shared_' + name.replace('_tpl', '') + f'_{ii}'
+                setattr(getattr(p_i.tr_atten_tpl,name), 'shared_weight_layer_id', shared_name)
+                logging.info(f'sid-{name}: {shared_name}')
+          else:
+            p_i.shared_weight_layer_id = f'shared_layer_{ii}'
+
+      lrpe_layers = [] if self.lrpe_layers is None else self.lrpe_layers
+      if i in lrpe_layers: p_i.tr_atten_tpl.use_lrpe = True  
+      if self.use_slope_rate: # mqy for TransNormer
+        def get_slopes_power_of_2(n):
+          start = 2**(-(2**-(jnp.log2(n) - 3)))
+          ratio = start
+          return [start * ratio**i for i in range(n)]
+        slope_rate = jnp.array(get_slopes_power_of_2(self.num_heads)) 
+        if self.slope_rate_lidxs is None:
+          slope_rate_lidx = i 
+        else:
+          assert len(self.slope_rate_lidxs) == self.num_layers
+          slope_rate_lidx = self.slope_rate_lidxs[i] 
+        p_i.tr_atten_tpl.slope_rate = slope_rate * (1 - slope_rate_lidx/(self.num_layers-1) + 1e-5)
+
       p_i.use_cross_attention = self.use_cross_attention
       p_i.num_heads = self.num_heads
       p_i.dim_per_head = self.dim_per_head
@@ -1677,6 +2416,60 @@ class StackedTransformer(base_layer.BaseLayer):
         p_i.residual_droppath_prob = (
             self.residual_droppath_prob * i / max(1, self.num_layers)
         )
+      # hyper connections params
+      p_i.hyper_conn = self.hyper_conn 
+      p_i.hyper_conn_n = self.hyper_conn_n
+      p_i.hyper_conn_tanh = self.hyper_conn_tanh
+      p_i.hyper_conn_norm_tpl = self.hyper_conn_norm_tpl
+      p_i.hyper_conn_merge_wcdc = self.hyper_conn_merge_wcdc
+      
+      # dense params
+      p_i.layer_index = i
+      p_i.num_ffn = self.num_ffn
+      p_i.num_layers = self.num_layers
+      p_i.dense_conn = self.dense_conn
+      p_i.dense_conn_on_attn = self.dense_conn_on_attn
+      p_i.dense_conn_on_layerdiff = self.dense_conn_on_layerdiff
+      p_i.dynamic_dense = self.dynamic_dense
+      p_i.dynamic_dense_sep_qkv_ln = self.dynamic_dense_sep_qkv_ln
+      p_i.dynamic_dense_stack = self.dynamic_dense_stack
+      p_i.dynamic_dense_type = self.dynamic_dense_type
+      p_i.dynamic_dense_num_groups = self.dynamic_dense_num_groups
+      p_i.dynamic_dense_ov = self.dynamic_dense_ov
+      p_i.dynamic_dense_ov_gate = self.dynamic_dense_ov_gate
+      p_i.dynamic_dense_ov_init = self.dynamic_dense_ov_init
+      p_i.dynamic_dense_ov_outer_loop = self.dynamic_dense_ov_outer_loop
+      p_i.dynamic_dense_ov_rank = self.dynamic_dense_ov_rank
+      p_i.dynamic_dense_hidden_expand = self.dynamic_dense_hidden_expand 
+      p_i.dynamic_dense_key_wise = self.dynamic_dense_key_wise
+      p_i.dynamic_dense_query_wise = self.dynamic_dense_query_wise
+      p_i.dynamic_dense_multilayer = self.dynamic_dense_multilayer
+      p_i.dynamic_dense_gate_mlp = self.dynamic_dense_gate_mlp
+      p_i.dynamic_dense_glu_mlp = self.dynamic_dense_glu_mlp 
+      p_i.dynamic_dense_seperate_gating_ln = self.dynamic_dense_seperate_gating_ln
+      p_i.dense_bias_init_method = self.dense_bias_init_method
+      p_i.comp_dense_diff = self.comp_dense_diff
+      p_i.dynamic_dense_share_qk_way = self.dynamic_dense_share_qk_way
+      p_i.dynamic_dense_fix_last_layer = self.dynamic_dense_fix_last_layer
+
+      p_i.laurel_lr = self.laurel_lr
+      p_i.laurel_rw = self.laurel_rw
+      p_i.laurel_normed_residual = self.laurel_normed_residual
+
+      # shared hyper-params by dense and head_dense
+      p_i.use_dense_norm = self.use_dense_norm
+      p_i.dynamic_dense_act_cls = self.dynamic_dense_act_cls
+
+      # head dense params
+      p_i.dynamic_head_dense = self.dynamic_head_dense[i] if isinstance(self.dynamic_head_dense, tuple) else self.dynamic_head_dense
+      p_i.dynamic_head_rank = self.dynamic_head_rank[i] if isinstance(self.dynamic_head_rank, tuple) else self.dynamic_head_rank
+      p_i.dynamic_head_dense_type = self.dynamic_head_dense_type
+      p_i.tr_atten_tpl.dynamic_head_dense_type = self.dynamic_head_dense_type
+      p_i.dynamic_head_seperate_param = self.dynamic_head_seperate_param
+      p_i.v_out_rank = self.v_out_rank
+      p_i.v_out_dynamic = self.v_out_dynamic
+      p_i.attn_out_orig = self.attn_out_orig
+      # p_i.dynamic_qk_proj = self.dynamic_qk_proj
 
       if self.moe_layers and i in self.moe_layers:
         assert self.num_experts > 0
@@ -1692,6 +2485,8 @@ class StackedTransformer(base_layer.BaseLayer):
         p_i.tr_fflayer_tpl = moe_p
 
       atten_tpl = p_i.tr_atten_tpl
+
+      atten_tpl.dynamic_dense_by_group_heads = self.dynamic_dense_by_group_heads
       # assert atten_tpl.project_logits
       # assert atten_tpl.project_probs
       # if i == 1:
@@ -1702,7 +2497,7 @@ class StackedTransformer(base_layer.BaseLayer):
       if hasattr(atten_tpl, 'dynamic_w_pre_proj_tpl'):
         cross_head_proj_tpls += [atten_tpl.dynamic_w_pre_proj_tpl, atten_tpl.dynamic_w_post_proj_tpl]
       for p in cross_head_proj_tpls:
-        for name in ['use_static_w', 'dynamic_w_init', 'dynamic_d_init']:
+        for name in ['use_static_w', 'dynamic_w_init', 'dynamic_d_init', 'src_dependent','tgt_dependent']:
           if hasattr(p, name):
             val = getattr(p, name)
             # if i > 0: assert isinstance(val, list), f'{p}.{name} = {val}'
@@ -1712,7 +2507,7 @@ class StackedTransformer(base_layer.BaseLayer):
       # Several attributes of atten_tpl (inc. window_size) have already beens set, but
       # num_heads and dim_per_head haven't, which are to be set in Transformer._setup_attention
       for tpl, tpl_name, names in [(p_i, 'p_i', ['hidden_dims', 'num_heads', 'dim_per_head']),  # tuple
-                        (atten_tpl, 'atten_tpl', ['window_size'])]:  # list
+                        (atten_tpl, 'atten_tpl', ['window_size', 'project_probs', 'project_logits', 'internal_enable_query_scale'] + ['o_norm', 'o_gate_activation_cls', 'use_rotary_position_emb', 'linear_attn', 'qk_activation_cls'] )]:  # list
         for name in names:
           if hasattr(tpl, name):
             val = getattr(tpl, name)
@@ -1732,8 +2527,90 @@ class StackedTransformer(base_layer.BaseLayer):
         raise ValueError('num_layers should be divisible by '
                          'transformer_layer_params_tpl')
 
+    if isinstance(self.dynamic_head_rank, tuple):
+      assert len(self.dynamic_head_rank) == self.num_layers
+    if isinstance(self.dynamic_head_dense, tuple):
+      assert len(self.dynamic_head_dense) == self.num_layers
+
+    if self.dynamic_dense_type is not None:
+      assert self.dynamic_dense_type in ['qkv', 'qkvm', 'm', 'qkvmm', 'qkvlm', 'qkvgm', 'kvm', 'qkm', 'qvm']
+
     layer_params = [_layer_params(i) for i in range(self.num_layers)]
     self.create_children('x_layers', layer_params)
+
+    self.create_child('head_dw1_norm', self.head_dw1_norm_tpl.clone())
+
+    if self.dense_conn:
+      # self.create_child('dense_norm', self.dense_norm_tpl.clone())
+        # assert isinstance(self.dynamic_dense_act_cls, GELU)
+      assert self.dense_bias_init_method in ['current_only', 'emb_only', 'uniform', 'zeros3+current_only', 'current_only_softmax']
+      if self.dense_conn_learnable:
+        b_init_method = self.dense_bias_init_method if not self.comp_dense_diff else 'uniform' # use uniform init with comp_dense_diff
+        if self.dense_conn_on_attn or self.dense_conn_on_layerdiff:
+          assert 'current_only' in b_init_method
+          factor = 2 if not self.attn_out_orig else 1
+        else:
+          factor = 1
+        for i in range(self.num_layers):
+          if self.dynamic_dense_type is not None:
+            C = 1 if i==self.num_layers-1 and self.dynamic_dense_fix_last_layer else len(self.dynamic_dense_type)
+          else:
+            C = None 
+          if b_init_method == 'uniform':
+            init_v = [1] * (i+2) 
+          elif b_init_method == 'current_only':
+            init_v = [0] * ((i+1) * factor) + [1] 
+          elif b_init_method == 'emb_only':
+            init_v = [1] + [0] * (i+1) 
+          elif b_init_method == 'current_only_softmax':
+            init_v = [0] * (i+1) + [5]
+          elif b_init_method == 'zeros3+current_only':
+            init_v = [0] * ((i+1) * factor) + [1]
+            init_vs = [ [0] * len(init_v) ] * 3 + [init_v]
+          dense_w = WeightHParams(
+              shape=[len(init_v)] if C is None else [C, len(init_v)],
+              init=WeightInit.Constant(init_vs if b_init_method == 'zeros3+current_only' else init_v), # L or CL
+              mesh_shape=self.mesh_shape,
+              tensor_split_dims_mapping=[None] if C is None else [None, None],
+              collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+          )
+          self.create_variable(f'dense_conn_{i}', dense_w)
+
+      if self.dense_finetune_scale:
+        for i in range(self.num_layers+1):
+          ft_scale = WeightHParams(
+              shape=[self.model_dims], # D 
+              init=WeightInit.Constant(1),
+              mesh_shape=self.mesh_shape,
+              tensor_split_dims_mapping=[None],
+              collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+          )
+          self.create_variable(f'dense_ft_scale_{i}', ft_scale)
+
+      if self.dynamic_dense_key_wise: # BTD, DL-> BTL
+        if self.use_dense_norm: 
+          self.create_child('emb_dense_norm', self.dense_norm_tpl.clone())
+        if self.dynamic_dense_act_cls is not None:
+          self.create_child('emb_dense_activation', pax_fiddle.Config(self.dynamic_dense_act_cls).clone())
+        std = 1/math.sqrt(self.model_dims) 
+        l = self.num_layers * self.dynamic_dense_num_groups 
+        dyn_dense_proj1 = WeightHParams(
+            shape=[self.model_dims, l * self.dynamic_dense_hidden_expand], # DL
+            init=WeightInit.Gaussian(std),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=['data', None],
+        )
+        dyn_dense_proj2 = WeightHParams(
+            shape=[l * self.dynamic_dense_hidden_expand, l], # LL
+            init=WeightInit.Constant(0),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=[None, None],
+        )
+        self.create_variable('emb_dynamic_dense_conn1', dyn_dense_proj1)
+        self.create_variable('emb_dynamic_dense_conn2', dyn_dense_proj2)
+
+    if self.use_recurrent_layer_mixing:
+      self.create_child('layer_mix', self.recurrent_layer_mixing_tpl.clone())
 
     if self.input_dropout_prob > 0.0:
       self.create_child(
@@ -1812,26 +2689,76 @@ class StackedTransformer(base_layer.BaseLayer):
         cross_inputs,
         cross_attention_mask,
         segment_pos,
+        v_in,
+        hhids,
     ):
-      x_out, _ = transformer(
+      x_out, atten_output, _, dyn_dense_w, dyn_head_dense_w, v_out, hhids = transformer(
           x_in,
           paddings,
           attention_mask,
           cross_inputs,
           cross_attention_mask,
           segment_pos=segment_pos,
+          v_in=v_in,
+          hhids=hhids,
       )
-      return x_out
+      # dyn_dense_w = None
+      # if dyn_dense_proj is not None:
+      #   dense_proj1, dense_proj2 = dyn_dense_proj
+      #   # x_out_normed = self.dense_norm(x_out) if self.use_dense_norm else x_out
+      #   if self.dynamic_dense_act_cls is None:
+      #     dense_proj = dense_proj1 @ dense_proj2 # DL,LL->DL # 1024x25 , 25x25 -> 1024x25
+      #     dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out, dense_proj)
+      #   else:
+      #     # dense_w_inner = self.dense_activation(jnp.einsum('B T D, D K -> B T K', x_out, dense_proj1))   # GELU activation
+      #     dense_w_inner = jax.nn.gelu(jnp.einsum('B T D, D K -> B T K', x_out, dense_proj1))   # GELU activation
+      #     dense_w_inner = self.dense_norm(dense_w_inner)
+      #     dyn_dense_w = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
+
+      #   # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', self.dense_norm(x_out), dyn_dense_proj)
+      #   # dyn_dense_w = self.dense_norm(dyn_dense_w)
+      return x_out, atten_output, dyn_dense_w, dyn_head_dense_w, v_out, hhids
 
     fprop = _fprop
     if self.remat:
       fprop = nn.remat(
           _fprop, policy=checkpoint_policy.custom_policy(self.checkpoint_policy)
       )
+    
+    if self.dense_conn:
+      hids = [x_out]
+      if self.dynamic_dense_key_wise:
+        dense_proj1, dense_proj2 = self.theta.emb_dynamic_dense_conn1, self.theta.emb_dynamic_dense_conn2
+        x_out_normed = self.emb_dense_norm(x_out) if self.use_dense_norm else x_out
+        if self.dynamic_dense_act_cls is None:
+          dense_proj = dense_proj1 @ dense_proj2 # DL,LL->DL # 1024x25 , 25x25 -> 1024x25
+          dyn_dense_w_keywise = jnp.einsum('B T D, D L -> B T L', x_out_normed, dense_proj)
+        else:
+          dense_w_inner = self.emb_dense_activation(jnp.einsum('B T D, D K -> B T K', x_out_normed, dense_proj1))  # GELU activation
+          dyn_dense_w_keywise = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
+        dyn_dense_w_keywise = rearrange(dyn_dense_w_keywise, 'B T (L G) -> B T L G', G=self.dynamic_dense_num_groups)
+        dws_key_wise = [dyn_dense_w_keywise] # BTLG, L=num_layers
 
-    for i in range(self.num_layers):
-      x_in = x_out
-      x_out = fprop(
+    if self.hyper_conn:
+      hhids = jnp.stack([x_out] * self.hyper_conn_n) # nD hyper hidden states
+    else:
+      hhids = None
+
+    if self.use_recurrent_layer_mixing:
+      h_0 = jnp.zeros(x_out.shape, dtype=self.fprop_dtype)
+      cell_0 = jnp.zeros(x_out.shape, dtype=self.fprop_dtype)
+      layer_hid, x_out, cell = self.layer_mix(x_out, h_0, cell_0)
+    v_in = None
+    v_outs = []
+    x_in = x_out
+    block_factor = 2 if self.dense_conn_on_attn or self.dense_conn_on_layerdiff else 1
+    for i in range(self.num_layers):  
+      hid_idxs = list(range((i+1)*block_factor +1))
+      # if self.dynamic_dense:
+      #   dyn_dense_proj = (getattr(self.theta, f'dynamic_dense_conn1_{i}'),  getattr(self.theta, f'dynamic_dense_conn2_{i}'))
+      # else:
+      #   dyn_dense_proj = None 
+      x_out, atten_output, dyn_dense_w, dyn_head_dense_w, v_out, hhids = fprop(
           self.x_layers[i],
           x_in,
           paddings,
@@ -1839,8 +2766,161 @@ class StackedTransformer(base_layer.BaseLayer):
           cross_inputs,
           cross_attention_mask,
           segment_pos,
+          v_in,
+          hhids,
       )
       x_out = checkpoint_name(x_out, 'transformer_layer_out')
+      v_in = None
+      if self.dynamic_dense_disentangle:
+        x_out = (x_out - x_in) + hids[-1]
+      if self.use_recurrent_layer_mixing:
+        layer_hid, x_out, cell = self.layer_mix(x_out, layer_hid, cell)
+
+      if self.dense_conn: # update x_in for next layer
+        dense_w = getattr(self.theta, f'dense_conn_{i}') if self.dense_conn_learnable else jnp.array([0] * (i+1) + [1]) 
+        if self.dense_conn_on_attn:
+          hids.append(atten_output)
+        elif self.dense_conn_on_layerdiff:
+          if self.dynamic_dense_type is not None and self.dynamic_dense_type.endswith('m'):
+            hids.append(x_out - x_in[-1])
+          else:
+            hids.append(x_out - x_in)
+        if self.comp_dense_diff:
+          if self.dynamic_dense_type is not None and self.dynamic_dense_type.endswith('m'):
+            hids.append(x_out - x_in[-1])
+          else:
+            hids.append(x_out - x_in)
+        else:
+          hids.append(x_out)
+        if self.dynamic_dense:
+          # dyn_dense_w = jnp.einsum('B T D, D L -> B T L', x_out, dyn_dense_proj) 
+          # dyn_dense_w = base_layer.maybe_shard(dyn_dense_w, ['data', None, None], self.mesh_axis_names)
+          ov = None
+          if isinstance(dyn_dense_w, tuple):
+            dyn_dense_w, ov = dyn_dense_w[0], dyn_dense_w[1:] # ov = ov1, ov2
+          
+          if self.dynamic_dense_norm_on_weight:
+            assert self.dynamic_dense_num_groups == 1 and self.use_dense_norm
+            dyn_dense_w = self.x_layers[i].dense_norm(dyn_dense_w) # BTL 2-25 
+
+          if self.dynamic_dense_ov:
+            assert ov is not None
+          if not self.attn_out_orig:
+            assert len(hids) == dense_w.shape[-1] and dyn_dense_w is not None
+          
+          if self.dynamic_dense_type is not None:
+            C = 1 if self.dynamic_dense_fix_last_layer and i==self.num_layers-1  else len(self.dynamic_dense_type) 
+          if self.dynamic_dense_query_wise and self.dynamic_dense_key_wise:
+            assert self.dynamic_dense_num_groups == 1 and not self.dynamic_dense_normalized
+            assert self.num_layers + 2 == dyn_dense_w.shape[-1] / self.dynamic_dense_num_groups 
+            dyn_dense_w = rearrange(dyn_dense_w, 'B T (L G) -> B T L G', G=self.dynamic_dense_num_groups)
+            qw, kw = dyn_dense_w[:,:,:i+2],dyn_dense_w[:,:,i+2:]
+            dws_key_wise.append(kw)
+          elif self.dynamic_dense_query_wise: # default
+            if self.dynamic_dense_type is not None:
+              dyn_dense_w = rearrange(dyn_dense_w, 'B T (C L G) -> C B T L G', G=self.dynamic_dense_num_groups, C=C)
+            else: # default
+              assert len(hids) == dyn_dense_w.shape[-1] / self.dynamic_dense_num_groups
+              dyn_dense_w = rearrange(dyn_dense_w, 'B T (L G) -> B T L G', G=self.dynamic_dense_num_groups)
+          elif self.dynamic_dense_key_wise:
+            assert self.dynamic_dense_num_groups == 1 and not self.dynamic_dense_normalized
+            assert self.num_layers - (len(hids) - 2) == dyn_dense_w.shape[-1] / self.dynamic_dense_num_groups
+            dyn_dense_w = rearrange(dyn_dense_w, 'B T (L G) -> B T L G', G=self.dynamic_dense_num_groups)
+            dws_key_wise.append(dyn_dense_w) # BTLG; L=num_layers - i
+          def _ov_transform(_x, ov, normalize=False):
+            if ov is None: # identity transformation
+              return _x if not normalize else self.x_layers[i].dense_norm(_x) 
+            else: # low_rank transformation
+              ov1, ov2, ov_gate = ov 
+              _layer = self.x_layers[i]
+              _x_normed = _layer.dense_norm(_x) if _layer.use_dense_norm else _x
+              _inner = jnp.einsum('B T D, D R -> B T R', _x_normed, ov1)
+              if ov_gate is not None: 
+                _inner = _inner * jnp.einsum('B T D, D R -> B T R', _x_normed, ov_gate)
+              _output_lr = jnp.einsum('B T R, R D -> B T D', _inner, ov2)
+              if self.laurel_normed_residual: _output_lr = _output_lr + _x_normed
+              return _x + _output_lr
+          if self.dynamic_dense_ov_after_merge:
+            ov_before, ov_after = None, ov
+          else: #default
+            ov_before, ov_after = ov, None
+          if self.dynamic_dense_num_groups == 1:
+            if self.dynamic_dense_normalized:
+              dyn_dense_w = jax.nn.softmax(dyn_dense_w + jnp.expand_dims(dense_w, 1), axis=2) # BTLG + LG-> BTLG 
+              x_out = sum([dyn_dense_w[:,:,j] * _ov_transform(hids[j], ov_before) for j in hid_idxs])
+            else: #default
+              if self.dynamic_dense_query_wise and self.dynamic_dense_key_wise:
+                x_out = sum([(dense_w[j] + qw[:,:,j] + dws_key_wise[j][:,:,self.num_layers-1-i]) * _ov_transform(hids[j], ov_before) for j in hid_idxs])
+              elif self.dynamic_dense_query_wise: # default
+                if self.dynamic_dense_type is not None:
+                  dyn_dense_w = dyn_dense_w + dense_w[:,None,None,:,None]  # CBTL1 + C11L1 -> CBTL1
+                  # C = len(self.dynamic_dense_type)
+                  if self.dynamic_dense_type == 'qkvm' and self.attn_out_orig: # CBTL
+                    assert self.dynamic_dense_type == 'qkvm'
+                    x_out_qkv = [sum([dyn_dense_w[cidx,:,:,j] * hids[(j-1)*2+1] for j in range(1,i+2)]) + hids[-1] for cidx in range(3)] # 3BTL, LBTD -> 3BTD; L = num_layers  
+                    x_out_m = sum([dyn_dense_w[3,:,:,j] * hids[j*2] for j in range(0,i+2)]) # BTL, LBTD -> BTD; L = num_layers + 1 
+                    x_out_qkv.append(x_out_m)
+                    x_out = jnp.stack(x_out_qkv)
+                  elif self.dynamic_dense_type == 'm' and not self.dynamic_dense_stack:
+                    x_out = (hids[-1], sum([dyn_dense_w[0,:,:,j] * _ov_transform(hids[j], ov_before) for j in hid_idxs]))
+                  else: # DyanmicDense ['qkvm', 'qkvgm', 'qkm', 'qvm', 'kvm'] branch
+                    if self.dense_finetune_scale:
+                      x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * (_ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) * getattr(self.theta, f'dense_ft_scale_{j}')[None,None,:]) for j in hid_idxs]) for cidx in range(C)])
+                    else: # default 
+                      x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]) for cidx in range(C)])
+                    if self.dynamic_dense_stack:
+                      x_out = jnp.stack(x_out)
+                else: # dynamic dense branch
+                  dyn_dense_w = dyn_dense_w + dense_w[None,None,:,None]  # BTLG, L
+                  x_out = sum([dyn_dense_w[:,:,j] * _ov_transform(hids[j], ov_before) for j in hid_idxs]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
+                  # x_out = sum([(dense_w[j] + dyn_dense_w[:,:,j]) * _ov_transform(hids[j], ov_before) for j in hid_idxs]) # BTL,LBTD-> BTD [(1+BT1->BT1), BTD->BTD for l in L]
+              elif self.dynamic_dense_key_wise:
+                # dws_key_wise: [BTL,BTL,BT(L-1),...BT1] L=num_layers, len=25
+                x_out = sum([(dense_w[j] + dws_key_wise[j][:,:,self.num_layers-1-i]) * _ov_transform(hids[j], ov_before) for j in hid_idxs])
+          else:
+            group_dim = self.model_dims//self.dynamic_dense_num_groups
+            x_out = sum([jnp.repeat(dense_w[j] + dyn_dense_w[:,:,j], group_dim, axis=-1) * _ov_transform(hids[j], ov_before) for j in hid_idxs]) # 1 + BTLG -> BTLG -> BTL(Gd) repeat ;BTLD,LBTD-> BTD
+          if self.dynamic_dense_ov_after_merge:
+            x_out = _ov_transform(x_out, ov_after)
+          # if not self.dynamic_dense_key_wise:
+          #   self.add_summary(f'dynamic_dense_w_max_{i}', dyn_dense_w.max(), verbosity=3)
+          #   self.add_summary(f'dynamic_dense_w_mean_{i}', dyn_dense_w.mean(), verbosity=3)
+          #   self.add_summary(f'dynamic_dense_w_min_{i}', dyn_dense_w.min(), verbosity=3)
+        else:
+          x_out = sum([dense_w[j] * hids[j] for j in range(len(hids))])
+      if self.dynamic_head_dense:
+        v_outs.append(v_out)
+      if self.x_layers[i].dynamic_head_dense: # update v_in for next layer
+        C = len(self.dynamic_head_dense_type) # 2: qk, 3:qkv, 4: qkvo
+        # dw2, dw1 = jnp.split(dyn_head_dense_w, jnp.array([2], dtype=jnp.int32), axis=0) # (L+1)BSRN -> 2BSRN,LBSRN
+        if isinstance(dyn_head_dense_w, tuple):
+          dw1, dw2 = dyn_head_dense_w # LBTRr, CBTRN
+        else:
+          dw1, dw2 = dyn_head_dense_w[:-C], dyn_head_dense_w[-C:] #(L*C+C)BSRN 
+        if self.dynamic_head_seperate_param:
+          dw1 = rearrange(dw1, '(L C) B S R N -> L C B S R N',C=C)
+          if not self.head_dw1_norm_on_activation: dw1 = self.head_dw1_norm(dw1)
+          inner_v = sum(jnp.einsum('BSND,CBSRN->CBSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
+          if self.head_dw1_norm_on_activation: inner_v = self.head_dw1_norm(inner_v) # rmsnorm
+          inner_v = sum(jnp.einsum('BSND,CBSRN->CBSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
+          v_in = jnp.einsum('CBSRD,CBSRN->CBSND', inner_v, dw2)
+        else:
+          if not self.head_dw1_norm_on_activation: dw1 = self.head_dw1_norm(dw1)
+          inner_v = sum(jnp.einsum('BSND,BSRN->BSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSrD, (C)LBSRr->(C)BSRD # 
+          if self.head_dw1_norm_on_activation: inner_v = self.head_dw1_norm(inner_v) # rmsnorm
+          v_in = jnp.einsum('BSRD,CBSRN->CBSND', inner_v, dw2) # C=4, QKVO  # [LBSrD -> BSND for _ in range(4)] # CLrN
+          # dynamic_conv(v_out) : LBSND, LBS-> BSND
+          # dynamic_conv4(v_out) : LBSND, CLBS1-> CBSND
+          # dynamic_conv4_byhead(v_out) : LBSND, CLBSN-> CBSND
+          # dynamic head dense: LBSND, LBSRN -> BSRD;  BSRD,CBSRN->CBSND
+          # v_in = sum(jnp.einsum('BSND,BS->BSND', v_outs[j], dw1[j,:,:,0,0]) for j in range(i+1)) ; v_in = v_in[None] # LBSND, (C)LBSRN->BSRD
+          # v_in = sum(jnp.einsum('BSND,BSC->CBSND', v_outs[j], dw1[j,:,:,:,0]) for j in range(i+1))
+          # v_in = sum(v_outs[j] for j in range(i+1)) / len(v_outs); v_in = v_in[None]
+      x_in = x_out   
+    if self.dynamic_dense_type is not None:
+      x_out = x_out[0] if self.dynamic_dense_fix_last_layer else x_out[1] # dynamic combination of all previous layer outputs
+    elif self.hyper_conn:
+      x_out = hhids.sum(axis=0)
     return x_out
 
   def extend_step(self,
