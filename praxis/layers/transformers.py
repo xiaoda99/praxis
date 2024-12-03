@@ -478,8 +478,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
       inputs = self.pre_layer_norm(inputs)
     elif self.norm_policy == 'pre':
       inputs = self.layer_norm(inputs)
-      if self.seperate_gating_ln: 
-        assert gate_inputs is not None
+      if self.seperate_gating_ln and gate_inputs is not None: # qkvgm, lidx>0
         gate_inputs = self.layer_norm_gating(gate_inputs)
       else:
         gate_inputs = inputs
@@ -1251,6 +1250,7 @@ class Transformer(base_layer.BaseLayer):
   dynamic_dense_ov_rank: int = 64
   dynamic_dense_ov_outer_loop: bool = False
   dynamic_dense_hidden_expand: int = 1
+  dynamic_dense_hidden_round: bool = False
   dynamic_dense_key_wise: bool = False 
   dynamic_dense_query_wise: bool = True
   dynamic_dense_multilayer: bool = True
@@ -1259,6 +1259,8 @@ class Transformer(base_layer.BaseLayer):
   dynamic_dense_seperate_gating_ln: bool = False
   dynamic_dense_share_qk_way: bool = False # default: share q/k/v with mlp way cross-layer composition
   dynamic_dense_fix_last_layer: bool = False # reduce static dense and dynamic dense to 1-way
+  dynamic_dense_keep_residual: bool = False
+  dynamic_dense_k_from_res: bool = False
   v_out_rank: Optional[int] = None
   v_out_dynamic: bool = False
   attn_out_orig: bool = False
@@ -1443,14 +1445,18 @@ class Transformer(base_layer.BaseLayer):
           C = 1 
         l = l * self.dynamic_dense_num_groups * C 
         std = 1/math.sqrt(self.input_dims) 
+        dynamic_dense_inter_dim = int(l * self.dynamic_dense_hidden_expand)
+        if self.dynamic_dense_hidden_round:  # round to 64 or 128
+          # assert dynamic_dense_inter_dim < 128
+          dynamic_dense_inter_dim = (dynamic_dense_inter_dim// 64 +1) * 64 
         dyn_dense_proj1 = WeightHParams(
-            shape=[self.input_dims, l * self.dynamic_dense_hidden_expand], # DL
+            shape=[self.input_dims, dynamic_dense_inter_dim], # DL
             init=WeightInit.Gaussian(std),
             mesh_shape=self.mesh_shape, 
             tensor_split_dims_mapping=['data', None],
         )
         dyn_dense_proj2 = WeightHParams(
-            shape=[l * self.dynamic_dense_hidden_expand, l], # LL
+            shape=[dynamic_dense_inter_dim, l], # LL
             init=WeightInit.Constant(0),
             mesh_shape=self.mesh_shape, 
             tensor_split_dims_mapping=[None, None],
@@ -1735,6 +1741,7 @@ class Transformer(base_layer.BaseLayer):
       segment_ids: Optional[JTensor] = None,
       v_in:Optional[JTensor] = None, # mqy: cross head values, 2BTNd (2:q/k) 
       hhids:Optional[JTensor] = None, # mqy: hyper hidden states, NBTD (N:4) 
+      residual:Optional[JTensor] = None, # original residual for qvm ablation where k uses residual stream directly
       ) -> Tuple[JTensor, JTensor]:
     """Transformer decoder layer.
 
@@ -1801,9 +1808,12 @@ class Transformer(base_layer.BaseLayer):
                 _idx = self.dynamic_dense_type.index(_type)
               elif self.dynamic_dense_share_qk_way and _type in ['q', 'k']:
                 _idx = self.dynamic_dense_type.index('qk'.replace(_type, '')) # q->k or k->q
-              else: # share mlp-way cross-layer composition
-                _idx = -1
-              inputs_normalized.append(self.layer_norms[_idx](inputs[_idx]))
+              else: 
+                _idx = -1 # share mlp-way cross-layer composition or apply ln to residual 
+              if self.dynamic_dense_k_from_res:
+                assert residual is not None
+              _input = residual if self.dynamic_dense_k_from_res and _idx == -1 else inputs[_idx] 
+              inputs_normalized.append(self.layer_norms[_idx](_input))
           else: 
             inputs_normalized = [self.layer_norm(_inputs) for _inputs in inputs]
         else: # dynamic_dense_type = 'm' 
@@ -2221,7 +2231,7 @@ class StackedTransformer(base_layer.BaseLayer):
   mask_self_attention: bool = False
   num_layers: int = 0
   model_dims: int = 0
-  hidden_dims: int = 0
+  hidden_dims: Union[int, Tuple[int]] = 0
   num_heads: int = 0
   dim_per_head: Optional[int] = None
   dropout_prob: float = 0.0
@@ -2269,6 +2279,8 @@ class StackedTransformer(base_layer.BaseLayer):
   dense_conn_on_layerdiff: bool = False
   dense_conn_learnable: bool = True
   dense_finetune_scale: bool = False
+  dense_vector_scale: bool= False
+  dense_vector_scale_keywise: bool = False
   num_ffn: int = 1 # mqy; group of feedforward layer
   dynamic_dense: bool = False
   dynamic_dense_ft_norm: bool = False
@@ -2283,7 +2295,8 @@ class StackedTransformer(base_layer.BaseLayer):
   dynamic_dense_ov_outer_loop: bool = False
   dynamic_dense_ov_rank: int = 64
   dynamic_dense_ov_after_merge: bool = False 
-  dynamic_dense_hidden_expand: int = 1
+  dynamic_dense_hidden_expand: Union[int, list] = 1
+  dynamic_dense_hidden_round: bool = False
   dynamic_dense_key_wise: bool = False 
   dynamic_dense_query_wise: bool = True
   dynamic_dense_multilayer: bool = True
@@ -2295,6 +2308,9 @@ class StackedTransformer(base_layer.BaseLayer):
   dynamic_dense_share_qk_way: bool = False # default: share q/k/v with mlp way cross-layer composition
   dynamic_dense_fix_last_layer: bool = False # reduce multi-way static and dynamic dense to 1-way
   dynamic_dense_by_group_heads: bool = False
+  dynamic_dense_keep_residual: bool = False
+  dynamic_dense_k_from_res: bool = False
+  dynamic_dense_param_residual: bool = False
   v_out_rank: Optional[int] = None
   v_out_dynamic: bool = False
   attn_out_orig: bool = False
@@ -2424,6 +2440,11 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.hyper_conn_merge_wcdc = self.hyper_conn_merge_wcdc
       
       # dense params
+      if isinstance(self.dynamic_dense_hidden_expand, tuple) or isinstance(self.dynamic_dense_hidden_expand, list):
+        assert len(self.dynamic_dense_hidden_expand) == self.num_layers
+        dynamic_dense_hidden_expand = self.dynamic_dense_hidden_expand[i]
+      else:
+        dynamic_dense_hidden_expand = self.dynamic_dense_hidden_expand
       p_i.layer_index = i
       p_i.num_ffn = self.num_ffn
       p_i.num_layers = self.num_layers
@@ -2440,7 +2461,8 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.dynamic_dense_ov_init = self.dynamic_dense_ov_init
       p_i.dynamic_dense_ov_outer_loop = self.dynamic_dense_ov_outer_loop
       p_i.dynamic_dense_ov_rank = self.dynamic_dense_ov_rank
-      p_i.dynamic_dense_hidden_expand = self.dynamic_dense_hidden_expand 
+      p_i.dynamic_dense_hidden_expand = dynamic_dense_hidden_expand
+      p_i.dynamic_dense_hidden_round = self.dynamic_dense_hidden_round
       p_i.dynamic_dense_key_wise = self.dynamic_dense_key_wise
       p_i.dynamic_dense_query_wise = self.dynamic_dense_query_wise
       p_i.dynamic_dense_multilayer = self.dynamic_dense_multilayer
@@ -2451,6 +2473,9 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.comp_dense_diff = self.comp_dense_diff
       p_i.dynamic_dense_share_qk_way = self.dynamic_dense_share_qk_way
       p_i.dynamic_dense_fix_last_layer = self.dynamic_dense_fix_last_layer
+      p_i.dynamic_dense_keep_residual = self.dynamic_dense_keep_residual
+      p_i.dynamic_dense_k_from_res = self.dynamic_dense_k_from_res
+
 
       p_i.laurel_lr = self.laurel_lr
       p_i.laurel_rw = self.laurel_rw
@@ -2576,6 +2601,20 @@ class StackedTransformer(base_layer.BaseLayer):
           )
           self.create_variable(f'dense_conn_{i}', dense_w)
 
+      if self.dense_vector_scale:
+        assert self.dynamic_dense_type is not None
+        num_vecs = self.num_layers +1 if self.dense_vector_scale_keywise else self.num_layers
+        for i in range(num_vecs):
+          C = 1 if i==self.num_layers-1 and self.dynamic_dense_fix_last_layer and not self.dense_vector_scale_keywise else len(self.dynamic_dense_type)
+          vector_scale = WeightHParams(
+              shape=[C, self.model_dims], # D 
+              init=WeightInit.Constant(1),
+              mesh_shape=self.mesh_shape,
+              tensor_split_dims_mapping=[None, None],
+              collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+          )
+          self.create_variable(f'dense_vector_scale_{i}', vector_scale)
+
       if self.dense_finetune_scale:
         for i in range(self.num_layers+1):
           ft_scale = WeightHParams(
@@ -2691,6 +2730,7 @@ class StackedTransformer(base_layer.BaseLayer):
         segment_pos,
         v_in,
         hhids,
+        residual,
     ):
       x_out, atten_output, _, dyn_dense_w, dyn_head_dense_w, v_out, hhids = transformer(
           x_in,
@@ -2701,6 +2741,7 @@ class StackedTransformer(base_layer.BaseLayer):
           segment_pos=segment_pos,
           v_in=v_in,
           hhids=hhids,
+          residual=residual,
       )
       # dyn_dense_w = None
       # if dyn_dense_proj is not None:
@@ -2751,6 +2792,8 @@ class StackedTransformer(base_layer.BaseLayer):
     v_in = None
     v_outs = []
     x_in = x_out
+    last_dyn_dense_w = None
+    residual = x_out if self.dynamic_dense_keep_residual else None 
     block_factor = 2 if self.dense_conn_on_attn or self.dense_conn_on_layerdiff else 1
     for i in range(self.num_layers):  
       hid_idxs = list(range((i+1)*block_factor +1))
@@ -2768,7 +2811,9 @@ class StackedTransformer(base_layer.BaseLayer):
           segment_pos,
           v_in,
           hhids,
+          residual,
       )
+      residual = x_out if self.dynamic_dense_keep_residual else None
       x_out = checkpoint_name(x_out, 'transformer_layer_out')
       v_in = None
       if self.dynamic_dense_disentangle:
@@ -2853,6 +2898,10 @@ class StackedTransformer(base_layer.BaseLayer):
                 x_out = sum([(dense_w[j] + qw[:,:,j] + dws_key_wise[j][:,:,self.num_layers-1-i]) * _ov_transform(hids[j], ov_before) for j in hid_idxs])
               elif self.dynamic_dense_query_wise: # default
                 if self.dynamic_dense_type is not None:
+                  if last_dyn_dense_w is not None and i < self.num_layers-1:
+                    dyn_dense_w = jnp.concatenate([dyn_dense_w[...,:-1,:] + last_dyn_dense_w, dyn_dense_w[...,-1:,:]], axis=-2)
+                  if self.dynamic_dense_param_residual:
+                    last_dyn_dense_w = dyn_dense_w
                   dyn_dense_w = dyn_dense_w + dense_w[:,None,None,:,None]  # CBTL1 + C11L1 -> CBTL1
                   # C = len(self.dynamic_dense_type)
                   if self.dynamic_dense_type == 'qkvm' and self.attn_out_orig: # CBTL
@@ -2866,6 +2915,11 @@ class StackedTransformer(base_layer.BaseLayer):
                   else: # DyanmicDense ['qkvm', 'qkvgm', 'qkm', 'qvm', 'kvm'] branch
                     if self.dense_finetune_scale:
                       x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * (_ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) * getattr(self.theta, f'dense_ft_scale_{j}')[None,None,:]) for j in hid_idxs]) for cidx in range(C)])
+                    elif self.dense_vector_scale:
+                      if self.dense_vector_scale_keywise:
+                        x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * (_ov_transform(hids[j], ov_before) * getattr(self.theta, f'dense_vector_scale_{j}')[None,None,cidx,:]) for j in hid_idxs]) for cidx in range(C)])
+                      else:
+                        x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * (_ov_transform(hids[j], ov_before) * getattr(self.theta, f'dense_vector_scale_{i}')[None,None,cidx,:]) for j in hid_idxs]) for cidx in range(C)])
                     else: # default 
                       x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]) for cidx in range(C)])
                     if self.dynamic_dense_stack:
