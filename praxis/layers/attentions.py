@@ -1818,6 +1818,10 @@ class DotProductAttention(base_layer.BaseLayer):
   logits_absorb_residual: bool = False
   probs_absorb_residual: bool = False
   merge_dw_proj: bool = True
+  head_act_activation_cls: activations_lib.BaseActivation = None
+  head_act_stop_grad: bool = True
+  use_head_act_bias: bool = False
+  skip_head_act_bias_decay: bool = True
 
   dim_per_head: Optional[int] = None
   # XD: gated attention related
@@ -1831,6 +1835,9 @@ class DotProductAttention(base_layer.BaseLayer):
   headless_proj_tpl: LayerTpl = template_field(OneHeadedAttentionProjection)  # XD: from mqa.py
   dconv_qkv: bool = False
   dconv_kernel_size: int = 3
+  dconv_only_v: bool = False  # XD
+  dconv_activation_cls: activations_lib.BaseActivation = activations_lib.Identity  # XD
+  dconv_v_activation_cls: activations_lib.BaseActivation = None  # XD
   internal_gshard_gaussian_init: bool = False
   combine_qkv: bool = False
   combined_qkv_proj_tpl: LayerTpl = template_field(CombinedQKVProjectionLayer)
@@ -2116,20 +2123,44 @@ class DotProductAttention(base_layer.BaseLayer):
       self.merge_dw_proj: # and self.query_chunk_size is not None:
       self.create_child('dyn_w_proj', project_dynamic_w(
         self.dynamic_w_post_proj_tpl, merge_projection=True))
+    
+    if self.head_act_activation_cls is not None:
+      pc = WeightHParams(
+        shape=[self.num_heads, dim_per_head_v],
+        mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl', None],
+        init=WeightInit.Gaussian(0.0006),
+      )
+      self.create_variable('head_act_emb', pc)
+      if self.use_head_act_bias:
+        pc = WeightHParams(
+          shape=[self.num_heads],
+          mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl'],
+          init=WeightInit.Constant(0.0),
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION] 
+            if self.skip_head_act_bias_decay else None,
+        )
+        self.create_variable('head_act_bias', pc)
+      self.create_child('head_act_activation', pax_fiddle.Config(self.head_act_activation_cls).clone())
 
     if self.relative_bias_tpl is not None:
       relative_bias_p = self.relative_bias_tpl.clone()
       relative_bias_p.num_heads = self.num_heads
       self.create_child('relative_bias', relative_bias_p)
 
-    if self.dconv_qkv:
+    if self.dconv_qkv or self.dconv_only_v:  # XD
       causal_dconv_p = self.causal_depthwise_conv1d_tpl.clone().set(
           kernel_size=self.dconv_kernel_size,
           hidden_dims=[self.num_heads, dim_per_head],
       )
       causal_dconv_p.weight_split_dims_mapping.wt = wp.dconv
+      self.create_child('dconv_activation', pax_fiddle.Config(self.dconv_activation_cls).clone())  # XD
+      dconv_v_activation_cls = self.dconv_v_activation_cls \
+        if self.dconv_v_activation_cls is not None else self.dconv_activation_cls
+      self.create_child('dconv_v_activation', pax_fiddle.Config(dconv_v_activation_cls).clone())  # XD
+    if self.dconv_qkv:  # XD
       self.create_child('dconv_q', causal_dconv_p)
       self.create_child('dconv_k', causal_dconv_p)
+    if self.dconv_qkv or self.dconv_only_v:  # XD
       self.create_child('dconv_v', causal_dconv_p)
 
     # Initialize NGrammer layer if present
@@ -2322,6 +2353,11 @@ class DotProductAttention(base_layer.BaseLayer):
     if self.shared_qk_dim > 0 and self.float32_logits:  # XD
       assert not self.scale_logits_by_head_dims
       logits = jnp.multiply(logits, 1.0 / np.sqrt(self.dim_per_head))
+    if self.head_act_activation_cls is not None:
+      logits = py_utils.apply_mask_to_logits(logits, atten_mask)
+      _logits = jax.lax.stop_gradient(logits) if self.head_act_stop_grad else logits
+      head_act = self.head_act_activation(jnp.max(_logits[:, :, :, 1:], axis=-1) - _logits[:, :, :, 0])  # BNT
+      if self.use_head_act_bias: head_act += jnp.expand_dims(self.theta.head_act_bias, axis=1)  # N->N1
 
     # logits = base_layer.maybe_shard(logits, [('replica', 'data'), 'mdl', None, None], self.mesh_axis_names)  # debug
     logits = self._cross_head_proj(logits, 'pre_proj', *pre_proj_dw_args,
@@ -2353,6 +2389,9 @@ class DotProductAttention(base_layer.BaseLayer):
     value_exp = logits_exp.replace('S', '') + 'H'
     encoded = self.pv_einsum(f'{logits_exp},B{N}SH->{value_exp}', probs, value)
     # encoded = self.pv_einsum(f'BNTS,B{N}SH->BNTH', probs, value)
+    if self.head_act_activation_cls is not None:
+      head_act_emb = jnp.einsum('BNT,NH->BNTH', head_act, self.theta.head_act_emb)
+      encoded = encoded + head_act_emb
     return encoded, probs
     
   def _dot_atten(
@@ -2629,8 +2668,12 @@ class DotProductAttention(base_layer.BaseLayer):
       )
       key_proj = self.dconv_k(key_proj, axis=1, segment_pos=key_segment_pos)
       self._fprop_update_decode_state('key_post_dconv', key_proj)
+      query_proj = self.dconv_activation(query_proj)  # XD
+      key_proj = self.dconv_activation(key_proj)  # XD
+    if self.dconv_qkv or self.dconv_only_v:  # XD
       value_proj = self.dconv_v(value_proj, axis=1, segment_pos=key_segment_pos)
       self._fprop_update_decode_state('value_post_dconv', value_proj)
+      value_proj = self.dconv_v_activation(value_proj)  # XD
 
     if self.qk_norm:  # XD
       query_proj, key_proj = self.q_norm(query_proj), self.k_norm(key_proj)
