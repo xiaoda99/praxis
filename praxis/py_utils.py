@@ -470,7 +470,10 @@ def total_num_vars(variables) -> int:
 
 def global_mesh_defined() -> bool:
   """Checks if global xmap/pjit mesh resource environment is defined."""
-  maps_env = jax.experimental.maps.thread_resources.env
+  if jax.__version__ > "0.4.25":
+    maps_env = jax._src.mesh.thread_resources.env
+  else:
+    maps_env = jax.experimental.maps.thread_resources.env
   return maps_env.physical_mesh.devices.shape != ()  # pylint: disable=g-explicit-bool-comparison
 
 
