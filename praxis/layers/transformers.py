@@ -2189,8 +2189,12 @@ def wsum(w: jnp.ndarray, # CBTL1  # XD
   for chunk_i in range(T // seq_chunk_size):
     sli = slice(chunk_i * seq_chunk_size, (chunk_i + 1) * seq_chunk_size)
     for l in range(L):
-      out[:, :, sli, :] += w[:, :, sli, l, :] * hids[l][:, sli, :]  # CBt1*BtD->CBtD)
-  return out
+      if seq_chunk_size == D:
+        out += w[:, :, :, l, :] * hids[l]
+      else:
+        # out[:, :, sli, :] += w[:, :, sli, l, :] * hids[l][:, sli, :]  # CBt1*BtD->CBtD)
+        out = out.at[:, :, sli, :].set(out[:, :, sli, :] + w[:, :, sli, l, :] * hids[l][:, sli, :])  # CBt1*BtD->CBtD)
+  return out if out.shape[0] > 1 else jnp.squeeze(out, 0)  # squeeze C dim if C == 1
 
 class StackedTransformer(base_layer.BaseLayer):
   """A stack of Transformer layers.
@@ -2937,14 +2941,16 @@ class StackedTransformer(base_layer.BaseLayer):
                         x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * (_ov_transform(hids[j], ov_before) * getattr(self.theta, f'dense_vector_scale_{i}')[None,None,cidx,:]) for j in hid_idxs]) for cidx in range(C)])
                     else: # default 
                       # _ov_transform return inputs 
-                      # x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]) for cidx in range(C)])
-                      if self.ddense_w_gen_pattern == 'q,k,v,m':
+                      if self.ddense_w_gen_pattern == '': # default
+                        x_out = tuple([sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]) for cidx in range(C)])
+                      elif self.ddense_w_gen_pattern == 'q,k,v,m':
                         x_out = tuple([wsum(dyn_dense_w[cidx: cidx + 1], hids, self.ddense_w_gen_chunk_size) for cidx in range(C)])
                       elif self.ddense_w_gen_pattern == 'qkvm':
                         x_out = tuple(wsum(dyn_dense_w, hids, self.ddense_w_gen_chunk_size))
                       elif self.ddense_w_gen_pattern == 'qk,vm':
                         x_out = tuple(wsum(dyn_dense_w[:2], hids, self.ddense_w_gen_chunk_size)) + \
-                          tuple(wsum(dyn_dense_w[2:], hids, self.ddense_w_gen_chunk_size))
+                          tuple(wsum(dyn_dense_w[2:], hids, self.ddense_w_gen_chunk_size)) \
+                          if C > 1 else tuple(wsum(dyn_dense_w, hids, self.ddense_w_gen_chunk_size))
               
                     if self.dynamic_dense_stack: #ignore 
                       x_out = jnp.stack(x_out)
