@@ -1169,6 +1169,106 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     return self.__call__(inputs)
 
 
+class HyperConnection(base_layer.BaseLayer):
+  hyper_conn: bool = False 
+  hyper_conn_n: int = 4
+  hyper_conn_tanh: bool = False
+  hyper_conn_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)  # mqy
+  hyper_conn_attn: bool = False
+  input_dims: int = 0
+  layer_index: int = 0
+  efficient: bool = False
+
+  def setup(self) -> None:
+    self.create_child('hyper_conn_norm', self.hyper_conn_norm_tpl.clone().set(dim=self.input_dims))
+    # static w: alpha_sw, beta_sw
+    m_w = np.array([1 if _i == self.layer_index % self.hyper_conn_n else 0 for _i in range(self.hyper_conn_n)]) 
+    r_w = np.eye(self.hyper_conn_n)
+    sw_arr = np.concatenate([m_w[:,None], r_w], axis=-1)
+    alpha_sw = WeightHParams(
+        shape=[self.hyper_conn_n, 1+self.hyper_conn_n], # N(1+N)
+        init=WeightInit.Constant(sw_arr.tolist()), 
+        mesh_shape=self.mesh_shape,
+        tensor_split_dims_mapping=[None, None],
+        collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
+    )
+    self.create_variable('hyper_conn_alpha_sw', alpha_sw)
+    beta_sw = WeightHParams(
+        shape=[self.hyper_conn_n], # N
+        init=WeightInit.Constant(1), 
+        mesh_shape=self.mesh_shape,
+        tensor_split_dims_mapping=[None],
+        collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
+    )
+    self.create_variable('hyper_conn_beta_sw', beta_sw)
+    # dynamic alpha w: alpha_dw, alpha_scale
+    # std = 1/ math.sqrt(self.input_dims)
+    alpha_dw = WeightHParams(
+        shape=[self.input_dims, 1+self.hyper_conn_n], # D(1+N)
+        # init=WeightInit.Gaussian(std),
+        init=WeightInit.Constant(0),
+        mesh_shape=self.mesh_shape, 
+        tensor_split_dims_mapping=['data', None],
+    )
+    alpha_scale = WeightHParams(
+        shape=[1],
+        init=WeightInit.Constant(0.01), # L or CL
+        mesh_shape=self.mesh_shape,
+        tensor_split_dims_mapping=[None],
+    )
+    self.create_variable('hyper_conn_alpha_dw', alpha_dw)
+    self.create_variable('hyper_conn_alpha_scale', alpha_scale)
+    # dynamic beta w: beta_dw, beta_scale
+    # std = 1/ math.sqrt(self.input_dims)
+    beta_dw = WeightHParams(
+        shape=[self.input_dims], # D
+        # init=WeightInit.Gaussian(std),
+        init=WeightInit.Constant(0),
+        mesh_shape=self.mesh_shape, 
+        tensor_split_dims_mapping=[None],
+    )
+    beta_scale = WeightHParams(
+        shape=[1],
+        init=WeightInit.Constant(0.01), # L or CL
+        mesh_shape=self.mesh_shape,
+        tensor_split_dims_mapping=[None],
+    )
+    self.create_variable('hyper_conn_beta_dw', beta_dw)
+    self.create_variable('hyper_conn_beta_scale', beta_scale)
+
+  def __call__(self, hhids: JTensor) -> Tuple[JTensor, JTensor, JTensor]:
+    alpha_sw, alpha_dw, alpha_scale = getattr(self.theta, 'hyper_conn_alpha_sw'), getattr(self.theta, 'hyper_conn_alpha_dw'), getattr(self.theta, 'hyper_conn_alpha_scale')
+    beta_sw, beta_dw, beta_scale = getattr(self.theta, 'hyper_conn_beta_sw'), getattr(self.theta, 'hyper_conn_beta_dw'), getattr(self.theta, 'hyper_conn_beta_scale')
+    if self.efficient:
+      hhids_normed = self.hyper_conn_norm(hhids) # NBtD  
+      # B_w = jnp.einsum('NBTD, D->NBT', hhids_normed, beta_dw) # beta 
+      B_w = (hhids_normed * beta_dw[None,None,None]).sum(-1)
+      Amr_w = jnp.einsum('NBTD, DM->NBTM', hhids_normed, alpha_dw) # alpha  BTN(1+N)
+      # Amr_w = jnp.stack([(hhids_normed * alpha_dw[None,None,None,:,i]).sum(-1) for i in range(alpha_dw.shape[-1])], axis=-1) # NBTD, 111D -> NBTD.sum(-1) -> NBT
+      if self.hyper_conn_tanh: 
+        B_w = jnp.tanh(B_w)
+        Amr_w = jnp.tanh(Amr_w)
+      Amr_w = Amr_w * alpha_scale + alpha_sw[:,None,None] # NBTM + N11M
+      B_w = B_w * beta_scale + beta_sw[:,None,None] # NBT + N11
+      Am_w, Ar_w = Amr_w[...,0], Amr_w[...,1:] # NBT, NBTN
+      inputs = jnp.einsum('NBTD,NBT->BTD', hhids, Am_w) # mixed inputs
+      # inputs = (hhids * Am_w[...,None]).sum(0)
+      # hhids = jnp.einsum('NBTD,NBTM->MBTD',hhids, Ar_w) # mixed hyper hidden states
+      hhids = jnp.stack([(hhids * Ar_w[...,i:i+1]).sum(0) for i in range(Ar_w.shape[-1])]) # NBTD, NBT1
+    else:
+      hhids_normed = self.hyper_conn_norm(hhids)
+      B_w = jnp.einsum('NBTD, D->BTN', hhids_normed, beta_dw) # beta 
+      Amr_w = jnp.einsum('NBTD, DM->BTNM', hhids_normed, alpha_dw) # alpha  BTN(1+N)
+      if self.hyper_conn_tanh: 
+        B_w = jnp.tanh(B_w)
+        Amr_w = jnp.tanh(Amr_w)
+      Amr_w = Amr_w * alpha_scale + alpha_sw[None,None]
+      B_w = B_w * beta_scale + beta_sw[None,None]
+      Am_w, Ar_w = Amr_w[...,0], Amr_w[...,1:] # BTN, BTNN
+      inputs = jnp.einsum('NBTD,BTN->BTD', hhids, Am_w) # mixed inputs
+      hhids = jnp.einsum('NBTD,BTNM->MBTD',hhids,Ar_w) # mixed hyper hidden states
+    return hhids, inputs, B_w
+
 class Transformer(base_layer.BaseLayer):
   """Transformer layer with multi-headed attention.
 
@@ -1236,6 +1336,8 @@ class Transformer(base_layer.BaseLayer):
   hyper_conn_merge_wcdc: bool = False # whether to merge width connection and depth connection
   hyper_conn_tanh: bool = False
   hyper_conn_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)  # mqy
+  hyper_conn_attn: bool = False
+  hyper_conn_efficient: bool = False
   dense_conn: bool = False
   dense_conn_on_attn: bool = False
   dense_conn_on_layerdiff: bool = False
@@ -1482,62 +1584,73 @@ class Transformer(base_layer.BaseLayer):
           self.create_variable(f'dynamic_dense_gate_{i}', dyn_dense_proj_gate)
 
     if self.hyper_conn:
-      self.create_child('hyper_conn_norm', self.hyper_conn_norm_tpl.clone().set(dim=self.input_dims))
-      # static w: alpha_sw, beta_sw
-      m_w = np.array([1 if _i == self.layer_index % self.hyper_conn_n else 0 for _i in range(self.hyper_conn_n)]) 
-      r_w = np.eye(self.hyper_conn_n)
-      sw_arr = np.concatenate([m_w[:,None], r_w], axis=-1)
-      alpha_sw = WeightHParams(
-          shape=[self.hyper_conn_n, 1+self.hyper_conn_n], # N(1+N)
-          init=WeightInit.Constant(sw_arr.tolist()), 
-          mesh_shape=self.mesh_shape,
-          tensor_split_dims_mapping=[None, None],
-          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
-      )
-      self.create_variable('hyper_conn_alpha_sw', alpha_sw)
-      beta_sw = WeightHParams(
-          shape=[self.hyper_conn_n], # N
-          init=WeightInit.Constant(1), 
-          mesh_shape=self.mesh_shape,
-          tensor_split_dims_mapping=[None],
-          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
-      )
-      self.create_variable('hyper_conn_beta_sw', beta_sw)
-      # dynamic alpha w: alpha_dw, alpha_scale
-      # std = 1/ math.sqrt(self.input_dims)
-      alpha_dw = WeightHParams(
-          shape=[self.input_dims, 1+self.hyper_conn_n], # D(1+N)
-          # init=WeightInit.Gaussian(std),
-          init=WeightInit.Constant(0),
-          mesh_shape=self.mesh_shape, 
-          tensor_split_dims_mapping=['data', None],
-      )
-      alpha_scale = WeightHParams(
-          shape=[1],
-          init=WeightInit.Constant(0.01), # L or CL
-          mesh_shape=self.mesh_shape,
-          tensor_split_dims_mapping=[None],
-      )
-      self.create_variable('hyper_conn_alpha_dw', alpha_dw)
-      self.create_variable('hyper_conn_alpha_scale', alpha_scale)
-      # dynamic beta w: beta_dw, beta_scale
-      # std = 1/ math.sqrt(self.input_dims)
-      beta_dw = WeightHParams(
-          shape=[self.input_dims], # D
-          # init=WeightInit.Gaussian(std),
-          init=WeightInit.Constant(0),
-          mesh_shape=self.mesh_shape, 
-          tensor_split_dims_mapping=[None],
-      )
-      beta_scale = WeightHParams(
-          shape=[1],
-          init=WeightInit.Constant(0.01), # L or CL
-          mesh_shape=self.mesh_shape,
-          tensor_split_dims_mapping=[None],
-      )
-      self.create_variable('hyper_conn_beta_dw', beta_dw)
-      self.create_variable('hyper_conn_beta_scale', beta_scale)
-
+      if self.hyper_conn_attn:
+        assert not self.hyper_conn_merge_wcdc
+        hyper_conn_config = pax_fiddle.Config(HyperConnection).clone().set(
+                                hyper_conn=self.hyper_conn,
+                                hyper_conn_n=self.hyper_conn_n,
+                                hyper_conn_tanh=self.hyper_conn_tanh,
+                                input_dims=self.input_dims,
+                                efficient=self.hyper_conn_efficient,
+                            )
+        self.create_child('hyper_conn_layer_attn', hyper_conn_config.clone().set(layer_index=self.layer_index*2))
+        self.create_child('hyper_conn_layer_mlp', hyper_conn_config.clone().set(layer_index=self.layer_index*2+1))
+      else:
+        self.create_child('hyper_conn_norm', self.hyper_conn_norm_tpl.clone().set(dim=self.input_dims))
+        # static w: alpha_sw, beta_sw
+        m_w = np.array([1 if _i == self.layer_index % self.hyper_conn_n else 0 for _i in range(self.hyper_conn_n)]) 
+        r_w = np.eye(self.hyper_conn_n)
+        sw_arr = np.concatenate([m_w[:,None], r_w], axis=-1)
+        alpha_sw = WeightHParams(
+            shape=[self.hyper_conn_n, 1+self.hyper_conn_n], # N(1+N)
+            init=WeightInit.Constant(sw_arr.tolist()), 
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=[None, None],
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
+        )
+        self.create_variable('hyper_conn_alpha_sw', alpha_sw)
+        beta_sw = WeightHParams(
+            shape=[self.hyper_conn_n], # N
+            init=WeightInit.Constant(1), 
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=[None],
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION], 
+        )
+        self.create_variable('hyper_conn_beta_sw', beta_sw)
+        # dynamic alpha w: alpha_dw, alpha_scale
+        # std = 1/ math.sqrt(self.input_dims)
+        alpha_dw = WeightHParams(
+            shape=[self.input_dims, 1+self.hyper_conn_n], # D(1+N)
+            # init=WeightInit.Gaussian(std),
+            init=WeightInit.Constant(0),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=['data', None],
+        )
+        alpha_scale = WeightHParams(
+            shape=[1],
+            init=WeightInit.Constant(0.01), # L or CL
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=[None],
+        )
+        self.create_variable('hyper_conn_alpha_dw', alpha_dw)
+        self.create_variable('hyper_conn_alpha_scale', alpha_scale)
+        # dynamic beta w: beta_dw, beta_scale
+        # std = 1/ math.sqrt(self.input_dims)
+        beta_dw = WeightHParams(
+            shape=[self.input_dims], # D
+            # init=WeightInit.Gaussian(std),
+            init=WeightInit.Constant(0),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=[None],
+        )
+        beta_scale = WeightHParams(
+            shape=[1],
+            init=WeightInit.Constant(0.01), # L or CL
+            mesh_shape=self.mesh_shape,
+            tensor_split_dims_mapping=[None],
+        )
+        self.create_variable('hyper_conn_beta_dw', beta_dw)
+        self.create_variable('hyper_conn_beta_scale', beta_scale)
 
     if self.laurel_rw:
         init_v = [1, 1]
@@ -1777,19 +1890,22 @@ class Transformer(base_layer.BaseLayer):
     # self.add_summary('attention_input_rms', _rms(inputs), verbosity=4)
 
     if self.hyper_conn and not self.hyper_conn_merge_wcdc: # ignore:  width connections
-      alpha_sw, alpha_dw, alpha_scale = getattr(self.theta, 'hyper_conn_alpha_sw'), getattr(self.theta, 'hyper_conn_alpha_dw'), getattr(self.theta, 'hyper_conn_alpha_scale')
-      beta_sw, beta_dw, beta_scale = getattr(self.theta, 'hyper_conn_beta_sw'), getattr(self.theta, 'hyper_conn_beta_dw'), getattr(self.theta, 'hyper_conn_beta_scale')
-      hhids_normed = self.hyper_conn_norm(hhids)
-      B_w = jnp.einsum('NBTD, D->BTN', hhids_normed, beta_dw) # beta 
-      Amr_w = jnp.einsum('NBTD, DM->BTNM', hhids_normed, alpha_dw) # alpha  BTN(1+N)
-      if self.hyper_conn_tanh: 
-        B_w = jnp.tanh(B_w)
-        Amr_w = jnp.tanh(Amr_w)
-      Amr_w = Amr_w * alpha_scale + alpha_sw[None,None]
-      B_w = B_w * beta_scale + beta_sw[None,None]
-      Am_w, Ar_w = Amr_w[...,0], Amr_w[...,1:] # BTN, BTNN
-      inputs = jnp.einsum('NBTD,BTN->BTD', hhids, Am_w) # mixed inputs
-      hhids = jnp.einsum('NBTD,BTNM->MBTD',hhids,Ar_w) # mixed hyper hidden states
+      if self.hyper_conn_attn:
+        hhids, inputs, B_w = self.hyper_conn_layer_attn(hhids)
+      else:
+        alpha_sw, alpha_dw, alpha_scale = getattr(self.theta, 'hyper_conn_alpha_sw'), getattr(self.theta, 'hyper_conn_alpha_dw'), getattr(self.theta, 'hyper_conn_alpha_scale')
+        beta_sw, beta_dw, beta_scale = getattr(self.theta, 'hyper_conn_beta_sw'), getattr(self.theta, 'hyper_conn_beta_dw'), getattr(self.theta, 'hyper_conn_beta_scale')
+        hhids_normed = self.hyper_conn_norm(hhids)
+        B_w = jnp.einsum('NBTD, D->BTN', hhids_normed, beta_dw) # beta 
+        Amr_w = jnp.einsum('NBTD, DM->BTNM', hhids_normed, alpha_dw) # alpha  BTN(1+N)
+        if self.hyper_conn_tanh: 
+          B_w = jnp.tanh(B_w)
+          Amr_w = jnp.tanh(Amr_w)
+        Amr_w = Amr_w * alpha_scale + alpha_sw[None,None]
+        B_w = B_w * beta_scale + beta_sw[None,None]
+        Am_w, Ar_w = Amr_w[...,0], Amr_w[...,1:] # BTN, BTNN
+        inputs = jnp.einsum('NBTD,BTN->BTD', hhids, Am_w) # mixed inputs
+        hhids = jnp.einsum('NBTD,BTNM->MBTD',hhids,Ar_w) # mixed hyper hidden states
       
     if self.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
@@ -1827,7 +1943,7 @@ class Transformer(base_layer.BaseLayer):
       inputs = inputs[-1] if self.dynamic_dense_type.endswith('m') else inputs[0]
     if self.use_mamba:
       output = self.mamba(inputs_normalized) + inputs
-      atten_probs, v_out = None, None
+      atten_probs, v_out, atten_output = None, None, None
     else:
       ### beginning of attn_mlp
       # Compute self-attention, key/value vectors are the input itself
@@ -1936,6 +2052,14 @@ class Transformer(base_layer.BaseLayer):
       else:
         mlp_input = atten_output
 
+      if self.hyper_conn and self.hyper_conn_attn: 
+        if self.hyper_conn_efficient:
+          hhids = hhids + jnp.einsum('BTD,NBT->NBTD', atten_output - inputs, B_w)  # fuse attn output into hyper hidden states
+          # hhids = hhids + (atten_output - inputs)[None] * B_w[...,None]  # fuse attn output into hyper hidden states
+        else:
+          hhids = hhids + jnp.einsum('BTD,BTN->NBTD', atten_output - inputs, B_w)  # fuse attn output into hyper hidden states
+        hhids, mlp_input, B_w = self.hyper_conn_layer_mlp(hhids)
+
       # Apply FFN layer
       if self.num_ffn == 1: # default
         gate_inputs = None 
@@ -2036,11 +2160,16 @@ class Transformer(base_layer.BaseLayer):
       assert self.dynamic_token_shift == 2
       _output = jnp.zeros(output.shape, dtype=output.dtype)
       ouput = output + _output.at[:, 1:, :].set(output[:,:-1] * tf_w[:,1:,:1]) + output * tf_w[:,:,1:]
+
     attn_out = atten_output_orig if self.attn_out_orig else atten_output
     
     if self.hyper_conn:
       if not self.hyper_conn_merge_wcdc: # depth connections 
-        hhids = hhids +  jnp.einsum('BTD,BTN->NBTD',output - inputs, B_w)  # fuse current output into hyper hidden states
+        Bw_pattern =  'NBT' if self.hyper_conn_efficient else 'BTN'
+        if self.hyper_conn_attn:
+            hhids = hhids + jnp.einsum(f'BTD,{Bw_pattern}->NBTD',output - mlp_input, B_w) # fuse mlp output into hyper hidden states
+        else:
+          hhids = hhids + jnp.einsum(f'BTD,{Bw_pattern}->NBTD',output - inputs, B_w)  # fuse attn and mlp output into hyper hidden states
       else:
         alpha_sw, alpha_dw, alpha_scale = getattr(self.theta, 'hyper_conn_alpha_sw'), getattr(self.theta, 'hyper_conn_alpha_dw'), getattr(self.theta, 'hyper_conn_alpha_scale')
         beta_sw, beta_dw, beta_scale = getattr(self.theta, 'hyper_conn_beta_sw'), getattr(self.theta, 'hyper_conn_beta_dw'), getattr(self.theta, 'hyper_conn_beta_scale')
@@ -2274,6 +2403,8 @@ class StackedTransformer(base_layer.BaseLayer):
   hyper_conn_n: int = 4
   hyper_conn_tanh: bool = False
   hyper_conn_norm_tpl: LayerTpl = template_field(normalizations.RmsNorm)  # mqy
+  hyper_conn_attn: bool = False
+  hyper_conn_efficient: bool = False
   dense_conn: bool = False
   dense_conn_on_attn: bool = False
   dense_conn_on_layerdiff: bool = False
@@ -2333,6 +2464,7 @@ class StackedTransformer(base_layer.BaseLayer):
   recurrent_layer_mixing_tpl: LayerTpl = template_field(rnn_cell.RecurrentLayerMix) # rnn, lstm 
   mamba_lidxs: Optional[list] = None # list(range(48))
   use_mamba: bool = False
+  mamba_use_minimal: bool = True
 
 
 
@@ -2366,6 +2498,7 @@ class StackedTransformer(base_layer.BaseLayer):
         p_i.use_mamba = i in mamba_lidxs  
         p_i.mamba_tpl.layer_idx = i 
         p_i.mamba_tpl.d_model = self.model_dims
+        p_i.mamba_tpl.use_minimal = self.mamba_use_minimal
 
       share_except_layers = self.share_except_layers if self.share_except_layers is not None else []
       if self.share_interval is not None and i not in share_except_layers:
@@ -2438,6 +2571,8 @@ class StackedTransformer(base_layer.BaseLayer):
       p_i.hyper_conn_tanh = self.hyper_conn_tanh
       p_i.hyper_conn_norm_tpl = self.hyper_conn_norm_tpl
       p_i.hyper_conn_merge_wcdc = self.hyper_conn_merge_wcdc
+      p_i.hyper_conn_attn = self.hyper_conn_attn
+      p_i.hyper_conn_efficient = self.hyper_conn_efficient
       
       # dense params
       if isinstance(self.dynamic_dense_hidden_expand, tuple) or isinstance(self.dynamic_dense_hidden_expand, list):
