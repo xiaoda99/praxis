@@ -2124,7 +2124,7 @@ class DotProductAttention(base_layer.BaseLayer):
           og1 = WeightHParams(shape=[self.hidden_dim, self.o_gate_rank], # 1024, 128
             mesh_shape=self.mesh_shape, tensor_split_dims_mapping=[None, None],
             init=WeightInit.Gaussian(math.sqrt(2.0 / (self.hidden_dim + self.o_gate_rank))))
-          assert self.o_gate2_init_method in ['gaussian' and 'zero']
+          assert self.o_gate2_init_method in ['gaussian', 'zero']
           if self.o_gate2_init_method == 'gaussian':
             og2_init = WeightInit.Gaussian(math.sqrt(2.0 / (self.hidden_dim + self.o_gate_rank)))
           elif self.o_gate2_init_method == 'zero':

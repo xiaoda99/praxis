@@ -391,6 +391,7 @@ class RmsNorm(BaseNormalization):
   direct_scale: bool = True
   intermediate_dtype: Optional[jnp.dtype] = None
   skip_weight_decay: bool = True  # XD
+  init_value: Optional[float] = None #mqy
 
   def setup(self) -> None:
     """Creates RMS normalization variables."""
@@ -400,7 +401,10 @@ class RmsNorm(BaseNormalization):
       # Simply replicate the weights.
       wp_scale = [-1]
     # Scale variable that scales the RMS norm output by (1 + scale).
-    init_value = 1.0 if self.direct_scale else 0.0
+    if self.init_value is not None:
+      init_value = self.init_value
+    else:
+      init_value = 1.0 if self.direct_scale else 0.0
     self.create_variable(
         'scale',
         WeightHParams(
