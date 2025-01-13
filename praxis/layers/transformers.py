@@ -2486,6 +2486,7 @@ class StackedTransformer(base_layer.BaseLayer):
   dynamic_dense_k_from_res: bool = False
   dynamic_dense_param_residual: bool = False
   dynamic_dense_add_residual: bool = False
+  dynamic_dense_prenormed_residual_qkv: bool = False
   dynamic_dense_w2_init: str = 'zero'
   dynamic_dense_scale_dw: bool = False
   dynamic_dense_scale_dw_squared: bool = False 
@@ -3135,7 +3136,11 @@ class StackedTransformer(base_layer.BaseLayer):
                           def _post_norm(mixed_x, skip=False):
                             return mixed_x if skip else self.x_layers[i].dense_post_norm(mixed_x)
                           skips = [False] * C if self.dense_post_norm_all else [ cidx < C-1 for cidx in range(C)]
-                          x_out = tuple([ x_out + _post_norm(sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]), skip=skips[cidx]) for cidx in range(C)])
+                          if self.dynamic_dense_prenormed_residual_qkv:
+                            assert self.dynamic_dense_type.endswith('m') # hids[-1] == normed(x_out)
+                            x_out = tuple([ (hids[-1] if cidx<C-1 else x_out) + _post_norm(sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]), skip=skips[cidx]) for cidx in range(C)])
+                          else:
+                            x_out = tuple([ x_out + _post_norm(sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]), skip=skips[cidx]) for cidx in range(C)])
                         else: 
                           x_out = tuple([ x_out + sum([dyn_dense_w[cidx,:,:,j] * _ov_transform(hids[j], ov_before, normalize=self.dynamic_dense_ft_norm) for j in hid_idxs]) for cidx in range(C)])
                       else:

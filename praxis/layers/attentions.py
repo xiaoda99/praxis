@@ -2662,7 +2662,7 @@ class DotProductAttention(base_layer.BaseLayer):
         start, stop = i * w, (i + 1) * w
         kv_start = max(0, stop - w - self.window_size) if self.window_size is not None else 0
         _query = query[:, :, start : stop, :]
-        _key, _value = key[..., kv_start : stop, :], value[..., kv_start : stop, :] # ... means [:] for MQA and [:,:] for MHA
+        _key, _value = key[..., kv_start : stop, :], value[..., kv_start : stop, :] # ... means [:] for MQA and [:,:] for MHA, produces different graph after compile.  
         if rel_bias_mask is None:
           _rel_bias_mask = None
         else:
