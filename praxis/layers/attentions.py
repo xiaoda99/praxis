@@ -1907,6 +1907,9 @@ class DotProductAttention(base_layer.BaseLayer):
   combine_qkv: bool = False
   combined_qkv_proj_tpl: LayerTpl = template_field(CombinedQKVProjectionLayer)
   dynamic_qk_proj: bool = False
+  dynamic_qkv_rotate: bool = False  # XD
+  mixedv_rotate: bool = True  # XD
+  v_out_rotate: bool = False  # XD
   shared_qk_dim: int = 0 # XD
   shared_ov_dim: int = 0 # XD
   num_shared_heads: int = None  # XD
@@ -2155,6 +2158,22 @@ class DotProductAttention(base_layer.BaseLayer):
             init=WeightInit.Gaussian(math.sqrt(1.0 / dim_per_head)))
       self.create_variable('dynamic_query', dynamic_query)
       self.create_variable('dynamic_key', dynamic_key)
+
+    if self.dynamic_qkv_rotate:  # XD
+      params = WeightHParams(shape=[self.num_heads, dim_per_head, dim_per_head],  # NDD
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl', None, None],
+            init=WeightInit.Gaussian(math.sqrt(1.0 / dim_per_head)))
+      self.create_variable('dynamic_query_rot_proj', params)
+      self.create_variable('dynamic_key_rot_proj', params)
+      self.create_variable('dynamic_value_rot_proj', params)
+      if 'o' in self.dynamic_head_dense_type and self.mixedv_rotate:
+        self.create_variable('dynamic_mixedv_rot_proj', params)
+    if self.v_out_rotate:  # XD
+      params = WeightHParams(shape=[self.num_heads, dim_per_head, dim_per_head],  # NDD
+            mesh_shape=self.mesh_shape, tensor_split_dims_mapping=['mdl', None, None],
+            # init=WeightInit.Constant(np.eye(dim_per_head)))
+            init=WeightInit.Gaussian(math.sqrt(1.0 / dim_per_head)))  # VoutRotGaussianInit
+      self.create_variable('v_out_rot_proj', params)
     
     if self.dynamic_position:
       assert self.num_kv_heads != 1
@@ -2930,6 +2949,13 @@ class DotProductAttention(base_layer.BaseLayer):
       if self.dynamic_qk_proj:
         dyn_q = jnp.einsum('BSND,DE->BSNE', dyn_q, self.theta.dynamic_query)
         dyn_k = jnp.einsum('BSND,DE->BSNE', dyn_k, self.theta.dynamic_key)
+      if self.dynamic_qkv_rotate:  # XD
+        assert 'qkv' in self.dynamic_head_dense_type, f'qkv not in {self.dynamic_head_dense_type}'
+        dyn_q = jnp.einsum('BSND,NDE->BSNE', dyn_q, self.theta.dynamic_query_rot_proj)
+        dyn_k = jnp.einsum('BSND,NDE->BSNE', dyn_k, self.theta.dynamic_key_rot_proj)
+        dyn_v = jnp.einsum('BSND,NDE->BSNE', dyn_v, self.theta.dynamic_value_rot_proj)
+        if 'o' in self.dynamic_head_dense_type and self.mixedv_rotate:
+          dyn_mixedv = jnp.einsum('BSND,NDE->BSNE', dyn_mixedv, self.theta.dynamic_mixedv_rot_proj)
       if dyn_q is not None: 
         query_proj = query_proj + dyn_q # BTNd
         # self.add_summary('dyn_q_rms', _rms(dyn_q), verbosity=4)
@@ -3073,6 +3099,8 @@ class DotProductAttention(base_layer.BaseLayer):
         if self.shared_ov_dim != self.hidden_dim else \
         self.post.project_shared_output(shared_encoded)
     v_out = encoded if self.save_v_out else None # BTNd
+    if self.v_out_rotate:  # XD
+      v_out = jnp.einsum('BTND, NDE -> BTNE', v_out, self.theta.v_out_rot_proj)
     encoded = self.post(encoded)     # BTNd, NdD -> BTD
     if self.shared_ov_dim > 0:  # XD
       encoded = encoded + shared_encoded

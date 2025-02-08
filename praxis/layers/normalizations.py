@@ -15,7 +15,7 @@
 
 """Normalization layers."""
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import jax
 from jax import numpy as jnp
@@ -445,7 +445,7 @@ class RmsNormNoScale(BaseNormalization):
     epsilon: Tiny value to guard rsqrt.
   """
   epsilon: float = 1e-6
-  axis: int = -1  # XD -2 for dynamic w1 (BTGMI) normalization on M dim
+  axis: Union[int, list] = -1  # XD -2 for dynamic w1 (BTGMI) normalization on M dim
 
   def __call__(self,
                inputs: JTensor,
@@ -462,8 +462,9 @@ class RmsNormNoScale(BaseNormalization):
       weight. With the same shape as 'inputs'.
     """
     del paddings  # Unused.
+    axis = self.axis if isinstance(self.axis, list) else [self.axis]  # XD
     var = jnp.mean(
-        jnp.square(inputs), axis=[self.axis], keepdims=True, dtype=jnp.float32)  # XD -1 -> self.axis
+        jnp.square(inputs), axis=self.axis, keepdims=True, dtype=jnp.float32)  # XD -1 -> self.axis
     if bias is None: bias = 0.  # XD
     normed_inputs = (inputs * jax.lax.rsqrt(var + self.epsilon + bias)).astype(
         inputs.dtype

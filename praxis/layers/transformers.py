@@ -1261,6 +1261,10 @@ class Transformer(base_layer.BaseLayer):
   dynamic_dense_fix_last_layer: bool = False # reduce static dense and dynamic dense to 1-way
   dynamic_dense_keep_residual: bool = False
   dynamic_dense_k_from_res: bool = False
+  squash_dyn_dense_w: str = ''  # XD
+  squash_scale_init: float = 0.1  # XD
+  squash_scale_by_layer: bool = False  # XD
+  squash_scale_init_by_layer: bool = False  # XD
   v_out_rank: Optional[int] = None
   v_out_dynamic: bool = False
   attn_out_orig: bool = False
@@ -1272,6 +1276,7 @@ class Transformer(base_layer.BaseLayer):
   dynamic_head_dense: bool = False
   dynamic_head_rank: int = 2
   dynamic_head_dense_type: str = 'qk'
+  dynamic_head_dense_use_bias: bool = False  # XD
   # dynamic_qk_proj: bool = False
   dynamic_head_seperate_param: bool = False
   dynamic_token_shift: int = 0
@@ -1434,16 +1439,16 @@ class Transformer(base_layer.BaseLayer):
         factor = 1
       if self.dynamic_dense: # default: BTD, DL-> BTL
         if self.dynamic_dense_query_wise and self.dynamic_dense_key_wise: 
-          l = i + 2 + (self.num_layers - i)
+          _l = i + 2 + (self.num_layers - i)
         elif self.dynamic_dense_query_wise: # default
-          l = (i + 1) * factor + 1
+          _l = (i + 1) * factor + 1
         elif self.dynamic_dense_key_wise:
-          l = self.num_layers - i
+          _l = self.num_layers - i
         if self.dynamic_dense_type is not None: # default
           C = 1 if self.dynamic_dense_fix_last_layer and i== self.num_layers-1 else len(self.dynamic_dense_type)
         else:
           C = 1 
-        l = l * self.dynamic_dense_num_groups * C  # G=1
+        l = _l * self.dynamic_dense_num_groups * C  # G=1
         std = 1/math.sqrt(self.input_dims)  
         dynamic_dense_inter_dim = int(l * self.dynamic_dense_hidden_expand)
         if self.dynamic_dense_hidden_round:  # default: round to 64 or 128
@@ -1463,6 +1468,15 @@ class Transformer(base_layer.BaseLayer):
         )
         self.create_variable(f'dynamic_dense_conn1_{i}', dyn_dense_proj1)
         self.create_variable(f'dynamic_dense_conn2_{i}', dyn_dense_proj2)
+        if self.squash_dyn_dense_w:  # XD: from hyper-connections
+          squash_scale_init = self.squash_scale_init / (math.sqrt(l) if self.squash_scale_init_by_layer else 1)
+          for t in self.squash_dyn_dense_w:
+            self.create_variable(f'squash_scale_{t}', WeightHParams(
+              shape=(_l, 1) if self.squash_scale_by_layer else (1,),
+              init=WeightInit.Constant(squash_scale_init),
+              mesh_shape=self.mesh_shape,
+              tensor_split_dims_mapping=[None, None] if self.squash_scale_by_layer else [None],
+            ))
         if self.dynamic_dense_gate_mlp: # ignore 
           assert self.dynamic_dense_hidden_expand == 1
           dyn_dense_proj_gate = WeightHParams(
@@ -1662,6 +1676,16 @@ class Transformer(base_layer.BaseLayer):
       self.create_variable(f'dynamic_head_dense_conn1_{i}', dyn_head_dense_proj1)
       self.create_variable(f'dynamic_head_dense_conn2a_{i}', dyn_head_dense_proj2a)
       self.create_variable(f'dynamic_head_dense_conn2b_{i}', dyn_head_dense_proj2b)
+      if self.dynamic_head_dense_use_bias:  # XD
+        kwargs = dict(
+            init=WeightInit.Constant(0),
+            mesh_shape=self.mesh_shape, 
+            tensor_split_dims_mapping=[None, None, None],
+            collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],
+        )
+        self.create_variable(f'dynamic_head_dense_bias2a', WeightHParams(shape=[_l, R, r], **kwargs))
+        self.create_variable(f'dynamic_head_dense_bias2b', WeightHParams(shape=[C, R, r], **kwargs))
+
     if self.v_out_rank: 
       if self.v_out_dynamic: 
         K = self.num_heads * self.v_out_rank
@@ -1992,6 +2016,18 @@ class Transformer(base_layer.BaseLayer):
           gate_w = getattr(self.theta, f'dynamic_dense_gate_{self.layer_index}') # DL
           gate = jnp.einsum('B T D, D K -> B T K', x_out_normed, gate_w) # BTL
           dyn_dense_w = jnp.einsum('B T K, K L -> B T L', gate * dense_w_inner, dense_proj2)
+        elif self.squash_dyn_dense_w:  # XD: from hyper-connections
+          C = 1 if self.dynamic_dense_fix_last_layer and self.layer_index == self.num_layers-1 else len(self.dynamic_dense_type)
+          dense_proj2 = rearrange(dense_proj2, 'K (C L G) -> K C L G', C=C, G=1)
+          w = jnp.einsum('B T K, K C L G -> C B T L G', dense_w_inner, dense_proj2)
+          if C == 1:
+            assert self.layer_index == self.num_layers - 1
+            dyn_dense_w = self.theta.squash_scale_m * jnp.tanh(w)
+          else:
+            dyn_dense_w = jnp.stack([getattr(self.theta, 'squash_scale_' + t) * jnp.tanh(w[i])
+                                    if t in self.squash_dyn_dense_w else w[i]
+                                    for i, t in enumerate(self.dynamic_dense_type)])
+          dyn_dense_w = rearrange(dyn_dense_w, 'C B T L G -> B T (C L G)')
         else: # default 
           dyn_dense_w = jnp.einsum('B T K, K L -> B T L', dense_w_inner, dense_proj2)
 
@@ -2016,6 +2052,10 @@ class Transformer(base_layer.BaseLayer):
       if self.v_out_rank is None:
         head_dense_proj2 = jnp.concatenate([head_dense_proj2a, head_dense_proj2b], axis=1) # KLRN, KCRN->K(L+C)RN
         dyn_head_dense_w = jnp.einsum('BTK,KLRN->LBTRN', dense_w_inner, head_dense_proj2) # (L*C+C)BTRN
+        if self.dynamic_head_dense_use_bias:  # XD
+          head_dense_bias2a, head_dense_bias2b = self.theta.dynamic_head_dense_bias2a, self.theta.dynamic_head_dense_bias2b
+          head_dense_bias2 = jnp.concatenate([head_dense_bias2a, head_dense_bias2b], axis=0) # LRN, CRN->(L+C)RN
+          dyn_head_dense_w += head_dense_bias2[:, None, None, :, :]  # (L+C)RN->(L+C)11RN
       else:
         dyn_head_dense_wa = jnp.einsum('BTK,KLRQ->LBTRQ', dense_w_inner, head_dense_proj2a) # BTK, KLRr->LBTRr
         dyn_head_dense_wb = jnp.einsum('BTK,KCRN->CBTRN', dense_w_inner, head_dense_proj2b) # 
@@ -2582,7 +2622,8 @@ class StackedTransformer(base_layer.BaseLayer):
     layer_params = [_layer_params(i) for i in range(self.num_layers)]
     self.create_children('x_layers', layer_params)
 
-    self.create_child('head_dw1_norm', self.head_dw1_norm_tpl.clone())
+    self.create_child('head_dw1_norm', self.head_dw1_norm_tpl.clone() if self.head_dw1_norm_on_activation
+                      else self.head_dw1_norm_tpl.clone().set(axis=[0, 4]))  # XD: LBSRN, norm along L and N
 
     if self.dense_conn:
       # self.create_child('dense_norm', self.dense_norm_tpl.clone())
@@ -2986,11 +3027,11 @@ class StackedTransformer(base_layer.BaseLayer):
           if not self.head_dw1_norm_on_activation: dw1 = self.head_dw1_norm(dw1)
           inner_v = sum(jnp.einsum('BSND,CBSRN->CBSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
           if self.head_dw1_norm_on_activation: inner_v = self.head_dw1_norm(inner_v) # rmsnorm
-          inner_v = sum(jnp.einsum('BSND,CBSRN->CBSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
+          # inner_v = sum(jnp.einsum('BSND,CBSRN->CBSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSND, (C)LBSRN->BSRD
           v_in = jnp.einsum('CBSRD,CBSRN->CBSND', inner_v, dw2)
-        else:
+        else:  # default
           if not self.head_dw1_norm_on_activation: dw1 = self.head_dw1_norm(dw1)
-          inner_v = sum(jnp.einsum('BSND,BSRN->BSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSrD, (C)LBSRr->(C)BSRD # 
+          inner_v = sum(jnp.einsum('BSND,BSRN->BSRD', v_outs[j], dw1[j]) for j in range(i+1)) # LBSrD, LBSRr->BSRD # 
           if self.head_dw1_norm_on_activation: inner_v = self.head_dw1_norm(inner_v) # rmsnorm
           v_in = jnp.einsum('BSRD,CBSRN->CBSND', inner_v, dw2) # C=4, QKVO  # [LBSrD -> BSND for _ in range(4)] # CLrN
           # dynamic_conv(v_out) : LBSND, LBS-> BSND
