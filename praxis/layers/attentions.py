@@ -1975,6 +1975,7 @@ class DotProductAttention(base_layer.BaseLayer):
   compose_mode: str = 'lp' # mqy ['lp', 'qkvo'] + combinations of ['q', 'k', 'v', 'o']; lp: logits+probs
   compose_residual: bool = True
   compose_inner_norm: bool = False
+  compose_o_conditioned_on: str = 'query_vec'  # XD
   dynamic_dense_by_group_heads: bool = False
 
   # SPMD partition related params.
@@ -2222,10 +2223,10 @@ class DotProductAttention(base_layer.BaseLayer):
       proj_p.weight_split_dims_mapping.wt = wp.proj
       return proj_p
       
-    def project_dynamic_w(proj_tpl, merge_projection=False):  # XD
+    def project_dynamic_w(proj_tpl, merge_projection=False, input_dim=None):  # XD
       proj_p = proj_tpl.clone().set(
         num_heads=self.num_heads, num_groups=self.num_groups,
-        query_input_dim=query_input_dim, key_input_dim=key_input_dim,
+        query_input_dim=input_dim or query_input_dim, key_input_dim=input_dim or key_input_dim,
         merge_projection=merge_projection)
       proj_p.weight_split_dims_mapping.wt = wp.proj
       return proj_p
@@ -2292,6 +2293,10 @@ class DotProductAttention(base_layer.BaseLayer):
       self.create_child('dyn_w_proj', project_dynamic_w(
         self.dynamic_w_post_proj_tpl, merge_projection=True))
     assert self.compose_mode in ['lp', 'qkvo', 'vo', 'qo']
+    if getattr(self, 'compose_o_conditioned_on', None) in ['mixedv', 'query_vec+mixedv']:  # XD
+      input_dim = query_input_dim * (1 if self.compose_o_conditioned_on == 'mixedv' else 2)
+      self.create_child('dyn_w_proj_o', project_dynamic_w(
+        self.dynamic_w_post_proj_tpl, input_dim=input_dim))
 
     if self.relative_bias_tpl is not None:
       relative_bias_p = self.relative_bias_tpl.clone()
@@ -2922,8 +2927,8 @@ class DotProductAttention(base_layer.BaseLayer):
 
     if hasattr(self, 'dyn_w_proj') and self.compose_mode != 'lp':
       pre_proj_dw_args, post_proj_dw_args = self.dyn_w_proj(query_vec, key_vec)
-      ((pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd),
-       (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd)) = pre_proj_dw_args, post_proj_dw_args
+      ((pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd, pre_qg, pre_kg),
+       (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd, post_qg, post_kg)) = pre_proj_dw_args, post_proj_dw_args
     if 'q' in self.compose_mode:
       query_proj = self.compose_btnd(query_proj, pre_qw1, pre_qw2, pre_qdd)
     if 'k' in self.compose_mode:
@@ -3041,6 +3046,11 @@ class DotProductAttention(base_layer.BaseLayer):
     )
 
     if 'o' in self.compose_mode:
+      if getattr(self, 'compose_o_conditioned_on', None) in ['mixedv', 'query_vec+mixedv']:  # XD
+        mixedv = rearrange(encoded, 'B T N D -> B T (N D)')
+        inp = mixedv if self.compose_o_conditioned_on == 'mixedv' \
+          else jnp.concatenate([query_vec, mixedv], axis=-1)
+        post_qw1, post_qw2, _, _, post_qdd, _, _, _ = self.dyn_w_proj_o(inp, None)
       encoded = self.compose_btnd(encoded, post_qw1, post_qw2, post_qdd)
 
     if dyn_mixedv is not None:
