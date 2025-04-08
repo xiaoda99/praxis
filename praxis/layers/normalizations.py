@@ -449,6 +449,8 @@ class RmsNormNoScale(BaseNormalization):
     epsilon: Tiny value to guard rsqrt.
   """
   epsilon: float = 1e-6
+  intermediate_dtype: Optional[jnp.dtype] = jnp.float32
+  cast_input: bool = False
   axis: int = -1  # XD -2 for dynamic w1 (BTGMI) normalization on M dim
 
   def __call__(self,
@@ -466,8 +468,10 @@ class RmsNormNoScale(BaseNormalization):
       weight. With the same shape as 'inputs'.
     """
     del paddings  # Unused.
+    if self.cast_input and self.intermediate_dtype is not None:
+      inputs = jnp.asarray(inputs, dtype=self.intermediate_dtype)
     var = jnp.mean(
-        jnp.square(inputs), axis=[self.axis], keepdims=True, dtype=jnp.float32)  # XD -1 -> self.axis
+        jnp.square(inputs), axis=[self.axis], keepdims=True, dtype=self.intermediate_dtype)  # XD -1 -> self.axis
     if bias is None: bias = 0.  # XD
     normed_inputs = (inputs * jax.lax.rsqrt(var + self.epsilon + bias)).astype(
         inputs.dtype

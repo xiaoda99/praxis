@@ -20,6 +20,7 @@ from __future__ import annotations
 import enum
 from typing import Any, Optional, Sequence
 
+import math
 import fiddle as fdl
 import jax
 from jax import numpy as jnp
@@ -33,6 +34,10 @@ from praxis.layers import embedding_softmax
 from praxis.layers import multi_query_attention
 from praxis.layers import normalizations
 from praxis.layers import transformers
+
+
+WeightInit = base_layer.WeightInit
+WeightHParams = base_layer.WeightHParams
 
 NestedMap = py_utils.NestedMap
 JTensor = pytypes.JTensor
@@ -274,6 +279,17 @@ class TransformerLm(base_layer.BaseLayer):
   skip_compute_loss: bool = False
   skip_aux_loss: bool = False
   record_activations_in_xent_output: bool = False
+  dynamic_temp: bool = False # mqy
+  dynamic_temp_hidden_dim: int = 128
+  dynamic_temp_scale_dw: bool = False
+  dynamic_temp_postnorm: bool = False
+  dynamic_temp_postnorm_scale: float = 0.001
+  dynamic_temp_postnorm_eps: float = 1e-6
+  dynamic_temp_postnorm_scale_slow: float = 0.1
+  dynamic_temp_slow: bool = False
+  dynamic_temp_prenorm: bool = False
+  dynamic_temp_skip_dw: bool = False
+  dynamic_temp_tanh: bool = False
 
   @classmethod
   def set_sharding_params_v1(
@@ -541,6 +557,40 @@ class TransformerLm(base_layer.BaseLayer):
       ln_params = self.final_ln_tpl.clone().set(dim=self.model_dims)
       self.create_child('final_ln', ln_params)
 
+    # dynamic temperature
+    if self.dynamic_temp:
+      if self.dynamic_temp_prenorm:
+        self.create_child('dt_prenorm', self.final_ln_tpl.clone().set(dim=self.model_dims, init_value=1))
+      if self.dynamic_temp_postnorm:
+        self.create_child('dt_postnorm', self.final_ln_tpl.clone().set(dim=self.model_dims, init_value=self.dynamic_temp_postnorm_scale, epsilon=self.dynamic_temp_postnorm_eps))
+        if self.dynamic_temp_slow:
+          self.create_child('dt_postnorm_slow', self.final_ln_tpl.clone().set(dim=self.model_dims, init_value=self.dynamic_temp_postnorm_scale_slow))
+      dt_b = WeightHParams(
+          shape=[1], # 
+          init=WeightInit.Constant(1),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None],
+          collections=[base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION],  # XD
+        )
+      self.create_variable('dt_b', dt_b)
+      dt_modes = ['fast', 'slow'] if self.dynamic_temp_slow else ['fast'] 
+      for mode in dt_modes:
+        std = 1/math.sqrt(self.model_dims)
+        dt_w1 = WeightHParams(
+          shape=[self.model_dims, self.dynamic_temp_hidden_dim], # DK
+          init=WeightInit.Gaussian(std),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=['data', None],
+        )
+        dt_w2 = WeightHParams(
+          shape=[self.dynamic_temp_hidden_dim, 1], # #K1
+          init=WeightInit.Constant(0),
+          mesh_shape=self.mesh_shape, 
+          tensor_split_dims_mapping=[None, None],
+        )
+        self.create_variable('dt_w1_slow' if mode == 'slow' else 'dt_w1', dt_w1)
+        self.create_variable('dt_w2_slow' if mode == 'slow' else 'dt_w2', dt_w2)
+
     # Final softmax
     softmax_params = self.softmax_tpl.clone()
     softmax_params.input_dims = self.model_dims
@@ -782,9 +832,36 @@ class TransformerLm(base_layer.BaseLayer):
         inputs, paddings, segment_mask=segment_mask, segment_pos=segment_pos
     )
 
+    if self.dynamic_temp:
+      if self.dynamic_temp_prenorm:
+        normed_out = self.dt_prenorm(output)
+        dt_inner = jax.nn.gelu(jnp.einsum('B T D, D K -> B T K', normed_out, self.theta.dt_w1))
+        dt = jnp.einsum('B T K, K J -> B T J', dt_inner, self.theta.dt_w2)
+        if self.dynamic_temp_slow:
+          dt_inner = jax.nn.gelu(jnp.einsum('B T D, D K -> B T K', normed_out, self.theta.dt_w1_slow))
+          dt_slow = jnp.einsum('B T K, K J -> B T J', dt_inner, self.theta.dt_w2_slow)
+
     # Final layer norm
     if self.final_ln_tpl is not None:
       output = self.final_ln(output)
+
+    if self.dynamic_temp:
+      if not self.dynamic_temp_prenorm:
+        dt_inner = jax.nn.gelu(jnp.einsum('B T D, D K -> B T K', output, self.theta.dt_w1))
+        dt = jnp.einsum('B T K, K J -> B T J', dt_inner, self.theta.dt_w2)
+      if self.dynamic_temp_scale_dw:
+        dt = dt / math.sqrt(self.dynamic_temp_hidden_dim)
+      if self.dynamic_temp_postnorm:
+        if self.dynamic_temp_slow:
+          output = output + self.dt_postnorm(output * (dt + self.theta.dt_b - 1)) + self.dt_postnorm_slow(output * dt_slow)
+        elif self.dynamic_temp_skip_dw:
+          output = output + self.dt_postnorm(output)
+        else:
+          output = output + self.dt_postnorm(output * (dt + self.theta.dt_b - 1))
+      elif self.dynamic_temp_tanh:
+        output = output + output * jnp.tanh(dt + self.theta.dt_b - 1)
+      else:
+        output = output * (dt + self.theta.dt_b)
 
     if self.skip_compute_loss:
       return output
