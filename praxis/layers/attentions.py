@@ -640,6 +640,9 @@ class DynamicWeightProjection(base_layer.BaseLayer):
   dw_hidden_activation_cls: activations_lib.BaseActivation = None  # mqy
   use_dw_hidden_bias: bool = True
   dw_hidden_gate_act_cls: activations_lib.BaseActivation = None
+  share_lp_dw_hidden: bool = False  # XD: actually share_qk_dw_hidden
+  share_prepost_dw_hidden: bool = False  # XD: true share_lp_dw_hidden
+  share_all_dw_hidden: bool = False  # XD
   merge_projection: bool = True
   summary_verbosity: int = 9
   dw_param_gate: bool = False #mqy generate dynamic gate for dynamic weight: dw2(dw1(x)) -> dw2(dw1(x) * silu(wg(x))) 
@@ -691,7 +694,9 @@ class DynamicWeightProjection(base_layer.BaseLayer):
             if self.dw_param_gate: I += dynamic_hidden_dim # for wg
             if not self.decompose_dynamic_w: I = M
             if w_name == 'qkw':
-              shape = [G, 4, K, I, M] 
+              if self.share_lp_dw_hidden or self.share_prepost_dw_hidden: shape = [G, 2, K * 2, I * 2, M]
+              elif self.share_all_dw_hidden: shape = [G, 1, K * 4, I * 4, M]
+              else: shape = [G, 4, K, I, M]
             elif w_name in ['qkw1', 'qkw2']:
               shape = [G, 4, K, I//2, M] 
             else:
@@ -774,6 +779,12 @@ class DynamicWeightProjection(base_layer.BaseLayer):
       if self.dynamic_w_hidden_dim and not self.merge_dynamic_w_hidden:
         if self.merge_projection:
           dw_hidden = jnp.einsum('BTD,DGCK->BTGCK', query_vec, theta.dw1)  # C=4 [pre,post]*[query,key]
+          if self.share_lp_dw_hidden: # XD: C=2 [pre,post], P=2 [query,key]
+            dw_hidden = rearrange(dw_hidden, 'B T G (C P) K -> B T G C (P K)', P=2)
+          elif self.share_prepost_dw_hidden:  # XD
+            dw_hidden = rearrange(dw_hidden, 'B T G (P C) K -> B T G P (C K)', P=2)
+          elif self.share_all_dw_hidden:  # XD
+            dw_hidden = rearrange(dw_hidden, 'B T G (C P) K -> B T G 1 (C P K)', P=2)
           dw_hidden = self.dw_hidden_activation(dw_hidden)
           if self.dynamic_w2_init is None:
             qkw = theta.qkw 
@@ -783,6 +794,12 @@ class DynamicWeightProjection(base_layer.BaseLayer):
             w1, w2, wg = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, qkw), 3, axis=-2) # I=3*2
           else:
             w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, qkw), 2, axis=-2)
+            if self.share_lp_dw_hidden:  # XD
+              w1, w2 = [rearrange(w, 'B T G C (P I) M -> B T G (C P) I M', P=2) for w in [w1, w2]]
+            elif self.share_prepost_dw_hidden:  # XD
+              w1, w2 = [rearrange(w, 'B T G P (C I) M -> B T G (C P) I M', C=2) for w in [w1, w2]]
+            elif self.share_all_dw_hidden:  # XD
+              w1, w2 = [rearrange(w, 'B T G 1 (C P I) M -> B T G (C P) I M', C=2, P=2) for w in [w1, w2]]
           # w1, w2 = jnp.split(jnp.einsum('BTGCK,GCKMI->BTGCMI', dw_hidden, theta.qkw), 2, axis=-1)
           if self.dw1_norm_cls is not None: w1 = self.dw1_norm(w1)
           pre_qw1, pre_kw1, post_qw1, post_kw1 = unbind(w1, 4, axis=3) # BT4GIM->[BTGIM]*4
@@ -911,6 +928,9 @@ class CrossHeadProjection(base_layer.BaseLayer):
   dw_hidden_activation_cls: activations_lib.BaseActivation = None  # mqy
   use_dw_hidden_bias: bool = True
   dw_hidden_gate_act_cls: activations_lib.BaseActivation = None
+  share_lp_dw_hidden: bool = False  # XD: actually share_qk_dw_hidden
+  share_prepost_dw_hidden: bool = False  # XD: true share_lp_dw_hidden
+  share_all_dw_hidden: bool = False  # XD
   tgt_dependent: bool = True
   src_dependent: bool = True
   summary_verbosity: int = 9
@@ -2824,6 +2844,7 @@ class DotProductAttention(base_layer.BaseLayer):
       _ret = _hid if residual else 0
       _inner = jnp.einsum('BTGND, BTGIN-> BTGID', _hid, _dw1)
       if self.compose_inner_norm: _inner = self.inner_norm(_inner) # normalize activation 
+      if _dw2 is None: return _inner # XD: assert not residual
       _ret = _ret + jnp.einsum('BTGID,BTGIN->BTGND', _inner, _dw2)
       _ret = _ret + jnp.einsum('BTGND, BTGN->BTGND', _hid, _dd)
       _ret = rearrange(_ret, 'B T G N D -> B T (G N) D')
